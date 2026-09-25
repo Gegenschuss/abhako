@@ -1,0 +1,17 @@
+services:
+  abhako:
+    build: .
+    image: abhako:local
+    container_name: abhako
+    restart: unless-stopped
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    env_file: .env
+    volumes:
+      - ./data:/data
+    ports:
+      # Abhako has NO login of its own. Keep it on localhost and put a reverse proxy
+      # with authentication in front, or expose it only inside a private network / VPN.
+      - "127.0.0.1:3040:3040"
