@@ -7,7 +7,7 @@ Lists, calendar, Eisenhower matrix, habits and a focus timer in one small web ap
 
 <p align="center"><img src="docs/today.png" alt="Today view with overdue and today's tasks, subtasks, tags and the list sidebar"></p>
 
-> **Language:** the interface speaks **English and German** (switch under *Settings > Language*). The name comes from the German *abhaken*, to tick off.
+> **Language:** the interface is **English** by default, with **German** included (switch under *Settings > Language*); more languages are welcome, see [TRANSLATING.md](TRANSLATING.md). The name comes from the German *abhaken*, to tick off.
 > Abhako is an independent hobby project and not affiliated with TickTick.
 
 ## Features
@@ -37,7 +37,7 @@ Lists, calendar, Eisenhower matrix, habits and a focus timer in one small web ap
 - Share from Android into the inbox (see below)
 - Optional [Paperless-ngx](https://docs.paperless-ngx.com) integration: link documents to tasks, send attachments to Paperless
 - Import TickTick CSV backups, export everything as JSON
-- Dark and light theme, English and German interface
+- Dark and light theme, English and German interface (translations are plain JSON files, [add yours](TRANSLATING.md))
 
 | | | |
 |---|---|---|
@@ -127,11 +127,15 @@ Everything else (language, reminder defaults, digest time, pomodoro lengths, whi
 
 ## Language
 
-Open *Settings > Language* (in German: *Einstellungen > Sprache*) and pick **Deutsch** or **English**. The choice is
-stored on the server, so it applies to every device and also to the push notifications (reminders, focus end,
-habit reminders, daily digest) and server messages. New installs start in German.
+Abhako starts in **English**. Open *Settings > Language* (in German: *Einstellungen > Sprache*) to switch; **Deutsch**
+is included. The choice is stored on the server, so it applies to every device and also to the push notifications
+(reminders, focus end, habit reminders, daily digest) and server messages.
 
-Quick add always understands both languages, independent of this setting:
+Each language other than English is one JSON file in [`static/i18n/`](static/i18n/) that is picked up
+automatically. Want Abhako in your language? [TRANSLATING.md](TRANSLATING.md) explains how to add one in a few
+steps (copy `de.json`, translate, run `python3 tools/i18n_check.py`, open a pull request).
+
+Quick add always understands English and German, independent of this setting:
 
 | | English | German |
 |---|---|---|
@@ -171,7 +175,7 @@ Chrome currently passes no files to installed web apps via the share sheet (link
 
 ## Tech
 
-Python (Flask, waitress, python-dateutil) and SQLite on the server, plain JavaScript in the browser (`app.js` plus the translations in `i18n.js`): no build step, no framework, no external requests. Icons from [Lucide](https://lucide.dev).
+Python (Flask, waitress, python-dateutil) and SQLite on the server, plain JavaScript in the browser (`app.js`, translation helpers in `i18n.js`, translations in `static/i18n/*.json`): no build step, no framework, no external requests. Icons from [Lucide](https://lucide.dev).
 
 ## License
 

@@ -12,6 +12,7 @@ A watchdog thread sends ntfy pushes for due reminders, finished focus
 sessions, habit reminders and the optional daily digest.
 TickTick CSV backups can be imported (idempotent via tasks.tt_id)."""
 import csv
+import glob
 import io
 import json
 import mimetypes
@@ -133,11 +134,11 @@ MAX_DEPTH = 3  # task > subtask > sub-subtask
 DEFAULT_SETTINGS = {
     "allday_time": "09:00",     # reminder base time for all-day tasks
     "default_reminder": "0",    # reminder preset for new timed tasks ('' = none)
-    "digest_time": "",          # daily "heute fällig" push (HH:MM, '' = off)
+    "digest_time": "",          # daily "due today" push (HH:MM, '' = off)
     "digest_sent": "",
     "pomo_focus": "25", "pomo_short": "5", "pomo_long": "15", "pomo_long_every": "4",
     "ntfy_topic": "",
-    "show_completed": "1",      # show the collapsed "Erledigt" group / done tasks in the calendar
+    "show_completed": "1",      # show the collapsed "Completed" group / done tasks in the calendar
     # modules that can be switched off in the settings (hidden from nav, data stays)
     "features": "cal,timeline,matrix,habits,pomo,kanban,paperless",
     "nav_order": "tasks,cal,matrix,habits,pomo",   # order of the mobile tab bar / desktop rail
@@ -145,73 +146,45 @@ DEFAULT_SETTINGS = {
     "features_rev": "1",        # one-shot migrations of the features list
     "paperless_keep": "0",
     "ntfy_inbox_since": "",     # last imported ntfy message id (or unix time on first start)      # 1 = keep the local attachment after it was consumed by Paperless            # json list: folder order in the sidebar (also keeps empty folders)
-    "lang": "de",               # UI + push language: de | en (global, the watchdog sends pushes)
+    "lang": "en",               # UI + push language: en or a static/i18n/<code>.json (global, the watchdog sends pushes)
     "version": "1",
 }
 PRIO = {0: "", 1: "niedrig", 3: "mittel", 5: "hoch"}
 
 
 # ---------------------------------------------------------------- i18n
-# German is the source text. The "lang" setting (de | en, global because pushes are sent from here)
-# switches user-visible server texts (error toasts, ntfy pushes, /drop replies) to English.
-# A tuple value = (singular, plural), picked by the first format arg.
-EN = {
-    "Upload zu groß (max. {0} MB pro Datei)": "Upload too large (max. {0} MB per file)",
-    "nicht erlaubt": "not allowed",
-    "nichts empfangen": "nothing received",
-    "Geteilt": "Shared",
-    "{0} Dateien geteilt": "{0} files shared",
-    ", {0} Datei": (", {0} file", ", {0} files"),
-    "Fehler: {0}": "error: {0}",
-    "Name fehlt": "Name missing",
-    "unbekannt": "unknown",
-    "Eingang": "Inbox",
-    "Eingang kann nicht gelöscht werden": "The inbox cannot be deleted",
-    "Name/Liste fehlt": "Name/list missing",
-    "Aufgabe kann nicht unter sich selbst hängen": "A task cannot be nested under itself",
-    "Maximal {0} Ebenen": "At most {0} levels",
-    "Titel fehlt": "Title missing",
-    "Keine wiederkehrende Aufgabe": "Not a recurring task",
-    "Das ist schon die letzte Wiederholung": "This is already the last occurrence",
-    "Datei fehlt": "File missing",
-    "Datei fehlt auf dem Server": "File missing on the server",
-    "{0}: größer als {1} MB": "{0}: larger than {1} MB",
-    "Paperless ist nicht eingerichtet": "Paperless is not set up",
-    "Token ungültig": "invalid token",
-    "keine Berechtigung": "no permission",
-    "Dokument nicht gefunden": "document not found",
-    "Paperless nicht erreichbar ({0})": "Paperless not reachable ({0})",
-    "Dokument {0}": "Document {0}",
-    "Wird schon an Paperless übertragen": "Already being sent to Paperless",
-    "Paperless hat die Übertragung nicht bestätigt": "Paperless did not confirm the upload",
-    "Paperless konnte das Dokument nicht übernehmen": "Paperless could not consume the document",
-    "from/to fehlt": "from/to missing",
-    "Zeitraum zu groß": "Date range too large",
-    "Benachrichtigungen kommen an.": "Notifications are arriving.",
-    "Keine TickTick-CSV (Kopfzeile 'Folder Name' fehlt)": "Not a TickTick CSV (header 'Folder Name' missing)",
-    "(ohne Titel)": "(untitled)",
-    "ganztägig": "all day",
-    "um {0}": "at {0}",
-    "heute": "today",
-    "Fällig {0} {1} · {2}": "Due {0} {1} · {2}",
-    "Verschieben": "Snooze",
-    "Erledigt": "Done",
-    "Fokus beendet": "Focus done",
-    "{0} min{1}. Zeit für eine Pause.": "{0} min{1}. Time for a break.",
-    "Pause vorbei": "Break is over",
-    "Weiter geht's.": "Back to it.",
-    "Gewohnheit: {0}": "Habit: {0}",
-    "Heute noch offen.": "Still open today.",
-    "Heute": "Today",
-    "Ohne Aufgabe": "No task",
-    "{0} Aufgaben heute": ("{0} task today", "{0} tasks today"),
-    "1 Aufgabe heute": "1 task today",
-    ", davon {0} überfällig": ", {0} of them overdue",
-}
+# English is the source language: tr("English text", *args) returns the text in the UI language.
+# Translations are the same JSON files the web client loads (static/i18n/<code>.json, see TRANSLATING.md).
+# The "lang" setting is global because the watchdog sends pushes in it. A list value = [one, other] (trn()).
+I18N_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "i18n")
+
+
+def load_languages():
+    """{code: dict} of every static/i18n/*.json; English is built in (the keys themselves)."""
+    out = {"en": {"_meta": {"name": "English", "locale": "en-GB"}}}
+    for fn in sorted(glob.glob(os.path.join(I18N_DIR, "*.json"))):
+        code = os.path.basename(fn)[:-5]
+        try:
+            with open(fn, encoding="utf-8") as f:
+                d = json.load(f)
+            if re.fullmatch(r"[a-z]{2,3}(-[A-Za-z0-9]{2,8})?", code) and code != "en" and isinstance(d, dict):
+                out[code] = d
+        except (OSError, ValueError) as e:
+            print("i18n: skipping", fn, e, flush=True)
+    return out
+
+
+LANGS = load_languages()
+
+
+def languages():
+    """[{code, name}] for the language selector, sorted by name."""
+    return sorted(({"code": k, "name": (v.get("_meta") or {}).get("name") or k} for k, v in LANGS.items()),
+                  key=lambda x: x["name"].casefold())
 
 
 def lang(c=None):
-    """UI language from the settings ('de' default). Works in requests and in the watchdog threads."""
+    """UI language from the settings ('en' default). Works in requests and in the watchdog threads."""
     try:
         own = c is None and not has_request_context()
         c = c or (db() if has_request_context() else connect())
@@ -220,16 +193,33 @@ def lang(c=None):
         finally:
             if own:
                 c.close()
-        return r[0] if r and r[0] in ("de", "en") else "de"
+        return r[0] if r and r[0] in LANGS else "en"
     except Exception:  # noqa: BLE001
-        return "de"
+        return "en"
 
 
-def tr(de, *a, lg=None):
-    s = EN.get(de, de) if (lg or lang()) == "en" else de
-    if isinstance(s, tuple):
-        s = s[0] if a and a[0] == 1 else s[1]
+def N_(s):
+    """Marks a key for tools/i18n_check.py; translated later by a tr call on the variable."""
+    return s
+
+
+def _key(k):
+    """English display of a key: 'Text|ctx' -> 'Text'."""
+    b = k.find("|")
+    return k[:b] if b > 0 else k
+
+
+def tr(key, *a, lg=None):
+    v = LANGS.get(lg or lang(), {}).get(key)
+    s = v if isinstance(v, str) else _key(key)
     return s.format(*a) if a else s
+
+
+def trn(one, other, n, *a, lg=None):
+    """Plural: one/other picked by n (n == 1 -> one); {0} = n, {1}.. = a."""
+    v = LANGS.get(lg or lang(), {}).get(one)
+    s = v[0 if n == 1 else 1] if isinstance(v, list) and len(v) == 2 else _key(one if n == 1 else other)
+    return s.format(n, *a)
 
 
 def now_utc():
@@ -308,7 +298,7 @@ def bump(c):
 
 
 def err(msg, code=400):
-    return jsonify(error=tr(msg)), code  # exact German texts get translated, formatted ones are translated by the caller
+    return jsonify(error=msg), code  # msg is already translated
 
 
 def body():
@@ -401,7 +391,7 @@ def headers(resp):
 
 @app.errorhandler(413)
 def too_large(_):  # json, not flask's html page (the client treats html as "session expired")
-    return err(tr("Upload zu groß (max. {0} MB pro Datei)", MAX_FILE_MB), 413)
+    return err(tr("Upload too large (max. {0} MB per file)", MAX_FILE_MB), 413)
 
 
 @app.get("/")
@@ -420,7 +410,7 @@ def new_inbox_task(c, title, content="", tt_id=None):
     ts = iso(now_utc())
     srt = c.execute("SELECT COALESCE(MIN(sort),0)-1 FROM tasks WHERE list_id=? AND parent_id IS NULL", (inbox,)).fetchone()[0]
     return c.execute("INSERT INTO tasks(list_id,title,content,sort,created_at,updated_at,tt_id) VALUES(?,?,?,?,?,?,?)",
-                     (inbox, (title or tr("Geteilt"))[:300], content or "", srt, ts, ts, tt_id)).lastrowid
+                     (inbox, (title or tr("Shared"))[:300], content or "", srt, ts, ts, tt_id)).lastrowid
 
 
 def save_attachment_bytes(c, tid, name, mime, data):
@@ -446,7 +436,7 @@ def ntfy_inbox_import(c, m):
         if (m.get("title") or "").strip():
             title, content = m["title"].strip(), msg
         else:  # first line becomes the title, the rest the description
-            title = first or (os.path.splitext(att["name"])[0] if att else tr("Geteilt"))
+            title = first or (os.path.splitext(att["name"])[0] if att else tr("Shared"))
             content = msg.split("\n", 1)[1].strip() if "\n" in msg else ""
         tid = new_inbox_task(c, title, content, "ntfy:" + mid)
         if att and att.get("url"):
@@ -503,7 +493,7 @@ def share_post():
           [(f.filename, f.mimetype) for f in files], flush=True)
     text, url = (request.form.get("text") or "").strip(), (request.form.get("url") or "").strip()
     title = (request.form.get("title") or "").strip() or text.replace(url, "").strip() or url \
-        or (os.path.splitext(safe_name(files[0].filename))[0] if files else tr("Geteilt"))
+        or (os.path.splitext(safe_name(files[0].filename))[0] if files else tr("Shared"))
     tid = new_inbox_task(c, title, url if url and url != title else "")
     save_attachments(c, tid, files)
     bump(c)
@@ -525,31 +515,34 @@ def drop_post():
     if not DROP_TOKEN or not secrets.compare_digest(auth.encode(), f"Bearer {DROP_TOKEN}".encode()):
         print("drop: 403, auth header", "missing" if not auth else
               f"len {len(auth)} starts {auth[:7]!r} ends-with-space {auth != auth.rstrip()}", flush=True)
-        return Response(tr("nicht erlaubt") + "\n", 403, mimetype="text/plain")
+        return Response(tr("not allowed") + "\n", 403, mimetype="text/plain")
     c = db()
     files = [f for key in request.files for f in request.files.getlist(key) if f and f.filename]
     text = (request.form.get("text") or "").strip()
     if any(text.startswith(p) for p in SHARE_PLACEHOLDERS):
         text = ""
     if not files and not text:
-        return Response(tr("nichts empfangen") + "\n", 400, mimetype="text/plain")
+        return Response(tr("nothing received") + "\n", 400, mimetype="text/plain")
     first, _, rest = text.partition("\n")
     title = first.strip() or (os.path.splitext(safe_name(files[0].filename))[0] if len(files) == 1
-                              else tr("{0} Dateien geteilt", len(files)))
+                              else tr("{0} files shared", len(files)))
     tid = new_inbox_task(c, title, rest.strip())
     e = save_attachments(c, tid, files) if files else None
     bump(c)
     c.commit()
     print("drop: task", tid, repr(title), len(files), "files", e or "", flush=True)
-    n = tr(", {0} Datei", len(files)) if files and title != tr("{0} Dateien geteilt", len(files)) else ""
-    if n and lang() == "de" and len(files) != 1:
-        n += "en"  # ", 3 Dateien" (German plural)
-    return Response(f"Abhako: {title}{n}" + (f" ({tr('Fehler: {0}', e)})" if e else "") + "\n", mimetype="text/plain")
+    n = trn(", {0} file", ", {0} files", len(files)) if files and title != tr("{0} files shared", len(files)) else ""
+    return Response(f"Abhako: {title}{n}" + (f" ({tr('error: {0}', e)})" if e else "") + "\n", mimetype="text/plain")
 
 
 @app.get("/manifest.json")
 def manifest():
-    return send_from_directory(app.static_folder, "manifest.json")
+    """static/manifest.json with description + lang in the UI language."""
+    with open(os.path.join(app.static_folder, "manifest.json"), encoding="utf-8") as f:
+        m = json.load(f)
+    lg = lang()
+    m["lang"], m["description"] = lg, tr("Tasks, lists, calendar, habits, focus", lg=lg)
+    return Response(json.dumps(m, ensure_ascii=False, indent=2), mimetype="application/json")
 
 
 @app.get("/sw.js")
@@ -606,6 +599,7 @@ def state():
         paperless={"enabled": bool(PL_TOKEN), "url": PL_PUBLIC},
         ntfy_inbox={"enabled": bool(NTFY_IN["token"]), "server": NTFY_IN["public"], "topic": NTFY_IN["topic"]},
         ntfy_url=NTFY_URL,
+        languages=languages(),
     )
 
 
@@ -635,7 +629,7 @@ def list_create():
     b = body()
     name = (b.get("name") or "").strip()
     if not name:
-        return err("Name fehlt")
+        return err(tr("Name missing"))
     c = db()
     srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM lists").fetchone()[0]
     cur = c.execute("INSERT INTO lists(name,color,folder,sort,view,created_at) VALUES(?,?,?,?,?,?)",
@@ -676,9 +670,9 @@ def list_delete(lid):
     c = db()
     r = c.execute("SELECT is_inbox FROM lists WHERE id=?", (lid,)).fetchone()
     if not r:
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     if r["is_inbox"]:
-        return err("Eingang kann nicht gelöscht werden")
+        return err(tr("The inbox cannot be deleted"))
     # tasks go to the trash inside the inbox so they stay restorable
     inbox = c.execute("SELECT id FROM lists WHERE is_inbox=1").fetchone()[0]
     ts = iso(now_utc())
@@ -695,7 +689,7 @@ def filter_create():
     b = body()
     name = (b.get("name") or "").strip()
     if not name:
-        return err("Name fehlt")
+        return err(tr("Name missing"))
     c = db()
     srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM filters").fetchone()[0]
     cur = c.execute("INSERT INTO filters(name,rules,sort,created_at) VALUES(?,?,?,?)",
@@ -741,7 +735,7 @@ def folder_rename():
     b = body()
     old, new = (b.get("old") or "").strip(), (b.get("new") or "").strip()
     if not old or not new:
-        return err("Name fehlt")
+        return err(tr("Name missing"))
     c = db()
     c.execute("UPDATE lists SET folder=? WHERE folder=?", (new, old))
     f = [new if x == old else x for x in _folders(c)]
@@ -769,7 +763,7 @@ def section_create():
     b = body()
     name = (b.get("name") or "").strip()
     if not name or not b.get("list_id"):
-        return err("Name/Liste fehlt")
+        return err(tr("Name/list missing"))
     c = db()
     srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM sections WHERE list_id=?", (b["list_id"],)).fetchone()[0]
     cur = c.execute("INSERT INTO sections(list_id,name,sort) VALUES(?,?,?)", (b["list_id"], name, srt))
@@ -861,9 +855,9 @@ def check_parent(c, tid, parent):
     if parent is None:
         return None
     if tid is not None and (parent == tid or parent in descendants(c, tid)):
-        return "Aufgabe kann nicht unter sich selbst hängen"
+        return tr("A task cannot be nested under itself")
     if depth(c, parent) + 1 + (subtree_height(c, tid) if tid else 0) >= MAX_DEPTH:
-        return tr("Maximal {0} Ebenen", MAX_DEPTH)
+        return tr("At most {0} levels", MAX_DEPTH)
     return None
 
 
@@ -882,7 +876,7 @@ def task_create():
     b = body()
     f = clean_task(b)
     if not f.get("title"):
-        return err("Titel fehlt")
+        return err(tr("Title missing"))
     c = db()
     e = check_parent(c, None, f.get("parent_id"))
     if e:
@@ -913,7 +907,7 @@ def task_create():
 def task_update(tid):
     c = db()
     if not c.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     conflicts = []
     e = apply_update(c, tid, body(), conflicts)
     if e:
@@ -952,7 +946,7 @@ def apply_update(c, tid, b, conflicts=None):
                 del b[k]
     f = clean_task(b)
     if "title" in f and not f["title"]:
-        return "Titel fehlt"
+        return tr("Title missing")
     if "start" in f or "due" in f:  # keep start <= due against the stored other half
         cur = c.execute("SELECT start, due FROM tasks WHERE id=?", (tid,)).fetchone()
         st, du = f.get("start", cur["start"]), f.get("due", cur["due"])
@@ -1016,7 +1010,7 @@ def task_complete(tid):
     c = db()
     t = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
     if not t:
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     b = body()
     # the same recurring task ticked on two devices (one offline): only the first tick advances it
     if t["repeat"] and b.get("expect_due") and t["status"] == 0 and b["expect_due"] != t["due"]:
@@ -1062,17 +1056,17 @@ def do_complete(c, tid, status=2):
 
 @app.post("/api/tasks/<int:tid>/skip")
 def task_skip(tid):
-    """'Diesen Termin überspringen': move a recurring task to its next date without a done copy."""
+    """'Skip this occurrence': move a recurring task to its next date without a done copy."""
     c = db()
     t = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
     if not t or not t["repeat"] or not t["due"]:
-        return err("Keine wiederkehrende Aufgabe")
+        return err(tr("Not a recurring task"))
     cnt = rr_count(t["repeat"])
     base = dict(t)
     base["repeat_from"] = "due"  # skipping always means: the next regular date
     nxt = next_due(base) if cnt is None or cnt > 1 else None
     if not nxt:
-        return err("Das ist schon die letzte Wiederholung")
+        return err(tr("This is already the last occurrence"))
     start = t["start"]
     if start:
         start = (date.fromisoformat(start) + (date.fromisoformat(nxt) - date.fromisoformat(t["due"]))).isoformat()
@@ -1132,7 +1126,7 @@ def task_restore(tid):
 
 @app.post("/api/tasks/purge-done")
 def purge_done():
-    """Settings > 'Alle erledigten löschen': every done / won't-do task -> trash."""
+    """Settings > 'Delete all completed': every done / won't-do task -> trash."""
     c = db()
     n = c.execute("UPDATE tasks SET deleted_at=? WHERE status!=0 AND deleted_at IS NULL",
                   (iso(now_utc()),)).rowcount
@@ -1164,10 +1158,10 @@ def safe_name(n):
 def attachment_upload(tid):
     c = db()
     if not c.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     files = request.files.getlist("file")
     if not files:
-        return err("Datei fehlt")
+        return err(tr("File missing"))
     e = save_attachments(c, tid, files)
     if e:
         return err(e)
@@ -1188,7 +1182,7 @@ def save_attachments(c, tid, files):
         size = os.path.getsize(full)
         if size > MAX_FILE_MB * 1024 * 1024:
             os.remove(full)
-            return tr("{0}: größer als {1} MB", name, MAX_FILE_MB)
+            return tr("{0}: larger than {1} MB", name, MAX_FILE_MB)
         mime = (f.mimetype if f.mimetype and f.mimetype != "application/octet-stream" else None) \
             or mimetypes.guess_type(name)[0] or "application/octet-stream"
         c.execute("INSERT INTO attachments(task_id,name,mime,size,path,created_at) VALUES(?,?,?,?,?,?)",
@@ -1201,10 +1195,10 @@ def save_attachments(c, tid, files):
 def attachment_get(aid):
     a = db().execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
     if not a:
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     full = os.path.join(ATT_DIR, a["path"])
     if not os.path.isfile(full):
-        return err("Datei fehlt auf dem Server", 404)
+        return err(tr("File missing on the server"), 404)
     inline = a["mime"] in INLINE_TYPES and request.args.get("dl") != "1"
     resp = send_file(full, mimetype=a["mime"] if inline else "application/octet-stream",
                      as_attachment=not inline, download_name=a["name"], conditional=True, max_age=0)
@@ -1222,7 +1216,7 @@ class PaperlessError(Exception):
 
 def pl_req(path, method="GET", body=None, ctype=None, raw=False, timeout=20):
     if not PL_TOKEN:
-        raise PaperlessError(tr("Paperless ist nicht eingerichtet"))
+        raise PaperlessError(tr("Paperless is not set up"))
     hdr = {"Authorization": f"Token {PL_TOKEN}", "Accept": "application/json"}
     if ctype:
         hdr["Content-Type"] = ctype
@@ -1232,11 +1226,11 @@ def pl_req(path, method="GET", body=None, ctype=None, raw=False, timeout=20):
             data = r.read()
             return (data, r.headers.get("Content-Type", "")) if raw else json.loads(data or b"null")
     except urllib.error.HTTPError as e:
-        msg = {401: "Token ungültig", 403: "keine Berechtigung", 404: "Dokument nicht gefunden"}.get(e.code)
+        msg = {401: N_("invalid token"), 403: N_("no permission"), 404: N_("document not found")}.get(e.code)
         raise PaperlessError(f"Paperless: {tr(msg)}" if msg else
                              f"Paperless: HTTP {e.code} {e.read()[:200].decode('utf-8', 'replace')}") from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise PaperlessError(tr("Paperless nicht erreichbar ({0})", e)) from e
+        raise PaperlessError(tr("Paperless not reachable ({0})", e)) from e
 
 
 _corr = {"at": 0, "map": {}}
@@ -1252,7 +1246,7 @@ def pl_correspondents():
 
 def pl_doc(doc_id):
     d = pl_req(f"/api/documents/{int(doc_id)}/?fields=id,title,created,correspondent")
-    return {"doc_id": d["id"], "title": d.get("title") or tr("Dokument {0}", d['id']),
+    return {"doc_id": d["id"], "title": d.get("title") or tr("Document {0}", d['id']),
             "correspondent": pl_correspondents().get(d.get("correspondent"), "") if d.get("correspondent") else "",
             "created": (d.get("created") or "")[:10]}
 
@@ -1298,7 +1292,7 @@ def paperless_thumb(doc_id):
 def paperless_link(tid):
     c = db()
     if not c.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     doc_id = int(body().get("doc_id") or 0)
     if not c.execute("SELECT 1 FROM paperless_links WHERE task_id=? AND doc_id=?", (tid, doc_id)).fetchone():
         d = pl_doc(doc_id)
@@ -1315,7 +1309,7 @@ def paperless_unlink(lid):
     c = db()
     r = c.execute("SELECT task_id FROM paperless_links WHERE id=?", (lid,)).fetchone()
     if not r:
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     c.execute("DELETE FROM paperless_links WHERE id=?", (lid,))
     bump(c)
     c.commit()
@@ -1345,9 +1339,9 @@ def attachment_to_paperless(aid):
     c = db()
     a = c.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
     if not a:
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     if c.execute("SELECT 1 FROM paperless_links WHERE att_id=? AND status='pending'", (aid,)).fetchone():
-        return err("Wird schon an Paperless übertragen")
+        return err(tr("Already being sent to Paperless"))
     with open(os.path.join(ATT_DIR, a["path"]), "rb") as f:
         data = f.read()
     title = os.path.splitext(a["name"])[0]
@@ -1378,7 +1372,7 @@ def paperless_poll(c):
         if not t:
             if age > 1800:
                 c.execute("UPDATE paperless_links SET status='error', message=? WHERE id=?",
-                          (tr("Paperless hat die Übertragung nicht bestätigt", lg=lang(c)), p["id"]))
+                          (tr("Paperless did not confirm the upload", lg=lang(c)), p["id"]))
                 bump(c)
                 c.commit()
             continue
@@ -1401,7 +1395,7 @@ def paperless_poll(c):
                 doc_id = int(m.group(1))
             else:
                 c.execute("UPDATE paperless_links SET status='error', message=? WHERE id=?",
-                          ((res_txt or tr("Paperless konnte das Dokument nicht übernehmen", lg=lang(c)))[:300], p["id"]))
+                          ((res_txt or tr("Paperless could not consume the document", lg=lang(c)))[:300], p["id"]))
                 bump(c)
                 c.commit()
                 continue
@@ -1435,7 +1429,7 @@ def attachment_delete(aid):
     c = db()
     a = c.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
     if not a:
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     c.execute("DELETE FROM attachments WHERE id=?", (aid,))
     bump(c)
     c.commit()
@@ -1477,7 +1471,7 @@ def task_batch():
         if action == "patch":
             e = apply_update(c, tid, data)
             if e:
-                errors.append(tr(e))
+                errors.append(e)
         elif action == "complete":
             do_complete(c, tid, int(data.get("status", 2)))
         elif action == "reopen":
@@ -1496,9 +1490,9 @@ def occurrences():
         lo = date.fromisoformat(request.args["from"])
         hi = date.fromisoformat(request.args["to"])
     except (KeyError, ValueError):
-        return err("from/to fehlt")
+        return err(tr("from/to missing"))
     if (hi - lo).days > 400:
-        return err("Zeitraum zu groß")
+        return err(tr("Date range too large"))
     out = []
     for t in db().execute("""SELECT id, due, repeat FROM tasks WHERE status=0 AND deleted_at IS NULL
                              AND repeat!='' AND due IS NOT NULL AND due<=?""", (hi.isoformat(),)):
@@ -1524,7 +1518,7 @@ def habit_create():
     b = body()
     name = (b.get("name") or "").strip()
     if not name:
-        return err("Name fehlt")
+        return err(tr("Name missing"))
     c = db()
     srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM habits").fetchone()[0]
     cur = c.execute("INSERT INTO habits(name,color,goal,days,remind_at,sort,per_week,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -1613,7 +1607,7 @@ def pomo_action(pid, action):
     c = db()
     p = c.execute("SELECT * FROM pomos WHERE id=?", (pid,)).fetchone()
     if not p:
-        return err("unbekannt", 404)
+        return err(tr("unknown"), 404)
     ts = now_utc()
     if action == "pause" and not p["paused_at"] and not p["end"]:
         c.execute("UPDATE pomos SET paused_at=? WHERE id=?", (iso(ts), pid))
@@ -1642,7 +1636,7 @@ def pomo_stats_api():
         d = parse_iso(r["start"]).astimezone(TZ).date().isoformat()
         m = pomo_elapsed(r) / 60
         per_day[d] = per_day.get(d, 0) + m
-        k = r["title"] or tr("Ohne Aufgabe")
+        k = r["title"] or tr("No task")
         per_task[k] = per_task.get(k, 0) + m
     recent = [dict(id=r["id"], title=r["title"], start=r["start"], minutes=round(pomo_elapsed(r) / 60),
                    done=r["done"]) for r in rows[:30]]
@@ -1660,7 +1654,7 @@ def settings_update():
     c = db()
     for k, v in b.items():
         if k in DEFAULT_SETTINGS and k not in ("version", "digest_sent", "ntfy_topic"):
-            if k == "lang" and v not in ("de", "en"):
+            if k == "lang" and v not in LANGS:
                 continue
             c.execute("UPDATE settings SET value=? WHERE key=?", (str(v), k))
     bump(c)
@@ -1670,7 +1664,7 @@ def settings_update():
 
 @app.post("/api/ntfy/test")
 def ntfy_test():
-    ok = ntfy("Abhako: Test", tr("Benachrichtigungen kommen an."), "default", PUBLIC_URL)
+    ok = ntfy("Abhako: Test", tr("Notifications are arriving."), "default", PUBLIC_URL)
     return jsonify(ok=ok)
 
 
@@ -1723,7 +1717,7 @@ def import_ticktick(c, text):
     text = text.lstrip("﻿")
     i = text.find('"Folder Name"')
     if i < 0:
-        raise ValueError("Keine TickTick-CSV (Kopfzeile 'Folder Name' fehlt)")
+        raise ValueError(tr("Not a TickTick CSV (header 'Folder Name' missing)"))
     rows = list(csv.DictReader(io.StringIO(text[i:])))
     lists = {r["name"]: r["id"] for r in c.execute("SELECT id, name FROM lists")}
     inbox = c.execute("SELECT id FROM lists WHERE is_inbox=1").fetchone()[0]
@@ -1793,7 +1787,7 @@ def import_ticktick(c, text):
             """INSERT INTO tasks(list_id,section_id,title,content,priority,status,due,due_time,reminders,
                reminded,repeat,sort,created_at,updated_at,completed_at,tt_id,start)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (lid, sec, (r.get("Title") or tr("(ohne Titel)", lg=lang(c))).strip(), content, int(r.get("Priority") or 0),
+            (lid, sec, (r.get("Title") or tr("(untitled)", lg=lang(c))).strip(), content, int(r.get("Priority") or 0),
              status, due, due_time, rems, json.dumps(reminded), repeat, stats["tasks"], created, ts, completed, tt,
              start))
         idmap[tt] = cur.lastrowid
@@ -1815,7 +1809,7 @@ def import_ticktick(c, text):
 def import_api():
     f = request.files.get("file")
     if not f:
-        return err("Datei fehlt")
+        return err(tr("File missing"))
     try:
         stats = import_ticktick(db(), f.read().decode("utf-8-sig"))
     except (ValueError, KeyError) as e:
@@ -1851,7 +1845,7 @@ def watchdog_tick(c):
         paperless_poll(c)
     s = settings(c)
     NTFY_TOPIC = s["ntfy_topic"]
-    lg = s.get("lang") or "de"
+    lg = s.get("lang") if s.get("lang") in LANGS else "en"
     now = local_now()
     # task reminders -- fire once per (due, offset); skip if missed by > 6 h
     rows = c.execute("""SELECT t.*, l.name AS list_name, l.is_inbox AS list_inbox FROM tasks t JOIN lists l ON l.id=t.list_id
@@ -1872,14 +1866,14 @@ def watchdog_tick(c):
             changed = True
             if now - at > timedelta(hours=6):
                 continue
-            when = tr("ganztägig", lg=lg) if not t["due_time"] else tr("um {0}", t["due_time"], lg=lg)
-            day = tr("heute", lg=lg) if t["due"] == now.date().isoformat() else \
+            when = tr("all day", lg=lg) if not t["due_time"] else tr("at {0}", t["due_time"], lg=lg)
+            day = tr("today", lg=lg) if t["due"] == now.date().isoformat() else \
                 date.fromisoformat(t["due"]).strftime("%d.%m." if lg == "de" else "%d %b")
-            lname = tr("Eingang", lg=lg) if t["list_inbox"] and t["list_name"] == "Eingang" else t["list_name"]
-            ntfy(t["title"], tr("Fällig {0} {1} · {2}", day, when, lname, lg=lg),
+            lname = tr("Inbox", lg=lg) if t["list_inbox"] and t["list_name"] == "Eingang" else t["list_name"]
+            ntfy(t["title"], tr("Due {0} {1} · {2}", day, when, lname, lg=lg),
                  "high" if t["priority"] == 5 else "default", f"{PUBLIC_URL}/#t/{t['id']}",
-                 actions=[(tr("Verschieben", lg=lg), f"{PUBLIC_URL}/#snooze/{t['id']}"),
-                          (tr("Erledigt", lg=lg), f"{PUBLIC_URL}/#done/{t['id']}")])
+                 actions=[(tr("Snooze", lg=lg), f"{PUBLIC_URL}/#snooze/{t['id']}"),
+                          (tr("Done|action", lg=lg), f"{PUBLIC_URL}/#done/{t['id']}")])
         if changed:
             c.execute("UPDATE tasks SET reminded=? WHERE id=?", (json.dumps(fired[-20:]), t["id"]))
             c.commit()
@@ -1890,10 +1884,10 @@ def watchdog_tick(c):
             c.execute("UPDATE pomos SET notified=1 WHERE id=?", (p["id"],))
             c.commit()
             if p["kind"] == "focus":
-                ntfy(tr("Fokus beendet", lg=lg), tr("{0} min{1}. Zeit für eine Pause.", p["minutes"], " · " + p["title"] if p["title"] else "", lg=lg),
+                ntfy(tr("Focus done", lg=lg), tr("{0} min{1}. Time for a break.", p["minutes"], " · " + p["title"] if p["title"] else "", lg=lg),
                      "default", f"{PUBLIC_URL}/#pomo")
             else:
-                ntfy(tr("Pause vorbei", lg=lg), tr("Weiter geht's.", lg=lg), "default", f"{PUBLIC_URL}/#pomo")
+                ntfy(tr("Break is over", lg=lg), tr("Back to it.", lg=lg), "default", f"{PUBLIC_URL}/#pomo")
     # habit reminders
     today = now.date().isoformat()
     wd = str(now.isoweekday())
@@ -1911,7 +1905,7 @@ def watchdog_tick(c):
         c.commit()
         done = c.execute("SELECT count FROM habit_logs WHERE habit_id=? AND day=?", (h["id"], today)).fetchone()
         if not done or done[0] < h["goal"]:
-            ntfy(tr("Gewohnheit: {0}", h["name"], lg=lg), tr("Heute noch offen.", lg=lg), "default", f"{PUBLIC_URL}/#habits")
+            ntfy(tr("Habit: {0}", h["name"], lg=lg), tr("Still open today.", lg=lg), "default", f"{PUBLIC_URL}/#habits")
     # daily digest
     dt = s.get("digest_time") or ""
     if dt and s.get("digest_sent") != today and now.strftime("%H:%M") >= dt:
@@ -1923,9 +1917,9 @@ def watchdog_tick(c):
         if rows:
             over = sum(1 for r in rows if r["due"] < today)
             lines = [f"- {r['title']}" + (f" ({r['due_time']})" if r["due_time"] else "") for r in rows[:15]]
-            head = (tr("{0} Aufgaben heute", len(rows), lg=lg) if len(rows) != 1 else tr("1 Aufgabe heute", lg=lg)) + \
-                (tr(", davon {0} überfällig", over, lg=lg) if over else "")
-            ntfy(tr("Heute", lg=lg), head + "\n" + "\n".join(lines), "default", f"{PUBLIC_URL}/#today")
+            head = trn("{0} task today", "{0} tasks today", len(rows), lg=lg) + \
+                (tr(", {0} of them overdue", over, lg=lg) if over else "")
+            ntfy(tr("Today", lg=lg), head + "\n" + "\n".join(lines), "default", f"{PUBLIC_URL}/#today")
 
 
 def watchdog():

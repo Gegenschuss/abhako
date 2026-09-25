@@ -1,13 +1,13 @@
 {
   "name": "Abhako",
   "short_name": "Abhako",
-  "description": "Aufgaben, Listen, Kalender, Gewohnheiten, Fokus",
+  "description": "Tasks, lists, calendar, habits, focus",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#0f1115",
   "theme_color": "#161a21",
-  "lang": "de",
+  "lang": "en",
   "icons": [
     {
       "src": "/static/icon-192.png",
