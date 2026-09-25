@@ -51,7 +51,7 @@ Lists, calendar, Eisenhower matrix, habits and a focus timer in one small web ap
 Requirements: Docker with Compose.
 
 ```sh
-git clone https://github.com/<you>/abhako.git
+git clone https://github.com/Gegenschuss/abhako.git
 cd abhako
 cp .env.example .env        # set TZ and PUBLIC_URL at least
 docker compose up -d --build
@@ -63,6 +63,22 @@ Abhako now listens on `http://127.0.0.1:3040`. Data (SQLite database and attachm
 > **Abhako has no login of its own.** It is built for a single user behind an authenticating reverse proxy
 > (Authelia, Authentik, oauth2-proxy, basic auth, ...) or inside a private network / VPN.
 > Never expose port 3040 directly to the internet.
+
+## Try it locally
+
+No proxy needed for a quick look. After the quick start above, open **http://localhost:3040** on the same machine.
+Everything works there, including installing it as an app and offline mode (browsers treat `localhost` as secure).
+Push notifications, Paperless and `/drop` stay off until you configure them.
+
+To try it from your phone or another device on your network, change the port line in `docker-compose.yml` to
+`"3040:3040"`, run `docker compose up -d` again and open `http://<your-computer's-ip>:3040`. Over plain HTTP the
+app works, but it cannot be installed and has no offline mode.
+
+> [!WARNING]
+> Without a proxy there is no login: anyone on your network can read and change everything. Fine for a test at
+> home; for daily use put it behind a reverse proxy with authentication (next section) and switch the port back.
+
+To remove the test again: `docker compose down` and delete the folder (your test data is in `./data`).
 
 ## Reverse proxy
 
