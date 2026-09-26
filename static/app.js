@@ -71,6 +71,8 @@ const P = {
   help: '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01"/>',
   comment: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
+  chart: '<path d="M3 3v18h18"/><path d="M7 16v-5M12 16V8M17 16v-8"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
 };
 const ic = (n, c = '') => `<svg class="i ${c}" viewBox="0 0 24 24">${P[n] || ''}</svg>`;
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
@@ -134,13 +136,15 @@ const S = {
   calMode: LS.get('calMode', 'month'), tlStart: null, quickPreset: {}, editContent: false,
   tl: {id: null}, drafts: {}, cfiles: {}, cedit: null, editLink: false,  // comments timeline of the open task
 };
-const FEATS = [['cal', N_('Calendar')], ['timeline', N_('Timeline')], ['matrix', N_('Eisenhower matrix')], ['habits', N_('Habits')], ['pomo', N_('Focus (Pomodoro)')], ['kanban', N_('Kanban')], ['paperless', N_('Paperless link')], ['collab', N_('Collaboration')]];
-const FEAT_DESC = {collab: N_('Comments, activity history, @mentions, News, sharing lists and assigning tasks')};
+const FEATS = [['cal', N_('Calendar')], ['timeline', N_('Timeline')], ['matrix', N_('Eisenhower matrix')], ['habits', N_('Habits')], ['pomo', N_('Focus (Pomodoro)')], ['kanban', N_('Kanban')], ['paperless', N_('Paperless link')], ['collab', N_('Collaboration')], ['stats', N_('Statistics')]];
+const FEAT_DESC = {collab: N_('Comments, activity history, @mentions, News, sharing lists and assigning tasks'), stats: N_('Completed tasks, on-time rate, overdue trend, focus time and habit streaks')};
 const feat = f => (S.settings.features ?? FEATS.map(x => x[0]).join(',')).split(',').includes(f);
 // collaboration module off: no comments / activity / mentions / sharing / assigning in the UI (data stays, API works)
 const collab = () => feat('collab');
 // module views: tasks always, News with the collaboration module, the rest by their own switch
 const modOn = m => m === 'tasks' || (m === 'news' ? collab() : feat(m));
+// no "+" button on views without tasks
+const noFab = () => ['habits', 'pomo', 'news', 'stats'].includes(S.route.mod) || ['done', 'trash', 'search'].includes(S.route.key);
 const inbox = () => S.lists.find(l => l.is_inbox);
 const listById = id => S.lists.find(l => l.id === id);
 // sharing: role of the logged-in user in a list (owner | edit | view); view = read only
@@ -206,7 +210,9 @@ function enqueue(method, url, body) {
   OUT.q.push(e); LS.set('outbox', OUT.q);
   renderTop();
   if (OUT.online) setTimeout(flush, 50);
-  return applyLocal(e);
+  const r = applyLocal(e);
+  if (r && typeof r === 'object') Object.defineProperty(r, '_q', {value: e, configurable: true});  // for undo (see UNDO)
+  return r;
 }
 function applyLocal(e) {
   const {method, url, body = {}} = e;
@@ -262,11 +268,13 @@ async function flush() {
         if (e.tmp) { idmap[e.tmp] = j.id; LS.set('idmap', idmap); if (S.sel === e.tmp) S.sel = j.id; }
         if (j && j.conflicts?.length) addConflicts(j.id, j.conflicts, j.title);
         if (j && j.skipped) skipped++;
+        e.res = j;
       } catch (err) {
         if (err instanceof Offline || err.message === 'auth') return;
         console.warn('outbox: dropped', e, err);  // e.g. 404: deleted on another device
-        dropped++;
+        dropped++; e.res = null;
       }
+      e.done = true;
       OUT.q.shift(); LS.set('outbox', OUT.q);
     }
     LS.set('idmap', {});
@@ -344,6 +352,7 @@ function applyState(j) {
   S.paperless = j.paperless || {enabled: false};
   S.ntfyInbox = j.ntfy_inbox || {enabled: false};
   S.news = j.news || {unread: 0, sig: ''};
+  S.templates = j.templates || [];
   // language changed on another device: switch once its file is loaded (the boot awaits it itself)
   if (S.booted && (j.settings.lang || 'en') !== I18N.code) i18nLoad(j.settings.lang).then(ok => { if (ok) render(); });
 }
@@ -412,14 +421,18 @@ function parseHash() {
   if (a === 'f' && b) return {mod: 'tasks', key: 'f:' + b};
   if (a === 'l') return {mod: 'tasks', key: 'l:' + b};
   if (a === 'tag') return {mod: 'tasks', key: 'tag:' + b};
-  if (['cal', 'matrix', 'habits', 'pomo', 'news'].includes(a)) return {mod: a, key: a};
+  if (['cal', 'matrix', 'habits', 'pomo', 'news', 'stats'].includes(a)) return {mod: a, key: a};
   if (SMART[a]) return {mod: 'tasks', key: a};
   return {mod: 'tasks', key: 'today'};
 }
 function go(hash) { if (location.hash !== '#' + hash) location.hash = hash; else route(); }
 async function route() {
   const r = parseHash();
-  if (!modOn(r.mod)) { r.mod = 'tasks'; r.key = LS.get('lastKey', 'today'); }
+  if (!modOn(r.mod)) {  // e.g. the "News" app shortcut while collaboration is off
+    const off = r.mod;
+    if (S.booted && (off === 'news' || off === 'stats')) setTimeout(() => toast(off === 'news' ? tr('News are part of the collaboration module, which is off (Settings > Layout)') : tr('Statistics are off (Settings > Layout)')), 50);
+    r.mod = 'tasks'; r.key = LS.get('lastKey', 'today');
+  }
   if (r.key.startsWith('f:') && !S.filters.some(f => f.id === +r.key.slice(2))) r.key = 'today';
   S.route = {mod: r.mod, key: r.key};
   if (S.route.mod !== 'tasks' || r.key !== S.lastRouteKey) { S.multi.clear(); S.multiMode = false; }
@@ -718,7 +731,7 @@ function quickDefaults() {
 function render() {
   renderRail(); renderSide(); renderTop(); renderView(); renderTabs();
   $('#fab').innerHTML = ic('plus'); $('#fab').setAttribute('aria-label', tr('New task'));
-  $('#fab').classList.toggle('gone', ['habits', 'pomo', 'news'].includes(S.route.mod) || ['done', 'trash', 'search'].includes(S.route.key) || S.multi.size > 0);
+  $('#fab').classList.toggle('gone', noFab() || S.multi.size > 0);
   if (S.sel && S.tasks.has(S.sel) && !$('#detail').contains(document.activeElement)) renderDetail();
   if (S.sel && !S.tasks.has(S.sel) && !(S.extra || []).some(t => t.id === S.sel)) closeDetail();
 }
@@ -755,6 +768,7 @@ function tabItem(id) {
   if (kind === 'f') { const f = S.filters.find(x => x.id === +v); return f ? {id, go: 'f/' + v, icon: ic('filter', 'l'), label: f.name, key: 'f:' + v} : null; }
   if (kind === 'tag' && v) return {id, go: 'tag/' + encodeURIComponent(v), icon: ic('tag', 'l'), label: v, key: 'tag:' + v};
   if (id === 'news') return collab() ? {id, go: 'news', icon: ic('bell', 'l'), label: tr('News'), mod: 'news'} : null;
+  if (id === 'stats') return feat('stats') ? {id, go: 'stats', icon: ic('chart', 'l'), label: tr('Statistics'), mod: 'stats'} : null;
   if (id === 'search') return {id, go: 'search', icon: ic('search', 'l'), label: tr('Search'), key: 'search'};
   if (id === 'settings') return {id, act: 'settings', icon: ic('gear', 'l'), label: tr('Settings')};
   return null;
@@ -778,6 +792,7 @@ function renderRail() {
   $('#rail').innerHTML = `<div class="logo"><img src="/static/icon.svg" alt="Abhako"></div>` +
     [...items, ...extra].map(t => tabBtn(t, t.id === on && S.route.key !== 'search', 'rbtn')).join('') +
     `<button class="rbtn ${S.route.key === 'search' ? 'on' : ''}" data-go="search" title="${tr('Search (/)')}">${ic('search')}</button>
+     ${feat('stats') && !items.some(t => t.id === 'stats') ? `<button class="rbtn ${S.route.mod === 'stats' ? 'on' : ''}" data-go="stats" title="${tr('Statistics')}">${ic('chart')}</button>` : ''}
      <div class="spacer"></div>
      <button class="rbtn" data-act="settings" title="${tr('Settings')}">${ic('gear')}</button>`;
 }
@@ -786,7 +801,7 @@ function tabOverflow() {
   const items = tabItems(), shown = items.length > TAB_MAX ? items.slice(0, TAB_MAX - 1) : items;
   const rest = items.slice(shown.length);
   const mods2 = mods().filter(([m]) => !items.some(t => t.mod === m)).map(([m]) => tabItem('m:' + m));
-  const misc = ['news', 'search', 'settings'].filter(k => !items.some(t => t.id === k)).map(tabItem).filter(Boolean);
+  const misc = ['news', 'stats', 'search', 'settings'].filter(k => !items.some(t => t.id === k)).map(tabItem).filter(Boolean);
   // search + settings are also in the side menu: they alone do not justify a "Mehr" tab
   return {shown, more: rest.length || mods2.length ? [...rest, ...mods2, ...misc] : []};
 }
@@ -799,7 +814,7 @@ function renderTabs() {
 }
 function tabsMore(anchor) {
   const {more} = tabOverflow();
-  menu(anchor, [...more.map(t => ({label: t.id === 'news' && S.news?.unread ? `${t.label} (${S.news.unread})` : t.label, icon: t.id === 'settings' ? 'gear' : t.id === 'search' ? 'search' : t.id === 'news' ? 'bell' : t.mod ? MODS.find(x => x[0] === t.mod)[1] : t.id.startsWith('f:') ? 'filter' : t.id.startsWith('tag:') ? 'tag' : t.id.startsWith('s:') ? SMART[t.key].icon : 'list',
+  menu(anchor, [...more.map(t => ({label: t.id === 'news' && S.news?.unread ? `${t.label} (${S.news.unread})` : t.label, icon: t.id === 'settings' ? 'gear' : t.id === 'search' ? 'search' : t.id === 'news' ? 'bell' : t.id === 'stats' ? 'chart' : t.mod ? MODS.find(x => x[0] === t.mod)[1] : t.id.startsWith('f:') ? 'filter' : t.id.startsWith('tag:') ? 'tag' : t.id.startsWith('s:') ? SMART[t.key].icon : 'list',
     fn: () => t.act ? settingsModal() : go(t.go)})), '-', {label: tr('Customize tab bar'), icon: 'edit', fn: () => settingsModal('tabbar')}]);
 }
 function counts() {
@@ -856,6 +871,7 @@ function renderSide() {
       ${row('done', ic('done'), tr('Completed'), '')}
       ${row('trash', ic('trash'), tr('Trash'), S.counts.trash || '')}
       ${archived.length ? `<div class="folder">${ic('eye', 's')}${tr('Archived')}</div>` + archived.map(l => row('l:' + l.id, `<span class="sw"></span>`, listName(l.name), '', `data-list="${l.id}"`)).join('') : ''}
+      ${feat('stats') ? `<button class="srow ${S.route.mod === 'stats' ? 'on' : ''}" data-go="stats">${ic('chart')}<span class="n">${tr('Statistics')}</span></button>` : ''}
       <button class="srow" data-go="search">${ic('search')}<span class="n">${tr('Search')}</span></button>
       <button class="srow" data-act="settings">${ic('gear')}<span class="n">${tr('Settings')}</span></button>
       ${S.me ? `<button class="srow suser" data-act="user-menu" title="${esc(S.me.username)}"><span class="avatar">${esc(initials(S.me.display_name))}</span><span class="n">${esc(S.me.display_name)}</span></button>` : ''}
@@ -863,7 +879,7 @@ function renderSide() {
 }
 function renderTop() {
   const m = S.route.mod, k = S.route.key;
-  let title = m === 'tasks' ? titleFor(k) : tr({cal: N_('Calendar'), matrix: N_('Eisenhower matrix'), habits: N_('Habits'), pomo: N_('Focus'), news: N_('News')}[m]);
+  let title = m === 'tasks' ? titleFor(k) : tr({cal: N_('Calendar'), matrix: N_('Eisenhower matrix'), habits: N_('Habits'), pomo: N_('Focus'), news: N_('News'), stats: N_('Statistics')}[m]);
   let acts = '';
   if (m === 'tasks' && (k.startsWith('l:') || k === 'inbox')) {
     const l = k === 'inbox' ? inbox() : listById(+k.slice(2));
@@ -899,6 +915,7 @@ function renderView() {
   else if (m === 'habits') el.innerHTML = viewHabits();
   else if (m === 'pomo') { el.innerHTML = viewPomo(); loadPomoStats(); }
   else if (m === 'news') el.innerHTML = viewNews();
+  else if (m === 'stats') el.innerHTML = viewStats();
   else if (S.route.key === 'search') el.innerHTML = viewSearch();
   else if (S.route.key === 'done' || S.route.key === 'trash') el.innerHTML = viewHistory();
   else if (isKanban()) el.innerHTML = viewKanban();
@@ -944,7 +961,10 @@ function taskRow(t, opts = {}) {
   return h;
 }
 function qaddBox(extraCls = '') {
-  return `<div class="qadd inline ${extraCls}"><div class="box">${ic('plus')}<input id="qinput" placeholder="${tr('Add task: “Dentist tomorrow 3pm !high #private ~list”')}" autocomplete="off" enterkeyhint="done"></div><div class="chips" id="qchips"></div></div>`;
+  return `<div class="qadd inline ${extraCls}"><div class="box">${ic('plus')}<input id="qinput" placeholder="${tr('Add task: “Dentist tomorrow 3pm !high #private ~list”')}" autocomplete="off" enterkeyhint="done">${tplBtn()}</div><div class="chips" id="qchips"></div></div>`;
+}
+function tplBtn() {
+  return tplOf('task').length ? `<button class="iconbtn qtpl" data-act="tpl-use" title="${tr('New from template')}" aria-label="${tr('New from template')}">${ic('copy', 's')}</button>` : '';
 }
 function viewList() {
   const v = viewTasks();
@@ -1968,13 +1988,87 @@ async function patchTask(id, body) {
   putTask(t); render(); if (S.sel === id) renderDetail();
   return t;
 }
+
+// ------------------------------------------------------------------ undo
+// One undo at a time: a toast with "Undo" (6 s, Ctrl/Cmd+Z while it is visible). Online, the reverse
+// goes to the server (signed undo payload for completions, restore for the trash, a reverse PATCH with
+// _prev for moves and date changes, batch actions per task). An operation that is still waiting in the
+// offline outbox is simply taken out of the queue and the local state restored (never sent); one that
+// is being sent right now is waited for, then reversed on the server.
+const UNDO = {cur: null};
+const UNDO_FIELDS = ['list_id', 'section_id', 'parent_id', 'due', 'due_time', 'start', 'duration', 'reminders', 'repeat', 'repeat_from', 'priority', 'pinned', 'assignee_id'];
+const snapTask = t => t ? JSON.parse(JSON.stringify(t)) : null;
+const withKids = id => { const out = [], walk = x => { for (const k of children(x)) { out.push(snapTask(k)); walk(k.id); } }; out.push(snapTask(taskById(id))); walk(id); return out.filter(Boolean); };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// res: the api() result of the forward operation (carries its outbox entry as _q when it was queued);
+// snaps: task copies from before (local restore); server(result): sends the reverse, false = no "Undone" toast
+function offerUndo(msg, res, snaps, server) {
+  const u = {entry: res && res._q || null, res, snaps: snaps || [], server, done: false};
+  UNDO.cur = u;
+  toast(msg, () => runUndo(u), 6000);
+}
+const cancellable = e => { const i = OUT.q.indexOf(e); return i >= 0 && !(OUT.flushing && i === 0); };
+async function runUndo(u) {
+  if (!u || u.done) return;
+  u.done = true;
+  if (UNDO.cur === u) UNDO.cur = null;
+  $('#toast').classList.add('hidden');
+  const e = u.entry;
+  if (e) {  // queued offline: cancel it if it has not left yet, else wait for its answer
+    for (let n = 0; n < 400 && !e.done && !cancellable(e); n++) await sleep(150);
+    if (!e.done && cancellable(e)) {
+      OUT.q.splice(OUT.q.indexOf(e), 1); LS.set('outbox', OUT.q);
+      for (const t of u.snaps) S.tasks.set(t.id, t);
+      if (e.tmp) S.tasks.delete(e.tmp);
+      renderTop(); render(); if (S.sel && S.tasks.has(S.sel)) renderDetail();
+      toast(tr('Undone')); return;
+    }
+    if (!e.res) { await load().catch(() => {}); render(); return; }  // was not applied (dropped) -> nothing to undo
+  }
+  let ok;
+  try { ok = await u.server(e ? e.res : u.res); } catch { return; }  // api() showed the error
+  await load().catch(() => {}); render(); if (S.sel && S.tasks.has(S.sel)) renderDetail();
+  if (ok !== false) toast(tr('Undone'));
+}
+document.addEventListener('keydown', e => {
+  if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.key.toLowerCase() !== 'z' || !UNDO.cur) return;
+  if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || e.target.isContentEditable || $('#toast').classList.contains('hidden')) return;
+  e.preventDefault(); runUndo(UNDO.cur);
+});
+// field changes (move, date, snooze): reverse PATCH of what actually changed; _prev = the new values, so a
+// change made elsewhere in the meantime is not overwritten (reported instead)
+function reverseOf(before, after, fields = UNDO_FIELDS) {
+  const back = {}, prev = {};
+  for (const k of fields) {
+    const a = k === 'tags' ? [...(before.tags || [])].sort().join('\u0001') : before[k] ?? null, b = k === 'tags' ? [...(after.tags || [])].sort().join('\u0001') : after[k] ?? null;
+    if (a !== b) { back[k] = k === 'tags' ? [...(before.tags || [])] : before[k] ?? null; prev[k] = k === 'tags' ? [...(after.tags || [])] : after[k] ?? null; }
+  }
+  return Object.keys(back).length ? {...back, _prev: prev} : null;
+}
+async function undoPatch(id, rev) {
+  const j = await api('PATCH', '/api/tasks/' + id, rev);
+  if (j && j.conflicts?.length) { toast(tr('Changed elsewhere in the meantime, the other version stays')); return false; }
+  return true;
+}
+async function patchUndoable(id, body, msg) {
+  const before = snapTask(taskById(id));
+  const t = await patchTask(id, body);
+  const rev = before && reverseOf(before, t);
+  if (rev) offerUndo(msg, t, [before], () => undoPatch(id, rev));
+  else if (msg) toast(msg);
+  return t;
+}
 async function toggleTask(id) {
   const t = taskById(id); if (!t) return;
   if (!canEdit(t)) { roToast(); return; }
+  const snaps = withKids(id);
   if (t.status !== 0) {
-    putTask(await api('POST', `/api/tasks/${id}/reopen`));
+    const r = await api('POST', `/api/tasks/${id}/reopen`);
+    const {undo, ...rt} = r; putTask(rt);
     if (S.extra) S.extra = S.extra.filter(x => x.id !== id);
-    render(); return;
+    render();
+    offerUndo(tr('Reopened'), r, snaps, res => res?.undo ? api('POST', `/api/tasks/${id}/undo`, res.undo) : false);
+    return;
   }
   // optimistic: fade the row, then sync
   $$(`.trow[data-id="${id}"] .chk`).forEach(c => { c.classList.add('on'); c.innerHTML = ic('check'); });
@@ -1982,16 +2076,23 @@ async function toggleTask(id) {
   await load();
   render();
   if (j.skipped) toast(tr('Already checked off (other device), not advanced twice'));
-  else if (j.next_due) toast(tr('Next occurrence: {0}', dayLabel(j.next_due)));
-  else toast(tr('Completed'), async () => { await api('POST', `/api/tasks/${id}/reopen`); await load(); render(); });
+  else offerUndo(j.next_due ? tr('Next occurrence: {0}', dayLabel(j.next_due)) : tr('Completed'), j, snaps,
+    res => res?.skipped ? false : res?.undo ? api('POST', `/api/tasks/${id}/undo`, res.undo) : false);
+}
+async function wontDo(id) {
+  const snaps = withKids(id);
+  const j = await api('POST', `/api/tasks/${id}/complete`, {status: -1});
+  await load(); render();
+  offerUndo(tr("Won't do"), j, snaps, res => res?.undo ? api('POST', `/api/tasks/${id}/undo`, res.undo) : false);
 }
 async function deleteTask(id) {
   const t = taskById(id);
   if (t && !canEdit(t)) { roToast(); return; }
-  await api('DELETE', '/api/tasks/' + id);
+  const snaps = withKids(id);
+  const r = await api('DELETE', '/api/tasks/' + id);
   if (S.sel === id) closeDetail();
   await load(); render();
-  toast(tr('“{0}” deleted', t ? t.title.slice(0, 30) : ''), async () => { await api('POST', `/api/tasks/${id}/restore`); await load(); render(); });
+  offerUndo(tr('“{0}” deleted', t ? t.title.slice(0, 30) : ''), r, snaps, () => api('POST', `/api/tasks/${id}/restore`));
 }
 async function createTask(body) {
   const t = await api('POST', '/api/tasks', body);
@@ -2068,8 +2169,8 @@ function datePop(anchor, id) {
     if (q === 'cancel') closePop();
     if (q === 'ok') {
       closePop();
-      await patchTask(id, {due: st.due, due_time: st.due ? st.due_time : null, reminders: st.due ? st.reminders : '', repeat: st.due ? st.repeat : '', repeat_from: st.repeat_from,
-        start: st.due && st.start && st.start < st.due ? st.start : null, duration: st.due_time ? (st.duration || 30) : null});
+      await patchUndoable(id, {due: st.due, due_time: st.due ? st.due_time : null, reminders: st.due ? st.reminders : '', repeat: st.due ? st.repeat : '', repeat_from: st.repeat_from,
+        start: st.due && st.start && st.start < st.due ? st.start : null, duration: st.due_time ? (st.duration || 30) : null}, st.due ? tr('Date: {0}', dayLabel(st.due)) : tr('Date removed'));
     }
   };
   p.onchange = e => {
@@ -2110,7 +2211,8 @@ function taskMenu(anchor, id) {
     ...(i > 0 && depthOf(sib[i - 1]) < 2 ? [{label: tr('Indent (under “{0}”)', sib[i - 1].title.slice(0, 24)), icon: 'indent', fn: () => patchTask(id, {parent_id: sib[i - 1].id})}] : []),
     ...(t.parent_id ? [{label: tr('Outdent'), icon: 'outdent', fn: () => patchTask(id, {parent_id: S.tasks.get(t.parent_id)?.parent_id || null})}] : []),
     ...(feat('pomo') ? [{label: tr('Start focus'), icon: 'timer', fn: () => { pomoStart(id); go('pomo'); }}] : []),
-    {label: t.status === -1 ? tr('Reopen') : tr("Won't do (discard)"), icon: 'ban', fn: async () => { if (t.status === -1) await api('POST', `/api/tasks/${id}/reopen`); else await api('POST', `/api/tasks/${id}/complete`, {status: -1}); await load(); render(); }},
+    {label: t.status === -1 ? tr('Reopen') : tr("Won't do (discard)"), icon: 'ban', fn: () => t.status === -1 ? toggleTask(id) : wontDo(id)},
+    {label: tr('Save as template'), icon: 'copy', fn: () => saveTemplate({task_id: id}, t.title)},
     {label: tr('Duplicate'), icon: 'sub', fn: () => createTask({title: t.title, content: t.content, list_id: t.list_id, section_id: t.section_id, priority: t.priority, due: t.due, due_time: t.due_time, reminders: t.reminders, repeat: t.repeat, repeat_from: t.repeat_from, tags: t.tags, parent_id: t.parent_id, url: t.url || null})},
     ...(t.parent_id && S.tasks.get(t.parent_id)?.parent_id ? [{label: tr('Make it a main task'), icon: 'arrow', fn: () => patchTask(id, {parent_id: null})}] : []),
     '-',
@@ -2125,7 +2227,7 @@ function snoozeSheet(id, anchor, extra = []) {
   if (!canEdit(t)) { roToast(); return; }
   const now = new Date();
   const inH = h => { const d = new Date(now.getTime() + h * 36e5); d.setMinutes(Math.ceil(d.getMinutes() / 5) * 5, 0, 0); return {due: ds(d), due_time: `${pad(d.getHours())}:${pad(d.getMinutes())}`}; };
-  const go2 = async (body, label) => { await patchTask(id, body); toast(tr('Snoozed: {0}', label)); };
+  const go2 = (body, label) => patchUndoable(id, body, tr('Snoozed: {0}', label));
   menu(anchor || $('#top h1'), [
     {label: tr('In 1 hour'), icon: 'clock', fn: () => go2(inH(1), tr('in 1 h'))},
     {label: tr('In 3 hours'), icon: 'clock', fn: () => go2(inH(3), tr('in 3 h'))},
@@ -2169,7 +2271,7 @@ function listModal(id, folder = '') {
     <div class="row"><label>${tr('View')}</label><select id="l-view"><option value="list">${tr('List')}</option>${feat('kanban') ? `<option value="kanban" ${l.view === 'kanban' ? 'selected' : ''}>${tr('Kanban')}</option>` : ''}${feat('timeline') ? `<option value="timeline" ${l.view === 'timeline' ? 'selected' : ''}>${tr('Timeline')}</option>` : ''}</select></div>
     <div class="row"><label>${tr('Color')}</label><div class="colors" id="l-col">${LCOLORS.map(c => `<button style="background:${c || 'var(--bg4)'}" class="${(l.color || '') === c ? 'on' : ''}" data-c="${c}" ${dis}></button>`).join('')}</div></div>
     ${id && !l.is_inbox && collab() ? `<h4>${tr('Sharing')}</h4><div class="members" id="l-members"></div>` : ''}
-    <div class="foot">${id && !l.is_inbox && own ? `<button class="btn danger" data-m="del">${tr('Delete')}</button><button class="btn" data-m="arch">${l.archived ? tr('Reactivate') : tr('Archive')}</button>` : ''}${id && !own ? `<button class="btn danger" data-m="leave">${ic('logout', 's')} ${tr('Leave list')}</button>` : ''}<span class="spacer"></span><button class="btn" data-m="close">${tr('Cancel')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
+    <div class="foot">${id && !l.is_inbox && own ? `<button class="btn danger" data-m="del">${tr('Delete')}</button><button class="btn" data-m="arch">${l.archived ? tr('Reactivate') : tr('Archive')}</button>` : ''}${id && !own ? `<button class="btn danger" data-m="leave">${ic('logout', 's')} ${tr('Leave list')}</button>` : ''}${id ? `<button class="btn" data-m="tpl" title="${tr('Save the sections and open tasks as a template')}">${ic('copy', 's')} ${tr('Save as template')}</button>` : ''}<span class="spacer"></span><button class="btn" data-m="close">${tr('Cancel')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
   let users = null;
   const drawMembers = () => {
     const box = $('#l-members', md); if (!box) return;
@@ -2220,6 +2322,7 @@ function listModal(id, folder = '') {
     }
     const a = b.dataset.m;
     if (a === 'close') md.remove();
+    if (a === 'tpl') { md.remove(); saveTemplate({list_id: id}, lname(l)); return; }
     if (a === 'save') {
       const nm = $('#l-name', md).value.trim().replace(EMO_RE, '');
       if (!nm) return $('#l-name', md).focus();
@@ -2253,7 +2356,7 @@ function listModal(id, folder = '') {
 const SET_SECS = [['account', 'user', N_('Account')], ['general', 'sliders', N_('General')], ['notify', 'bell', N_('Notifications')],
   ['layout', 'grid', N_('Layout')], ['focus', 'timer', N_('Focus')], ['integr', 'link', N_('Integrations')], ['data', 'download', N_('Data')],
   ['users', 'users', N_('Users')], ['help', 'help', N_('Help')]];
-const SET_SAVE = '#s-allday,#s-defrem,#s-digest,#s-pf,#s-ps,#s-pl,#s-pe,#s-showdone,#s-plkeep,[data-feat]';
+const SET_SAVE = '#s-allday,#s-defrem,#s-digest,#s-pf,#s-ps,#s-pl,#s-pe,#s-showdone,#s-plkeep,#s-icalscope,#s-icalalarm,[data-feat]';
 function settingsModal(focus) {
   const s = S.settings;
   const topicUrl = `${S.ntfyUrl}/${s.ntfy_topic}`;
@@ -2287,7 +2390,18 @@ function settingsModal(focus) {
     focus: `<h4>${tr('Focus (minutes)')}</h4>
       <div class="row"><label>${tr('Focus / short / long')}</label><input type="number" id="s-pf" value="${esc(s.pomo_focus)}" min="1" style="max-width:80px"><input type="number" id="s-ps" value="${esc(s.pomo_short)}" min="1" style="max-width:80px"><input type="number" id="s-pl" value="${esc(s.pomo_long)}" min="1" style="max-width:80px"></div>
       <div class="row"><label>${tr('Long break after')}</label><input type="number" id="s-pe" value="${esc(s.pomo_long_every)}" min="1" style="max-width:80px"><span class="muted">${tr('pomos')}</span></div>`,
-    integr: `${S.paperless?.enabled ? `<h4>Paperless</h4>
+    integr: `<h4 id="s-ical-h">${tr('Calendar subscription')}</h4>
+      ${hint(tr('Your open tasks with a date as a calendar for Google Calendar, Apple Calendar, Outlook or Thunderbird: read-only, the calendar app refreshes it by itself (usually every few hours, some apps every 15 minutes). Timed tasks appear with their duration, all-day tasks as all-day events, recurring tasks with all future dates.'))}
+      <div id="s-ical"><div class="muted mhint">${tr('Loading…')}</div></div>
+      <div class="row"><label>${tr('Tasks')}</label><select id="s-icalscope"><option value="all">${tr('All visible tasks (incl. shared lists)')}</option><option value="mine" ${s.ical_scope === 'mine' ? 'selected' : ''}>${tr('Only mine and assigned to me')}</option></select></div>
+      <div class="row"><label>${tr('Reminders')}</label>${chk('s-icalalarm', s.ical_alarms !== '0', tr('as calendar alarms'))}</div>
+      <details class="shelp sdet"><summary>${tr('How to subscribe')}</summary><ul class="slist">
+        <li>${tr('<b>Android / Google Calendar:</b> on a computer open calendar.google.com > Other calendars > + > From URL, paste the link. It then shows up in the Calendar app on the phone (tap the calendar under Settings to sync it).')}</li>
+        <li>${tr('<b>iPhone / iPad:</b> Settings > Apps > Calendar > Calendar Accounts > Add Account > Other > Add Subscribed Calendar, paste the link. <b>Mac:</b> Calendar > File > New Calendar Subscription.')}</li>
+        <li>${tr('<b>Thunderbird:</b> Calendar > New Calendar > On the Network, paste the link.')}</li>
+        <li>${tr('<b>Outlook:</b> Add calendar > Subscribe from web.')}</li></ul></details>
+      ${hint(tr('Anyone who knows the link sees these tasks. If it got out, create a new link: the old one stops working at once.'))}
+      ${S.paperless?.enabled ? `<h4>Paperless</h4>
       <div class="row"><label>${tr('After upload')}</label>${chk('s-plkeep', s.paperless_keep === '1', tr('Also keep the attachment in Abhako'))}</div>` : ''}
       <h4>${tr('Sharing from Android')}</h4>
       <ul class="slist"><li>${tr('Links and text: “Share” &gt; Abhako.')}</li>
@@ -2296,16 +2410,24 @@ function settingsModal(focus) {
     data: `<h4>${tr('Import and export')}</h4>
       <div class="row"><label>${tr('TickTick import')}</label><input type="file" id="s-import" accept=".csv,text/csv"></div>
       <div class="row"><label>${tr('Export')}</label><a class="btn sm" href="/api/export.json" download>${ic('download', 's')} ${tr('Download JSON')}</a></div>
+      <h4 id="s-tpl-h">${tr('Templates')}</h4>
+      ${hint(tr('Private to you. Save a task (with subtasks) from its menu (…) or a list from the list dialog; use them from the template button in the add bar or under Lists > +. Dates are kept as “days after use”.'))}
+      <div class="members" id="s-tpls"><div class="muted mhint">${tr('Loading…')}</div></div>
       <h4>${tr('Completed tasks')}</h4>
       <div class="row"><label>${tr('Clean up')}</label><button class="btn sm danger" data-m="purge">${ic('trash', 's')} ${tr('Delete all completed')}</button><span class="muted" style="font-size:12px">${tr('they go to the trash')}</span></div>`,
     users: S.me?.is_admin ? usersHtml() : '',
     help: `<h4>${tr('Quick add')}</h4>
       <div class="shelp">${tr('today, tomorrow, day after tomorrow, friday, next monday, in 3 days, 12.10., 3pm, at 15:00<br>daily, weekdays, weekly, every monday, every 2 weeks, monthly, yearly<br>!high / !medium / !low (or !!!, !!, !) · #tag · ~list<br>German works too: morgen 15 uhr, jeden montag, !hoch<br>Keyboard: n = new task, / = search, Esc = close')}</div>
+      <h4>${tr('Undo')}</h4>
+      <div class="shelp">${tr('After completing, reopening, deleting, moving to another list, snoozing / changing the date or a batch action, a message with “Undo” shows for a few seconds (Ctrl+Z / ⌘Z on a computer). Offline, the change is simply not sent.')}</div>
+      <h4>${tr('Templates')}</h4>
+      <div class="shelp">${tr('Task menu (…) or list dialog > Save as template. The template button in the add bar creates the task in the current list, Lists > + > New list from template a whole list. Manage them under Settings > Data.')}</div>
+      ${feat('stats') ? `<h4>${tr('Statistics')}</h4><div class="shelp">${tr('Sidebar > Statistics (or pin it as a tab): completions per week / day and per list, on-time rate, overdue trend, focus time and habit streaks of the last 12 weeks.')}</div>` : ''}
       <h4>${tr('Gestures (phone)')}</h4>
       <div class="shelp">${tr('Swipe right: complete · swipe left: snooze / delete · long-press and drag: reorder, move to another column, quadrant or onto a day; drag to the left edge and hold briefly to open the lists (dropping a subtask there = standalone task in that list).')}</div>`,
   };
   const secs = SET_SECS.filter(([k]) => pane[k]);
-  let cur = {tabbar: 'layout'}[focus] || focus;
+  let cur = {tabbar: 'layout', templates: 'data', ical: 'integr'}[focus] || focus;
   if (!secs.some(([k]) => k === cur)) cur = LS.get('settingsSec', 'general');
   if (!secs.some(([k]) => k === cur)) cur = 'general';
   const md = modal(`<div class="shdr"><h3>${tr('Settings')}</h3><button class="iconbtn" data-m="close" aria-label="${tr('Close')}">${ic('x')}</button></div>
@@ -2318,6 +2440,8 @@ function settingsModal(focus) {
     $$('.snav button', md).forEach(b => { b.classList.toggle('on', b.dataset.sec === k); b.setAttribute('aria-selected', b.dataset.sec === k); });
     $$('.spane', md).forEach(p => p.classList.toggle('hidden', p.dataset.pane !== k));
     $('.spanes', md).scrollTop = 0;
+    if (k === 'data') templatesDraw(md);
+    if (k === 'integr') icalDraw(md);
     $(`.snav [data-sec="${k}"]`, md)?.scrollIntoView({block: 'nearest', inline: 'nearest'});
   };
   const dirty = () => md.classList.add('dirty');
@@ -2325,6 +2449,8 @@ function settingsModal(focus) {
   md.addEventListener('input', e => { if (e.target.matches?.(SET_SAVE)) dirty(); });
   $('.snav', md).addEventListener('click', e => { const b = e.target.closest('[data-sec]'); if (b) show(b.dataset.sec); });
   setTimeout(() => $(`.snav [data-sec="${cur}"]`, md)?.scrollIntoView({block: 'nearest', inline: 'nearest'}), 0);
+  if (cur === 'data') templatesDraw(md).then(() => { if (focus === 'templates') $('#s-tpl-h', md)?.scrollIntoView({block: 'start'}); });
+  if (cur === 'integr') icalDraw(md);
   const tabDraw = () => {
     const ids = tabIds();
     $('#s-tabbar', md).innerHTML = ids.map(tabItem).map((t, i) => t ? `<div class="navrow" data-tab="${esc(t.id)}">${t.icon}<span>${esc(t.label)}</span>${i === TAB_MAX - 1 && ids.length > TAB_MAX ? `<span class="muted" style="font-size:11px">${tr('from here on “More”')}</span>` : ''}<button class="iconbtn" data-tmove="-1" title="${tr('move forward')}">${ic('chev', 's up')}</button><button class="iconbtn" data-tmove="1" title="${tr('move back')}">${ic('chev', 's')}</button><button class="iconbtn" data-tdel title="${tr('remove')}">${ic('x', 's')}</button></div>` : '').join('') || `<div class="muted" style="font-size:13px">${tr('Empty: only “More”')}</div>`;
@@ -2336,7 +2462,7 @@ function settingsModal(focus) {
       grp(N_('Lists'), S.lists.filter(l => !l.is_inbox && !l.archived).map(l => opt('l:' + l.id, listName(l.name))).join('')) +
       grp(N_('Filters'), S.filters.map(f => opt('f:' + f.id, f.name)).join('')) +
       grp(N_('Tags'), Object.keys(counts().tags).sort((a, b) => a.localeCompare(b, 'de')).map(t => opt('tag:' + t, '#' + t)).join('')) +
-      grp(N_('Other'), (collab() ? opt('news', tr('News')) : '') + opt('search', tr('Search')) + opt('settings', tr('Settings')));
+      grp(N_('Other'), (collab() ? opt('news', tr('News')) : '') + (feat('stats') ? opt('stats', tr('Statistics')) : '') + opt('search', tr('Search')) + opt('settings', tr('Settings')));
   };
   const tabSet = ids => { LS.set('tabbar', ids); tabDraw(); renderTabs(); renderRail(); };
   tabDraw();
@@ -2366,8 +2492,16 @@ function settingsModal(focus) {
       if (sib) { +b.dataset.nav < 0 ? sib.before(row) : sib.after(row); dirty(); }
       return;
     }
+    const trw = b.closest('[data-tpl]');
+    if (trw) {
+      const tp = ($('#s-tpls', md)._t || []).find(x => x.id === +trw.dataset.tpl); if (!tp) return;
+      if ('tplUse' in b.dataset) { md.remove(); useTemplate(tp); }
+      if ('tplEdit' in b.dataset) templateModal(tp, () => templatesDraw(md));
+      return;
+    }
     const a = b.dataset.m;
     if (a === 'close') md.remove();
+    if (a && a.startsWith('ical-')) { icalAction(md, a.slice(5)); return; }
     if (a === 'purge') {
       const n = [...S.tasks.values()].filter(t => t.status !== 0).length;
       if (!confirm(tr('Move all completed tasks to the trash?') + (n ? ' ' + tr('(at least {0})', n) : ''))) return;
@@ -2376,7 +2510,7 @@ function settingsModal(focus) {
     }
     if (a === 'test') { const j = await api('POST', '/api/ntfy/test'); toast(j.ok ? tr('Test sent') : tr('ntfy not reachable')); }
     if (a === 'save') {
-      await api('PATCH', '/api/settings', {...($('#s-plkeep', md) ? {paperless_keep: $('#s-plkeep', md).checked ? '1' : '0'} : {}), nav_order: $$('#s-nav .navrow', md).map(r => r.dataset.mod).join(','), features: $$('[data-feat]', md).filter(x => x.checked).map(x => x.dataset.feat).join(','), show_completed: $('#s-showdone', md).checked ? '1' : '0', allday_time: $('#s-allday', md).value || '09:00', default_reminder: $('#s-defrem', md).value, digest_time: $('#s-digest', md).value,
+      await api('PATCH', '/api/settings', {...($('#s-plkeep', md) ? {paperless_keep: $('#s-plkeep', md).checked ? '1' : '0'} : {}), nav_order: $$('#s-nav .navrow', md).map(r => r.dataset.mod).join(','), features: $$('[data-feat]', md).filter(x => x.checked).map(x => x.dataset.feat).join(','), show_completed: $('#s-showdone', md).checked ? '1' : '0', ical_scope: $('#s-icalscope', md).value, ical_alarms: $('#s-icalalarm', md).checked ? '1' : '0', allday_time: $('#s-allday', md).value || '09:00', default_reminder: $('#s-defrem', md).value, digest_time: $('#s-digest', md).value,
         pomo_focus: $('#s-pf', md).value, pomo_short: $('#s-ps', md).value, pomo_long: $('#s-pl', md).value, pomo_long_every: $('#s-pe', md).value});
       md.remove(); await load(); await route(); toast(tr('Saved'));
     }
@@ -2388,6 +2522,25 @@ function settingsModal(focus) {
     toast(tr('Import: {0} tasks, {1} new lists', j.tasks, j.lists) + (j.skipped ? tr(', {0} already there', j.skipped) : ''));
     await load(); render();
   });
+}
+// calendar subscription (Settings > Integrations): the secret feed link, copy / new link / off
+async function icalDraw(md, j) {
+  const box = $('#s-ical', md); if (!box) return;
+  if (!j) { try { j = await api('GET', '/api/ical'); } catch { box.innerHTML = `<div class="muted mhint">${tr('Only available online.')}</div>`; return; } }
+  if (!j.url) { box.innerHTML = `<div class="row"><button class="btn sm pri" data-m="ical-create">${ic('cal', 's')} ${tr('Create subscription link')}</button></div>`; return; }
+  box.innerHTML = `<div class="row icalrow"><input id="s-icalurl" readonly value="${esc(j.url)}" aria-label="${tr('Subscription link')}"><button class="btn sm pri" data-m="ical-copy">${ic('copy', 's')} ${tr('Copy')}</button></div>
+    <div class="row"><a class="btn sm" href="${esc(j.url.replace(/^https?:/, 'webcal:'))}">${ic('cal', 's')} ${tr('Open in calendar app')}</a><button class="btn sm" data-m="ical-rotate">${ic('key', 's')} ${tr('New link')}</button><button class="btn sm danger" data-m="ical-off">${tr('Turn off')}</button></div>`;
+}
+async function icalAction(md, a) {
+  if (a === 'copy') {
+    const i = $('#s-icalurl', md);
+    try { await navigator.clipboard.writeText(i.value); toast(tr('Link copied')); } catch { i.focus(); i.select(); toast(tr('Copy the selected link')); }
+    return;
+  }
+  if (a === 'rotate' && !confirm(tr('Create a new link? Calendars subscribed with the old one stop updating.'))) return;
+  if (a === 'off' && !confirm(tr('Turn the calendar feed off? Subscribed calendars stop updating.'))) return;
+  try { icalDraw(md, await api('POST', '/api/ical', {action: a})); } catch { /* api() showed it */ }
+  if (a === 'rotate') toast(tr('New link created, the old one no longer works'));
 }
 // ------------------------------------------------------------------ account, users (admin), login
 // settings sections: own account (name, password, upload token, log out) + user admin for admins
@@ -2530,15 +2683,237 @@ async function moveSection(sid, dir) {
   await load(); render();
 }
 
+// ------------------------------------------------------------------ templates (private per user)
+// A task (subtasks, priority, tags, notes, repeat; dates as days after the day it was saved) or a whole
+// list (sections + open tasks). Using one puts the dates relative to today. Settings > Data manages them.
+const tplOf = kind => (S.templates || []).filter(x => x.kind === kind);
+async function saveTemplate(src, def) {
+  const name = prompt(tr('Template name'), def || '');
+  if (name === null) return;
+  try { await api('POST', '/api/templates', {...src, name: name.trim()}); } catch { return; }
+  await load(); render(); toast(tr('Saved as template'));
+}
+async function useTemplate(tp) {
+  if (tp.kind === 'list') {
+    const name = prompt(tr('Name of the new list'), tp.name); if (name === null) return;
+    let j; try { j = await api('POST', `/api/templates/${tp.id}/apply`, {name: name.trim()}); } catch { return; }
+    await load(); go('l/' + j.list_id); toast(tr('List created from template')); return;
+  }
+  const lid = quickDefaults().list_id;
+  let j; try { j = await api('POST', `/api/templates/${tp.id}/apply`, {list_id: lid && canEditList(lid) ? lid : null}); } catch { return; }
+  putTask(j.task); await load(); render();
+  const id = j.task.id;
+  requestAnimationFrame(() => { const r = $(`#view .trow[data-id="${id}"]`); if (r) { r.classList.add('flash'); r.scrollIntoView({block: 'nearest'}); } });
+  offerUndo(tr('Created from template: {0}', tp.name), j, [], () => api('DELETE', '/api/tasks/' + id));
+}
+function templateMenu(anchor, kind) {
+  const ts = tplOf(kind);
+  if (!ts.length) { toast(kind === 'list' ? tr('No list templates yet: list dialog > Save as template') : tr('No task templates yet: task menu > Save as template')); return; }
+  menu(anchor, [...ts.map(tp => ({label: tp.name, icon: kind === 'list' ? 'list' : 'copy', fn: () => useTemplate(tp)})), '-', {label: tr('Manage templates'), icon: 'edit', fn: () => settingsModal('templates')}]);
+}
+// outline editor: one task per line, two spaces = one level deeper, "# Name" = section (list templates).
+// Lines that keep their title keep their dates, priority, notes etc.
+const tplOutline = (nodes, lvl = 0) => nodes.map(n => '  '.repeat(lvl) + n.title + '\n' + tplOutline(n.children || [], lvl + 1)).join('');
+function tplListOutline(d) {
+  const top = (d.tasks || []).filter(n => n.section == null);
+  return tplOutline(top) + (d.sections || []).map((s, i) => `# ${s}\n` + tplOutline((d.tasks || []).filter(n => n.section === i))).join('');
+}
+function tplParse(text, old, list) {
+  const pool = new Map();
+  const add = n => { if (!pool.has(n.title)) pool.set(n.title, []); pool.get(n.title).push(n); (n.children || []).forEach(add); };
+  old.forEach(add);
+  const take = title => { const n = (pool.get(title) || []).shift(); return n ? {...n, title, children: []} : {title, children: []}; };
+  const roots = [], sections = [], stack = [];
+  let sec = null;
+  for (const raw of String(text).split('\n')) {
+    if (!raw.trim()) continue;
+    if (list && /^#\s*\S/.test(raw)) { sections.push(raw.replace(/^#\s*/, '').trim().slice(0, 200)); sec = sections.length - 1; stack.length = 0; continue; }
+    const lvl = Math.min(2, Math.floor(raw.match(/^\s*/)[0].replace(/\t/g, '  ').length / 2));
+    const title = raw.trim().replace(/^[-*]\s+(\[[ xX]\]\s+)?/, '').slice(0, 500);
+    if (!title) continue;
+    const n = take(title), depth = Math.min(lvl, stack.length);
+    stack.length = depth;
+    if (depth === 0) { if (list) n.section = sec; else delete n.section; roots.push(n); } else stack[depth - 1].children.push(n);
+    stack.push(n);
+  }
+  return {roots, sections};
+}
+function templateModal(tp, done) {
+  const d = JSON.parse(JSON.stringify(tp.data)), task = tp.kind === 'task', root = task ? d.task : null;
+  const prios = [[0, N_('None')], [1, N_('Low')], [3, N_('Medium')], [5, N_('High')]];
+  const md = modal(`<h3>${tr('Edit template')}</h3>
+    <div class="row"><label>${tr('Template name')}</label><input id="tp-name" value="${esc(tp.name)}" maxlength="200"></div>
+    ${task ? `<div class="row"><label>${tr('Title')}</label><input id="tp-title" value="${esc(root.title)}"></div>
+      <div class="row"><label>${tr('Description')}</label><textarea id="tp-content" rows="3">${esc(root.content || '')}</textarea></div>
+      <div class="row"><label>${tr('Priority')}</label><select id="tp-prio">${prios.map(([v, n]) => `<option value="${v}" ${root.priority === v ? 'selected' : ''}>${tr(n)}</option>`).join('')}</select></div>
+      <div class="row"><label>${tr('Due')}</label><input type="number" id="tp-due" min="0" max="3650" value="${root.due_offset ?? ''}" placeholder="–" style="max-width:80px"><span class="muted" style="font-size:12px">${tr('days after use (0 = same day, empty = no date)')}</span></div>
+      <div class="row"><label>${tr('Time')}</label><input type="time" id="tp-time" value="${esc(root.due_time || '')}">${root.repeat ? `<span class="muted" style="font-size:12px">${ic('repeat', 's')} ${esc(repeatLabel(root.repeat))}</span>` : ''}</div>
+      <div class="row"><label>${tr('Tags')}</label><input id="tp-tags" value="${esc((root.tags || []).join(', '))}" placeholder="${tr('tag1, tag2')}"></div>
+      <h4>${tr('Subtasks')}</h4>`
+    : `<div class="row"><label>${tr('List name')}</label><input id="tp-lname" value="${esc(d.name || '')}"></div><h4>${tr('Sections and tasks')}</h4>`}
+    <textarea id="tp-outline" class="tpoutline" rows="9" spellcheck="false">${esc(task ? tplOutline(root.children || []) : tplListOutline(d))}</textarea>
+    <div class="shint">${task ? tr('One subtask per line, indent with two spaces for a further level (at most 3 levels in total).') : tr('One task per line, indent with two spaces for subtasks. A line “# Name” starts a section.')} ${tr('Lines that keep their title keep their dates, priority and notes.')}</div>
+    <div class="foot"><button class="btn danger" data-m="del">${tr('Delete')}</button><span class="spacer"></span><button class="btn" data-m="close">${tr('Cancel')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
+  md.classList.add('tpmodal');
+  md.addEventListener('click', async e => {
+    const b = e.target.closest('button[data-m]'); if (!b) return;
+    if (b.dataset.m === 'close') { md.remove(); return; }
+    try {
+      if (b.dataset.m === 'del') {
+        if (!confirm(tr('Delete the template “{0}”?', tp.name))) return;
+        await api('DELETE', '/api/templates/' + tp.id);
+      }
+      if (b.dataset.m === 'save') {
+        const name = $('#tp-name', md).value.trim(); if (!name) { $('#tp-name', md).focus(); return; }
+        let data;
+        if (task) {
+          const title = $('#tp-title', md).value.trim(); if (!title) { $('#tp-title', md).focus(); return; }
+          const due = $('#tp-due', md).value.trim();
+          data = {task: {...root, title, content: $('#tp-content', md).value, priority: +$('#tp-prio', md).value,
+            due_offset: due === '' ? null : Math.max(0, +due), due_time: due === '' ? null : $('#tp-time', md).value || null,
+            tags: $('#tp-tags', md).value.split(',').map(x => x.trim().replace(/^#/, '')).filter(Boolean),
+            children: tplParse($('#tp-outline', md).value, root.children || [], false).roots}};
+        } else {
+          const p = tplParse($('#tp-outline', md).value, d.tasks || [], true);
+          data = {...d, name: $('#tp-lname', md).value.trim(), sections: p.sections, tasks: p.roots};
+        }
+        await api('PATCH', '/api/templates/' + tp.id, {name, data});
+      }
+    } catch { return; }  // api() showed it
+    md.remove(); await load(); render(); done && done(); toast(b.dataset.m === 'del' ? tr('Template deleted') : tr('Saved'));
+  });
+  setTimeout(() => $('#tp-name', md).focus(), 50);
+}
+async function templatesDraw(md) {
+  const box = $('#s-tpls', md); if (!box) return;
+  let ts;
+  try { ts = (await api('GET', '/api/templates')).templates; } catch { box.innerHTML = `<div class="muted mhint">${tr('Templates are only available online.')}</div>`; return; }
+  box._t = ts;
+  box.innerHTML = ts.map(tp => `<div class="mrow" data-tpl="${tp.id}"><span class="tplic">${ic(tp.kind === 'list' ? 'list' : 'copy', 's')}</span><span class="n">${esc(tp.name)} <span class="muted">${tp.kind === 'list' ? tr('List') : tr('Task')} · ${trn('{0} task', '{0} tasks', tp.count)}</span></span><button class="iconbtn" data-tpl-use title="${tr('Use template')}">${ic('plus', 's')}</button><button class="iconbtn" data-tpl-edit title="${tr('Edit template')}">${ic('edit', 's')}</button></div>`).join('')
+    || `<div class="muted mhint">${tr('No templates yet. Save one from a task menu (…) or the list dialog: “Save as template”.')}</div>`;
+}
+
+// ------------------------------------------------------------------ statistics (module "stats")
+// Numbers come from GET /api/stats (per user, last 12 weeks; definitions there), habit rates and streaks
+// from the habit history the client already has (same numbers as in the habit dialog). Charts are inline
+// SVG drawn at the real pixel width (readable on phones), colours from the theme variables.
+S.st = {data: null, loading: false, err: null, v: -1, mode: LS.get('statsMode', 'week')};
+async function loadStats() {
+  if (S.st.loading) return;
+  S.st.loading = true;
+  const v = S.v;
+  try { S.st.data = await rawFetch('GET', '/api/stats'); S.st.err = null; S.st.v = v; }
+  catch (e) { if (e.message !== 'auth') S.st.err = e instanceof Offline ? 'offline' : e.message; S.st.v = v; }
+  finally { S.st.loading = false; }
+  if (S.route.mod === 'stats') renderView();
+}
+const chartW = () => Math.max(260, Math.min(760, ($('#view')?.clientWidth || 720) - 48));
+function niceMax(v) { for (let p = 1; ; p *= 10) for (const m of [2, 4, 6, 10]) if (m * p >= v) return m * p; }  // even: the middle grid line stays a whole number
+const topRound = (x, y, w, h, r) => { r = Math.min(r, w / 2, h); return h <= 0 ? '' : `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`; };
+const shortDay = s => pd(s).toLocaleDateString(LOCALE(), {day: 'numeric', month: 'short'});
+function yGrid(W, padL, padT, ih, max, fmt) {
+  return [0, max / 2, max].map(v => { const y = padT + ih - ih * v / max; return `<line class="ch-grid" x1="${padL}" x2="${W}" y1="${y}" y2="${y}"/><text class="ch-ax" x="${padL - 6}" y="${y + 4}" text-anchor="end">${esc(fmt(v))}</text>`; }).join('');
+}
+function barChart(vals, labels, {fmt = v => String(v), tip, label}) {
+  const W = chartW(), H = 170, padL = 36, padT = 10, padB = 24, ih = H - padT - padB, n = vals.length;
+  const max = niceMax(Math.max(1, ...vals)), slot = (W - padL) / n, bw = Math.max(4, slot - Math.max(2, Math.min(10, slot * .28)));
+  const every = Math.ceil(n * 46 / (W - padL));
+  let h = yGrid(W, padL, padT, ih, max, fmt);
+  vals.forEach((v, i) => {
+    const x = padL + i * slot + (slot - bw) / 2, bh = ih * v / max;
+    h += `<path class="ch-bar" d="${topRound(x, padT + ih - bh, bw, bh, 4)}"/>`;
+    if ((n - 1 - i) % every === 0) h += `<text class="ch-ax" x="${x + bw / 2}" y="${H - 6}" text-anchor="middle">${esc(labels[i])}</text>`;
+    h += `<rect class="ch-hit" x="${padL + i * slot}" y="${padT}" width="${slot}" height="${ih}"><title>${esc(tip(i))}</title></rect>`;
+  });
+  return `<svg class="chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label + ': ' + vals.map((v, i) => tip(i)).join('; '))}">${h}</svg>`;
+}
+function lineChart(vals, labels, {tip, label}) {
+  const W = chartW(), H = 160, padL = 36, padT = 12, padB = 24, ih = H - padT - padB, n = vals.length;
+  const max = niceMax(Math.max(1, ...vals)), slot = (W - padL - 12) / Math.max(1, n - 1);
+  const X = i => padL + 6 + i * slot, Y = v => padT + ih - ih * v / max;
+  const every = Math.ceil(n * 46 / (W - padL));
+  let h = yGrid(W, padL, padT, ih, max, v => String(v));
+  h += `<polyline class="ch-line" points="${vals.map((v, i) => `${X(i)},${Y(v)}`).join(' ')}"/>`;
+  vals.forEach((v, i) => {
+    h += `<circle class="ch-dot" cx="${X(i)}" cy="${Y(v)}" r="4"/>`;
+    if ((n - 1 - i) % every === 0) h += `<text class="ch-ax" x="${X(i)}" y="${H - 6}" text-anchor="${i === n - 1 ? 'end' : 'middle'}">${esc(labels[i])}</text>`;
+    h += `<rect class="ch-hit" x="${X(i) - slot / 2}" y="${padT}" width="${slot}" height="${ih}"><title>${esc(tip(i))}</title></rect>`;
+  });
+  return `<svg class="chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label + ': ' + vals.map((v, i) => tip(i)).join('; '))}">${h}</svg>`;
+}
+function hbarChart(rows, {fmt = v => String(v), label}) {  // rows: [{name, v}]
+  if (!rows.length) return `<div class="muted stempty">${tr('Nothing in this period.')}</div>`;
+  const W = chartW(), rh = 30, H = rows.length * rh, labW = Math.min(170, W * .38), valW = 58, bw = W - labW - valW;
+  const max = Math.max(1, ...rows.map(r => r.v));
+  const cut = s => s.length > 24 ? s.slice(0, 23) + '…' : s;
+  return `<svg class="chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label + ': ' + rows.map(r => `${r.name} ${fmt(r.v)}`).join('; '))}">${rows.map((r, i) => {
+    const y = i * rh, w = Math.max(3, bw * r.v / max);
+    return `<text class="ch-lab" x="0" y="${y + 19}">${esc(cut(r.name))}</text><path class="ch-bar" d="M${labW},${y + 7}H${labW + w - 4}Q${labW + w},${y + 7} ${labW + w},${y + 11}V${y + 19}Q${labW + w},${y + 23} ${labW + w - 4},${y + 23}H${labW}Z"/><text class="ch-val" x="${labW + w + 8}" y="${y + 19}">${esc(fmt(r.v))}</text><rect class="ch-hit" x="0" y="${y}" width="${W}" height="${rh}"><title>${esc(r.name + ': ' + fmt(r.v))}</title></rect>`;
+  }).join('')}</svg>`;
+}
+function heatmap(weeks, perDay, t0, {unit}) {  // weeks: Mondays; columns = weeks, rows = Mon..Sun
+  const W = chartW(), lab = 30, gap = 3, cs = Math.max(10, Math.min(22, Math.floor((W - lab) / weeks.length) - gap));
+  const H = 7 * (cs + gap) + 20, max = Math.max(1, ...Object.values(perDay));
+  const lvl = v => !v ? 0 : Math.min(4, Math.ceil(4 * v / max));
+  let h = [0, 2, 4, 6].map(r => `<text class="ch-ax" x="${lab - 6}" y="${r * (cs + gap) + cs * .75}" text-anchor="end">${esc(WD_MO()[r])}</text>`).join('');
+  weeks.forEach((w, c) => {
+    for (let r = 0; r < 7; r++) {
+      const d = addDays(w, r); if (d > t0) continue;
+      const v = perDay[d] || 0;
+      h += `<rect class="hm l${lvl(v)}" x="${lab + c * (cs + gap)}" y="${r * (cs + gap)}" width="${cs}" height="${cs}" rx="3"><title>${esc(`${fmtDate(d)}: ${unit(v)}`)}</title></rect>`;
+    }
+  });
+  h += `<text class="ch-ax" x="${lab}" y="${H - 4}">${esc(shortDay(weeks[0]))}</text><text class="ch-ax" x="${lab + weeks.length * (cs + gap) - gap}" y="${H - 4}" text-anchor="end">${esc(tr('Today'))}</text>`;
+  return `<svg class="chart" width="${Math.min(W, lab + weeks.length * (cs + gap))}" height="${H}" role="img" aria-label="${esc(tr('Completed per day'))}">${h}</svg>
+    <div class="hmleg muted">${tr('less')}${[0, 1, 2, 3, 4].map(l => `<i class="hm l${l}"></i>`).join('')}${tr('more')}</div>`;
+}
+const listLabel = x => x.id === -1 ? tr('No task') : x.id === 0 ? tr('Other lists') : x.is_inbox && x.name === 'Eingang' ? tr('Inbox') : listName(x.name);
+function viewStats() {
+  const st = S.st;
+  if ((st.v !== S.v || !st.data) && !st.loading) setTimeout(loadStats, 0);
+  const j = st.data;
+  if (!j) return `<div class="empty">${st.err ? (st.err === 'offline' ? tr('Statistics are only available online.') : esc(st.err)) : tr('Loading…')}</div>`;
+  const wl = j.weeks.map(shortDay), tipW = (i, s) => `${tr('Week of {0}', fmtDate(j.weeks[i]))}: ${s}`;
+  const tiles = [
+    [j.done.this_week, tr('completed this week'), trn('{0} today', '{0} today', j.done.today)],
+    [j.ontime.rate == null ? '–' : j.ontime.rate + '%', tr('on time'), j.ontime.with_due ? tr('{0} of {1} with a date', j.ontime.ontime, j.ontime.with_due) : tr('no completed tasks with a date')],
+    [j.streak.current, trn('day in a row', 'days in a row', j.streak.current), tr('best: {0}', j.streak.best)],
+    ...(feat('pomo') ? [[fmtH(j.focus.this_week), tr('focus this week'), tr('12 weeks: {0}', fmtH(j.focus.total))]] : []),
+  ];
+  const mode = st.mode;
+  let h = `<div class="stats"><div class="sttiles">${tiles.map(([v, l, s]) => `<div><b>${esc(String(v))}</b><span>${esc(l)}</span><small>${esc(s)}</small></div>`).join('')}</div>
+    <section class="stcard"><div class="sthead"><h3>${tr('Completed tasks')}</h3><span class="muted">${trn('{0} in 12 weeks', '{0} in 12 weeks', j.done.total)}</span><span class="spacer"></span>
+      <div class="seg"><button class="${mode === 'week' ? 'on' : ''}" data-act="stats-mode" data-k="week">${tr('Weeks')}</button><button class="${mode === 'day' ? 'on' : ''}" data-act="stats-mode" data-k="day">${tr('Days')}</button></div></div>
+      ${mode === 'day' ? heatmap(j.weeks, j.done.per_day, j.today, {unit: v => trn('{0} completed', '{0} completed', v)})
+        : barChart(j.done.per_week, wl, {tip: i => tipW(i, trn('{0} completed', '{0} completed', j.done.per_week[i])), label: tr('Completed per week')})}</section>
+    <section class="stcard"><div class="sthead"><h3>${tr('By list')}</h3><span class="muted">${tr('last 12 weeks')}</span></div>
+      ${hbarChart(j.done.by_list.map(x => ({name: listLabel(x), v: x.n})), {label: tr('Completed by list')})}</section>
+    <section class="stcard"><div class="sthead"><h3>${tr('Overdue')}</h3><span class="muted">${trn('{0} overdue now', '{0} overdue now', j.overdue[j.overdue.length - 1].n)}</span></div>
+      ${lineChart(j.overdue.map(x => x.n), j.overdue.map((x, i) => i === j.overdue.length - 1 ? tr('Today') : shortDay(x.date)), {label: tr('Overdue tasks at the end of each week'), tip: i => `${i === j.overdue.length - 1 ? tr('Today') : fmtDate(j.overdue[i].date)}: ${trn('{0} overdue', '{0} overdue', j.overdue[i].n)}`})}</section>`;
+  if (feat('pomo')) h += `<section class="stcard"><div class="sthead"><h3>${tr('Focus time')}</h3><span class="muted">${tr('12 weeks: {0}', fmtH(j.focus.total))}</span></div>
+      ${barChart(j.focus.per_week, wl, {fmt: v => fmtH(Math.round(v)), tip: i => tipW(i, fmtH(j.focus.per_week[i])), label: tr('Focus minutes per week')})}
+      <h4>${tr('By list')}</h4>${hbarChart(j.focus.by_list.map(x => ({name: listLabel(x), v: x.minutes})), {fmt: fmtH, label: tr('Focus by list')})}</section>`;
+  const hs = feat('habits') ? S.habits.filter(x => !x.archived) : [];
+  if (hs.length) h += `<section class="stcard"><div class="sthead"><h3>${tr('Habits')}</h3></div><div class="sthabits">
+      <div class="shh muted"><span></span><span>${tr('rate')}</span><span>${tr('streak')}</span><span>${tr('best')}</span></div>
+      ${hs.map(x => { const s = habitStats(x), col = x.color || HCOLORS[0]; return `<div class="shr" data-act="habit-open" data-id="${x.id}" title="${esc(x.per_week ? tr('Share of the last 4 weeks that reached the target') : tr('Share of the scheduled days of the last 30 days'))}"><span class="n"><i class="sw" style="background:${col}"></i>${esc(x.name)}</span>
+        <span class="rate"><svg width="64" height="8" viewBox="0 0 64 8" preserveAspectRatio="none" aria-hidden="true"><rect class="ch-track" width="64" height="8" rx="4"/><rect class="ch-bar" width="${Math.round(64 * s.rate / 100)}" height="8" rx="4"/></svg><b>${s.rate}%</b></span><span><b>${s.streak}</b> ${esc(streakUnit(x))}</span><span>${s.best}</span></div>`; }).join('')}</div></section>`;
+  h += `<p class="muted stnote">${tr('Last 12 weeks. A completed task counts for the person who ticked it off, also in shared lists; “won’t do” does not count. On time = completed on or before the due day. Overdue = your open tasks (assigned to you, or unassigned in your own lists) whose due date had passed at the end of each week, based on the current due dates.')}</p></div>`;
+  return h;
+}
+let statsResize;
+window.addEventListener('resize', () => { if (S.route.mod !== 'stats') return; clearTimeout(statsResize); statsResize = setTimeout(renderView, 150); });
+
 // ------------------------------------------------------------------ toast
 let toastTimer;
-function toast(msg, undo) {
+function toast(msg, undo, ms) {
   const el = $('#toast');
-  el.innerHTML = `<span>${esc(msg)}</span>${undo ? `<button>${tr('Undo')}</button>` : ''}`;
+  if (!undo) UNDO.cur = null;  // one undo at a time: any other message ends it
+  el.innerHTML = `<span>${esc(msg)}</span>${undo ? `<button>${tr('Undo')}</button>${isMobile() ? '' : `<kbd>${/Mac|iPhone|iPad/.test(navigator.platform || '') ? '⌘' : 'Ctrl+'}Z</kbd>`}` : ''}`;
   el.classList.remove('hidden');
   if (undo) el.querySelector('button').onclick = () => { el.classList.add('hidden'); undo(); };
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add('hidden'), undo ? 5000 : 2500);
+  toastTimer = setTimeout(() => { el.classList.add('hidden'); if (undo) UNDO.cur = null; }, ms || (undo ? 6000 : 2500));
 }
 
 // ------------------------------------------------------------------ quick add wiring
@@ -2574,7 +2949,7 @@ function openQuickSheet(prefill = '', preset = {}) {
   if (!q) {
     q = document.createElement('div');
     q.className = 'qadd sheet';
-    q.innerHTML = `<div class="box">${ic('plus')}<input id="qsheet" placeholder="${tr("What's next?")}" autocomplete="off" enterkeyhint="send"><button class="iconbtn" data-act="qsheet-send" aria-label="${tr('Add')}">${ic('arrow')}</button></div><div class="chips"></div><div class="qhint">${tr('tomorrow 3pm · !high · #tag · ~list · every monday')}</div>`;
+    q.innerHTML = `<div class="box">${ic('plus')}<input id="qsheet" placeholder="${tr("What's next?")}" autocomplete="off" enterkeyhint="send">${tplBtn()}<button class="iconbtn" data-act="qsheet-send" aria-label="${tr('Add')}">${ic('arrow')}</button></div><div class="chips"></div><div class="qhint">${tr('tomorrow 3pm · !high · #tag · ~list · every monday')}</div>`;
     document.body.appendChild(q);
   }
   $('#scrim').classList.remove('hidden');
@@ -2663,7 +3038,9 @@ document.addEventListener('click', async e => {
     case 'user-menu': menu(a, [{label: tr('Account'), icon: 'user', fn: () => { closeSide(); settingsModal('account'); }},
       ...(S.me?.auth === 'session' ? [{label: tr('Log out'), icon: 'logout', fn: logout}] : [])]); break;
     case 'tabs-more': tabsMore(a); break;
-    case 'list-new': menu(a, [{label: tr('New list'), icon: 'list', fn: () => { closeSide(); listModal(); }}, {label: tr('New folder'), icon: 'folder', fn: () => newFolder()}]); break;
+    case 'list-new': menu(a, [{label: tr('New list'), icon: 'list', fn: () => { closeSide(); listModal(); }}, ...(tplOf('list').length ? [{label: tr('New list from template'), icon: 'copy', fn: () => { closeSide(); templateMenu($('#top h1'), 'list'); }}] : []), {label: tr('New folder'), icon: 'folder', fn: () => newFolder()}]); break;
+    case 'tpl-use': if (a.closest('.qadd.sheet')) { closePop(); templateMenu($('#fab'), 'task'); } else templateMenu(a, 'task'); break;
+    case 'stats-mode': S.st.mode = a.dataset.k; LS.set('statsMode', S.st.mode); renderView(); break;
     case 'folder-toggle': { const k = 'fold:' + a.dataset.folder; S.collapsed.has(k) ? S.collapsed.delete(k) : S.collapsed.add(k); LS.set('collapsed', [...S.collapsed]); renderSide(); break; }
     case 'folder-menu': e.stopPropagation(); folderMenu(a, a.dataset.folder); break;
     case 'lists-reorder': S.listReorder = !S.listReorder; renderSide(); break;
@@ -2805,7 +3182,7 @@ document.addEventListener('change', async e => {
   if (t.id === 'd-file') { uploadFiles(S.sel, t.files); t.value = ''; return; }
   if (t.id === 'c-file') { addCommentFiles(t.files); t.value = ''; return; }
   if (t.id === 'd-url') { saveLink(t.value); return; }
-  if (t.id === 'd-list') patchTask(S.sel, {list_id: +t.value});
+  if (t.id === 'd-list') patchUndoable(S.sel, {list_id: +t.value}, tr('Moved to {0}', lname(listById(+t.value))));
   if (t.id === 'd-sec') patchTask(S.sel, {section_id: t.value ? +t.value : null});
   if (t.id === 'd-assignee') patchTask(S.sel, {assignee_id: t.value ? +t.value : null});
   if (t.id === 'pomo-task') { pomoTask = t.value; LS.set('pomoTask', t.value); }
@@ -2882,7 +3259,7 @@ function renderMultiBar() {
   if (!b) { b = document.createElement('div'); b.id = 'mbar'; document.body.appendChild(b); }
   const n = S.multi.size;
   b.classList.toggle('hidden', !(S.multiMode || n));
-  $('#fab').classList.toggle('gone', ['habits', 'pomo', 'news'].includes(S.route.mod) || ['done', 'trash', 'search'].includes(S.route.key) || S.multiMode || n > 0);
+  $('#fab').classList.toggle('gone', noFab() || S.multiMode || n > 0);
   b.innerHTML = `<span class="mcount">${n ? tr('{0} selected', n) : tr('Tap tasks')}</span>
     <button class="iconbtn" data-act="mb-all" title="${tr('All')}">${ic('all')}</button>
     ${n ? `<button class="iconbtn" data-act="mb-date" title="${tr('Date')}">${ic('cal')}</button><button class="iconbtn" data-act="mb-prio" title="${tr('Priority')}">${ic('flag')}</button><button class="iconbtn" data-act="mb-list" title="${tr('List')}">${ic('folder')}</button><button class="iconbtn" data-act="mb-tag" title="${tr('Add tag')}">${ic('tag')}</button><button class="iconbtn" data-act="mb-pin" title="${tr('Pin')}">${ic('pin')}</button><button class="iconbtn" data-act="mb-done" title="${tr('Completed')}">${ic('done')}</button><button class="iconbtn danger" data-act="mb-del" title="${tr('Delete')}">${ic('trash')}</button>` : ''}
@@ -2891,11 +3268,21 @@ function renderMultiBar() {
 async function batch(action, data, clear) {
   const ids = [...S.multi];
   if (!ids.length) return;
+  const snaps = ids.flatMap(withKids);
   const j = await api('POST', '/api/tasks/batch', {ids, action, data});
   if (j.errors?.length) toast(j.errors[0]);
   if (clear) { S.multi.clear(); S.multiMode = false; }
   await load(); render();
-  if (!j.errors?.length) toast(trn('{0} task changed', '{0} tasks changed', ids.length));
+  if (j.errors?.length) return;
+  const msg = action === 'complete' ? trn('{0} task completed', '{0} tasks completed', ids.length) : action === 'delete' ? trn('{0} task deleted', '{0} tasks deleted', ids.length) : trn('{0} task changed', '{0} tasks changed', ids.length);
+  if (action === 'complete') offerUndo(msg, j, snaps, res => res?.undo && Object.keys(res.undo).length ? api('POST', '/api/tasks/batch', {ids: Object.keys(res.undo).map(Number), action: 'undo', data: {items: res.undo}}) : false);
+  else if (action === 'delete') offerUndo(msg, j, snaps, () => api('POST', '/api/tasks/batch', {ids, action: 'restore'}));
+  else if (action === 'patch') {
+    const items = {};
+    for (const b of snaps) { const a = S.tasks.get(b.id); const rev = a && ids.includes(b.id) && reverseOf(b, a, [...UNDO_FIELDS, 'tags']); if (rev) items[b.id] = rev; }
+    if (Object.keys(items).length) offerUndo(msg, j, snaps, () => api('POST', '/api/tasks/batch', {ids: Object.keys(items).map(Number), action: 'patch_each', data: {items}}));
+    else toast(msg);
+  } else toast(msg);
 }
 function multiDateMenu(a) {
   menu(a, [
@@ -3130,8 +3517,7 @@ async function dropTask(id, el, clientY) {
     else if (k === 'done') { toggleTask(id); return; }
     else return;
     if (item.list_id && t.parent_id) {
-      try { await patchTask(id, {parent_id: null, list_id: item.list_id, section_id: null}); } catch { return; }
-      toast(tr('Standalone in {0}', lname(listById(item.list_id))));
+      try { await patchUndoable(id, {parent_id: null, list_id: item.list_id, section_id: null}, tr('Standalone in {0}', lname(listById(item.list_id)))); } catch { return; }
       return;
     }
     if (item.list_id && item.list_id !== t.list_id) item.section_id = null;
@@ -3175,10 +3561,15 @@ async function dropTask(id, el, clientY) {
     } else if (!kcol) return;
   }
   if (item.list_id && !canEditList(item.list_id)) { roToast(); return; }
+  const before = snapTask(t);
   Object.assign(t, item);
   render();
-  try { await api('POST', '/api/tasks/reorder', {items: [item]}); } catch { /* api() showed it */ }
+  let res;
+  try { res = await api('POST', '/api/tasks/reorder', {items: [item]}); } catch { /* api() showed it */ return; }
   await load(); render();
+  // a move to another list or day can be undone (plain reordering not)
+  const after = S.tasks.get(id), rev = after && (before.list_id !== after.list_id || before.due !== after.due || (before.due_time || null) !== (after.due_time || null)) && reverseOf(before, after);
+  if (rev) offerUndo(before.list_id !== after.list_id ? tr('Moved to {0}', lname(listById(after.list_id))) : after.due ? tr('Date: {0}', dayLabel(after.due)) : tr('Date removed'), res, [before], () => undoPatch(id, rev));
 }
 
 // ------------------------------------------------------------------ swipe (touch)
@@ -3297,6 +3688,10 @@ document.addEventListener('touchcancel', endTouchDrag);
     await route();
     const [u, rest] = shareLink(text, (q.get('url') || '').trim());
     openQuickSheet((q.get('title') || '').trim() || rest || (u ? urlTitle(u) : ''), {url: u, list_id: inbox().id});
+  } else if (new URLSearchParams(location.search).get('action') === 'new') {  // app shortcut "New task"
+    history.replaceState(null, '', '/' + (location.hash || ''));
+    await route();
+    openQuickSheet();
   } else await route();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 })();

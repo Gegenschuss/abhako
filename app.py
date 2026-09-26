@@ -21,6 +21,7 @@ allowed). Session cookies are HttpOnly + SameSite=Lax."""
 import csv
 import glob
 import hashlib
+import hmac
 import io
 import ipaddress
 import json
@@ -48,6 +49,7 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")  # topic of the first admin (seed)
 NTFY_URL = os.environ.get("NTFY_URL", "https://ntfy.sh")
 NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")  # optional ntfy access token (write access to NTFY_TOPIC)
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:3040")
+APP_NAME = "Abhako"
 WATCHDOG_INTERVAL = int(os.environ.get("TASKS_WATCHDOG_INTERVAL", "30"))
 
 ATT_DIR = os.environ.get("TASKS_ATTACHMENTS", os.path.join(os.path.dirname(DB), "attachments"))
@@ -96,6 +98,7 @@ CSRF_HEADER, CSRF_VALUE = "X-Requested-With", "abhako"
 OPEN_PATHS = {"/", "/sw.js", "/manifest.json", "/api/health", "/drop",
               "/api/auth/info", "/api/auth/login", "/api/auth/setup", "/api/auth/logout"}
 PROXY_IGNORE = {"/drop", "/manifest.json", "/sw.js", "/api/health"}
+ICAL_PREFIX = "/ical/"  # calendar feed: the secret token in the path is the only credential (never the proxy header)
 USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
 MIN_PASSWORD = 8
 
@@ -210,6 +213,11 @@ CREATE TABLE IF NOT EXISTS notifications (            -- "News" feed per user (s
   actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   comment_id INTEGER,                           -- comment kinds: the (live) comment, excerpt read at display time
   data TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, read_at TEXT);
+CREATE TABLE IF NOT EXISTS templates (                -- private per user: a task (+ subtasks) or a whole list
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL DEFAULT 'task',            -- task | list
+  name TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}',   -- json, see tpl_* below
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
 # additive migrations: (table, column, ddl)
 MIGRATIONS = [
@@ -229,6 +237,9 @@ MIGRATIONS = [
     ("tasks", "url", "ALTER TABLE tasks ADD COLUMN url TEXT"),                         # website link (http/https)
     ("attachments", "comment_id", "ALTER TABLE attachments ADD COLUMN comment_id INTEGER"),  # file of a comment
     ("tasks", "assigned_by", "ALTER TABLE tasks ADD COLUMN assigned_by INTEGER"),       # who set the assignee (pushes)
+    # package 1 (2026-09-26): statistics count completions for the person who completed; calendar feed
+    ("tasks", "completed_by", "ALTER TABLE tasks ADD COLUMN completed_by INTEGER"),
+    ("users", "ical_token", "ALTER TABLE users ADD COLUMN ical_token TEXT"),           # secret of GET /ical/<uid>.<token>.ics
 ]
 INDEXES = """
 CREATE INDEX IF NOT EXISTS lists_owner ON lists(owner_id);
@@ -243,6 +254,8 @@ CREATE INDEX IF NOT EXISTS activity_task ON activity(task_id, id);
 CREATE INDEX IF NOT EXISTS attachments_comment ON attachments(comment_id) WHERE comment_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, id);
 CREATE INDEX IF NOT EXISTS notifications_task ON notifications(task_id);
+CREATE INDEX IF NOT EXISTS tasks_completed_by ON tasks(completed_by, completed_at) WHERE completed_by IS NOT NULL;
+CREATE INDEX IF NOT EXISTS templates_user ON templates(user_id);
 """
 MAX_DEPTH = 3  # task > subtask > sub-subtask
 # per user (table user_settings)
@@ -256,12 +269,14 @@ USER_DEFAULTS = {
     "show_completed": "1",      # show the collapsed "Completed" group / done tasks in the calendar
     # modules that can be switched off in the settings (hidden from nav, data stays)
     # collab = comments, activity, mentions, News feed, sharing / assigning UI
-    "features": "cal,timeline,matrix,habits,pomo,kanban,paperless,collab",
+    "features": "cal,timeline,matrix,habits,pomo,kanban,paperless,collab,stats",
     "nav_order": "tasks,cal,matrix,habits,pomo",   # order of the mobile tab bar / desktop rail
     "folders": "[]",            # json list: folder order in the sidebar (also keeps empty folders)
-    "features_rev": "4",        # one-shot migrations of the features list
+    "features_rev": "5",        # one-shot migrations of the features list
     "paperless_keep": "0",      # 1 = keep the local attachment after it was consumed by Paperless
     "lang": "en",               # UI + push language: en or a static/i18n/<code>.json
+    "ical_scope": "all",        # calendar feed: all = every visible open task with a date, mine = mine / assigned to me
+    "ical_alarms": "1",         # calendar feed: reminders as VALARM
 }
 # global, server-internal (table settings); the legacy single-user rows stay there untouched
 GLOBAL_DEFAULTS = {
@@ -490,15 +505,24 @@ def init_db():
             # features_rev 2: paperless module added -> on by default for existing installs
             # features_rev 3: collab added (2026-09-26) -> on by default
             # features_rev 4: the "links" switch is gone (website link always on) -> dropped from the list
+            # features_rev 5: statistics module added (2026-09-26) -> on by default
             s = usettings(c, uid)
             rev, fs = int(s.get("features_rev") or 1), [x for x in s["features"].split(",") if x]
-            if rev < 4:
-                for f, since in (("paperless", 2), ("collab", 3)):
+            if rev < 5:
+                for f, since in (("paperless", 2), ("collab", 3), ("stats", 5)):
                     if rev < since and f not in fs:
                         fs.append(f)
                 fs = [f for f in fs if f != "links"]
                 uset(c, uid, "features", ",".join(fs))
-                uset(c, uid, "features_rev", "4")
+                uset(c, uid, "features_rev", "5")
+        if not gsetting(c, "undo_key"):  # signs the undo payloads handed to the client
+            gset(c, "undo_key", secrets.token_hex(32))
+        # one-shot: completions from before completed_by existed belong to the task's creator (else the list owner)
+        if gsetting(c, "migr_completed_by") != "1":
+            n = c.execute("""UPDATE tasks SET completed_by=COALESCE(created_by, (SELECT owner_id FROM lists WHERE lists.id=tasks.list_id))
+                             WHERE completed_by IS NULL AND status!=0 AND completed_at IS NOT NULL""").rowcount
+            gset(c, "migr_completed_by", "1")
+            print("completed_by: attributed", n, "earlier completions", flush=True)
         c.execute("COMMIT")
     except Exception:
         c.execute("ROLLBACK")
@@ -558,7 +582,7 @@ def _peer_trusted():
 
 def proxy_login_value():
     """The trusted proxy header of this request, or '' (not configured / untrusted peer / bypassed path)."""
-    if not AUTH_HEADER or request.path in PROXY_IGNORE or request.path.startswith("/static/"):
+    if not AUTH_HEADER or request.path in PROXY_IGNORE or request.path.startswith(("/static/", ICAL_PREFIX)):
         return ""
     v = (request.headers.get(AUTH_HEADER) or "").strip()
     return v if v and _peer_trusted() else ""
@@ -576,7 +600,7 @@ def client_ip():
 
 
 def _is_open(path, method):
-    return path in OPEN_PATHS or path.startswith("/static/") or (path == "/share" and method == "GET")
+    return path in OPEN_PATHS or path.startswith(("/static/", ICAL_PREFIX)) or (path == "/share" and method == "GET")
 
 
 @app.before_request
@@ -1115,6 +1139,11 @@ def manifest():
         m = json.load(f)
     lg = lang()
     m["lang"], m["description"] = lg, tr("Tasks, lists, calendar, habits, focus", lg=lg)
+    # long-press menu of the installed app (Android / desktop); the client handles these start URLs
+    m["shortcuts"] = [{"name": tr(n, lg=lg), "short_name": tr(n, lg=lg), "url": u,
+                       "icons": [{"src": f"/static/shortcuts/{k}-{z}.png", "sizes": f"{z}x{z}", "type": "image/png"} for z in (96, 192)]}
+                      for k, n, u in (("new", N_("New task"), "/?action=new"), ("today", N_("Today"), "/#today"),
+                                      ("news", N_("News"), "/#news"), ("search", N_("Search"), "/#search"))]
     return Response(json.dumps(m, ensure_ascii=False, indent=2), mimetype="application/json")
 
 
@@ -1216,6 +1245,8 @@ def state():
         ntfy_url=NTFY_URL,
         languages=languages(),
         news={"unread": news_unread(c, uid, s), "sig": news_sig(c, uid)},
+        templates=[dict(r) for r in c.execute("SELECT id, kind, name FROM templates WHERE user_id=? ORDER BY name COLLATE NOCASE, id",
+                                              (uid,))],
     )
 
 
@@ -1853,27 +1884,33 @@ def task_complete(tid):
     if t["repeat"] and b.get("expect_due") and t["status"] == 0 and b["expect_due"] != t["due"]:
         return jsonify({**one_task(c, tid), "next_due": None, "skipped": True})
     st = int(b.get("status", 2))
-    nxt = do_complete(c, tid, st)
+    undo = {}
+    nxt = do_complete(c, tid, st, undo)
     log_act(c, tid, "wont" if st == -1 else "reopen" if st == 0 else "complete", {"next": nxt} if nxt else None)
     if st == 2:
         task_event(c, tid, "complete")
     bump(c)
     c.commit()
-    return jsonify({**one_task(c, tid), "next_due": nxt})
+    return jsonify({**one_task(c, tid), "next_due": nxt, "undo": signed(tid, undo)})
 
 
-def do_complete(c, tid, status=2):
+def do_complete(c, tid, status=2, undo=None):
+    """undo (dict, filled in): what POST /api/tasks/<id>/undo needs to take this completion back."""
     t = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
     ts = iso(now_utc())
+    who = me() if status != 0 else None
     cnt = rr_count(t["repeat"])
     nxt = next_due(t) if status == 2 and (cnt is None or cnt > 1) else None
+    if undo is not None:
+        undo.update(op="complete", at=ts, status=t["status"], repeat=t["repeat"], due=t["due"], start=t["start"],
+                    reminded=t["reminded"], copy_id=None, kids=[])
     if status == 2 and t["repeat"] and not nxt:  # last repeat (COUNT used up / past UNTIL): done for good
         c.execute("UPDATE tasks SET repeat='' WHERE id=?", (tid,))
     if nxt:
         # keep a completed copy in the history, move the original forward
         cols = [k for k in t.keys() if k not in ("id", "tt_id")]
         vals = {k: t[k] for k in cols}
-        vals.update(status=2, repeat="", completed_at=ts, updated_at=ts, reminded="[]")
+        vals.update(status=2, repeat="", completed_at=ts, updated_at=ts, reminded="[]", completed_by=who)
         cur = c.execute(f"INSERT INTO tasks({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                         [vals[k] for k in cols])
         for r in c.execute("SELECT user_id, tag FROM task_tags WHERE task_id=?", (tid,)).fetchall():
@@ -1885,14 +1922,124 @@ def do_complete(c, tid, status=2):
         if cnt:
             c.execute("UPDATE tasks SET repeat=? WHERE id=?", (rr_with_count(t["repeat"], cnt - 1), tid))
         for d in descendants(c, tid):
-            c.execute("UPDATE tasks SET status=0, completed_at=NULL WHERE id=?", (d,))
+            k = c.execute("SELECT status, completed_at, completed_by FROM tasks WHERE id=?", (d,)).fetchone()
+            if undo is not None and k["status"] != 0:
+                undo["kids"].append([d, k["status"], k["completed_at"], k["completed_by"]])
+            c.execute("UPDATE tasks SET status=0, completed_at=NULL, completed_by=NULL WHERE id=?", (d,))
+        if undo is not None:
+            undo.update(copy_id=cur.lastrowid, next=nxt)
     else:
-        c.execute("UPDATE tasks SET status=?, completed_at=?, updated_at=? WHERE id=?", (status, ts, ts, tid))
+        c.execute("UPDATE tasks SET status=?, completed_at=?, completed_by=?, updated_at=? WHERE id=?",
+                  (status, ts, who, ts, tid))
         if status != 0:  # completing a parent completes its open subtasks (all levels)
             for d in descendants(c, tid):
-                c.execute("UPDATE tasks SET status=?, completed_at=?, updated_at=? WHERE id=? AND status=0",
-                          (status, ts, ts, d))
+                c.execute("UPDATE tasks SET status=?, completed_at=?, completed_by=?, updated_at=? WHERE id=? AND status=0",
+                          (status, ts, who, ts, d))
     return nxt
+
+
+def undo_sig(tid, u):
+    """HMAC over an undo payload (task, user, content): the client hands it back unchanged or not at all."""
+    key = UNDO_KEY.get("k") or UNDO_KEY.setdefault("k", gsetting(db(), "undo_key"))
+    msg = json.dumps({"tid": tid, "uid": me(), **{k: v for k, v in u.items() if k != "sig"}}, sort_keys=True, default=str)
+    return hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def signed(tid, u):
+    return {**u, "sig": undo_sig(tid, u)} if u else u
+
+
+UNDO_KEY = {}
+
+
+def undo_status(c, tid, u):
+    """Takes back a completion (op complete: the dict do_complete filled) or a reopen (op reopen: the
+    status / completed_at / completed_by the task had). The caller checked write access. Returns an
+    error text or None. Only acts while the task is still in the state the action left it in."""
+    t = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+    if not t or not isinstance(u, dict) or not hmac.compare_digest(str(u.get("sig") or ""), undo_sig(tid, u)):
+        return tr("unknown")
+    ts = iso(now_utc())
+    people = list_people(c, t["list_id"])
+
+    def who(v):  # a completer from the client: only someone of this list, else me
+        try:
+            return int(v) if int(v) in people else me()
+        except (TypeError, ValueError):
+            return me()
+
+    def when(v):
+        try:
+            parse_iso(str(v))
+            return str(v)
+        except ValueError:
+            return ts
+    if u.get("op") == "reopen":
+        st = int(u.get("status") or 0)
+        if t["status"] != 0 or st not in (2, -1):
+            return tr("Changed in the meantime, nothing to undo")
+        c.execute("UPDATE tasks SET status=?, completed_at=?, completed_by=?, updated_at=? WHERE id=?",
+                  (st, when(u.get("completed_at")), who(u.get("completed_by")), ts, tid))
+        log_act(c, tid, "wont" if st == -1 else "complete")
+        return None
+    if u.get("op") != "complete" or not u.get("at"):
+        return tr("unknown")
+    at = str(u["at"])
+    cp = u.get("copy_id")
+    if cp:  # recurring: drop the completed copy, move the task back to the occurrence it was on
+        row = c.execute("SELECT * FROM tasks WHERE id=?", (int(cp),)).fetchone()
+        if t["status"] != 0 or t["due"] != u.get("next") or not row or row["list_id"] != t["list_id"] or row["completed_at"] != at or row["status"] == 0 \
+                or row["created_at"] != t["created_at"] or row["title"] != t["title"] or row["repeat"] \
+                or row["id"] < tid or row["parent_id"] != t["parent_id"]:
+            return tr("Changed in the meantime, nothing to undo")
+        files = attachment_files(c, [row["id"]])
+        c.execute("DELETE FROM tasks WHERE id=?", (row["id"],))
+        unlink_files(files)
+        try:
+            due = date.fromisoformat(str(u.get("due"))).isoformat()
+            start = date.fromisoformat(str(u["start"])).isoformat() if u.get("start") else None
+            rem = json.dumps([str(x) for x in json.loads(u.get("reminded") or "[]")][-20:])
+        except (ValueError, TypeError):
+            return tr("unknown")
+        c.execute("UPDATE tasks SET due=?, start=?, repeat=?, reminded=?, updated_at=? WHERE id=?",
+                  (due, start, str(u.get("repeat") or "")[:500], rem, ts, tid))
+        for k in u.get("kids") or []:
+            try:
+                d, st, cat, cby = int(k[0]), int(k[1]), when(k[2]), who(k[3])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if st not in (2, -1):
+                continue
+            c.execute("UPDATE tasks SET status=?, completed_at=?, completed_by=? WHERE id=? AND parent_id IS NOT NULL AND status=0 AND list_id=?",
+                      (st, cat, cby, d, t["list_id"]))
+    else:
+        if t["status"] == 0 or t["completed_at"] != at:
+            return tr("Changed in the meantime, nothing to undo")
+        c.execute("UPDATE tasks SET status=0, completed_at=NULL, completed_by=NULL, updated_at=? WHERE id=?", (ts, tid))
+        if u.get("repeat") and not t["repeat"]:  # the last occurrence had ended the repetition
+            c.execute("UPDATE tasks SET repeat=? WHERE id=?", (str(u["repeat"])[:500], tid))
+        for d in descendants(c, tid):  # subtasks completed together with it
+            c.execute("UPDATE tasks SET status=0, completed_at=NULL, completed_by=NULL, updated_at=? WHERE id=? AND completed_at=?",
+                      (ts, d, at))
+    # the "completed" News items this completion created for others
+    c.execute("DELETE FROM notifications WHERE task_id=? AND kind='complete' AND actor_id=? AND created_at>=?",
+              (tid, me(), at))
+    log_act(c, tid, "reopen")
+    return None
+
+
+@app.post("/api/tasks/<int:tid>/undo")
+def task_undo(tid):
+    """Undo toast: takes back the completion / reopen described by the body (see undo_status)."""
+    c = db()
+    need_task(c, tid)
+    e = undo_status(c, tid, body())
+    if e:
+        c.rollback()
+        return err(e, 409)
+    bump(c)
+    c.commit()
+    return jsonify(one_task(c, tid))
 
 
 @app.post("/api/tasks/<int:tid>/skip")
@@ -1925,12 +2072,14 @@ def task_skip(tid):
 def task_reopen(tid):
     c = db()
     need_task(c, tid)
-    if c.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] != 0:
+    old = c.execute("SELECT status, completed_at, completed_by FROM tasks WHERE id=?", (tid,)).fetchone()
+    if old["status"] != 0:
         log_act(c, tid, "reopen")
-    c.execute("UPDATE tasks SET status=0, completed_at=NULL, updated_at=? WHERE id=?", (iso(now_utc()), tid))
+    c.execute("UPDATE tasks SET status=0, completed_at=NULL, completed_by=NULL, updated_at=? WHERE id=?", (iso(now_utc()), tid))
     bump(c)
     c.commit()
-    return jsonify(one_task(c, tid))
+    undo = {"op": "reopen", "status": old["status"], "completed_at": old["completed_at"], "completed_by": old["completed_by"]}
+    return jsonify({**one_task(c, tid), "undo": signed(tid, undo) if old["status"] != 0 else None})
 
 
 @app.delete("/api/tasks/<int:tid>")
@@ -1960,6 +2109,13 @@ def do_delete(c, tid):
 def task_restore(tid):
     c = db()
     need_task(c, tid)
+    restore_task(c, tid)
+    bump(c)
+    c.commit()
+    return jsonify(ok=True)
+
+
+def restore_task(c, tid):
     r = c.execute("SELECT deleted_at FROM tasks WHERE id=?", (tid,)).fetchone()
     if r:
         c.execute("UPDATE tasks SET deleted_at=NULL WHERE id=?", (tid,))
@@ -1970,9 +2126,6 @@ def task_restore(tid):
                      (SELECT id FROM tasks WHERE deleted_at IS NOT NULL)""", (tid,))
         if r["deleted_at"]:
             log_act(c, tid, "restore")
-    bump(c)
-    c.commit()
-    return jsonify(ok=True)
 
 
 @app.post("/api/tasks/purge-done")
@@ -2379,9 +2532,11 @@ def task_batch():
     ids = [int(i) for i in b.get("ids", [])]
     action, data = b.get("action"), b.get("data") or {}
     ts = iso(now_utc())
-    errors, done = [], 0
+    errors, done, undo = [], 0, {}
+    per = data.get("items") if isinstance(data.get("items"), dict) else {}  # patch_each / undo: per task id
     for tid in ids:
-        if not c.execute("SELECT 1 FROM tasks WHERE id=? AND deleted_at IS NULL", (tid,)).fetchone():
+        deleted = c.execute("SELECT deleted_at FROM tasks WHERE id=?", (tid,)).fetchone()
+        if not deleted or (deleted[0] and action != "restore") or (not deleted[0] and action == "restore"):
             continue
         try:
             need_task(c, tid)
@@ -2390,24 +2545,42 @@ def task_batch():
                 if e:
                     errors.append(e)
                     continue
+            elif action == "patch_each":  # undo of a batch edit: every task back to its own values
+                if str(tid) not in per:
+                    continue
+                e = apply_update(c, tid, per[str(tid)])
+                if e:
+                    errors.append(e)
+                    continue
             elif action == "complete":
                 st = int(data.get("status", 2))
-                nxt = do_complete(c, tid, st)
+                u = {}
+                if c.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] != 0:
+                    continue  # already completed: nothing to do (and nothing to undo)
+                nxt = do_complete(c, tid, st, u)
+                undo[str(tid)] = signed(tid, u)
                 log_act(c, tid, "wont" if st == -1 else "reopen" if st == 0 else "complete", {"next": nxt} if nxt else None)
                 if st == 2:
                     task_event(c, tid, "complete")
+            elif action == "undo":
+                e = undo_status(c, tid, per.get(str(tid)))
+                if e:
+                    errors.append(e)
+                    continue
             elif action == "reopen":
-                c.execute("UPDATE tasks SET status=0, completed_at=NULL, updated_at=? WHERE id=?", (ts, tid))
+                c.execute("UPDATE tasks SET status=0, completed_at=NULL, completed_by=NULL, updated_at=? WHERE id=?", (ts, tid))
                 log_act(c, tid, "reopen")
             elif action == "delete":
                 do_delete(c, tid)
                 log_act(c, tid, "delete")
+            elif action == "restore":
+                restore_task(c, tid)
             done += 1
         except Denied as e:
             errors.append(tr("No permission (view only)") if e.code == 403 else tr("unknown"))
     bump(c)
     c.commit()
-    return jsonify(ok=True, count=done, errors=list(dict.fromkeys(errors)))
+    return jsonify(ok=True, count=done, errors=list(dict.fromkeys(errors)), undo=undo)
 
 
 @app.get("/api/occurrences")
@@ -3107,7 +3280,7 @@ def export_json():
     own = "(SELECT id FROM lists WHERE owner_id=?)"
     task_ids = f"(SELECT id FROM tasks WHERE list_id IN {own})"
     q = {
-        "lists": (f"SELECT * FROM lists WHERE owner_id=?", (uid,)),
+        "lists": ("SELECT * FROM lists WHERE owner_id=?", (uid,)),
         "list_members": (f"SELECT * FROM list_members WHERE list_id IN {own}", (uid,)),
         "sections": (f"SELECT * FROM sections WHERE list_id IN {own}", (uid,)),
         "tasks": (f"SELECT * FROM tasks WHERE list_id IN {own}", (uid,)),
@@ -3121,6 +3294,7 @@ def export_json():
         "comments": (f"SELECT * FROM comments WHERE task_id IN {task_ids} AND deleted_at IS NULL", (uid,)),
         "activity": (f"SELECT * FROM activity WHERE task_id IN {task_ids}", (uid,)),
         "settings": ("SELECT key, value FROM user_settings WHERE user_id=?", (uid,)),
+        "templates": ("SELECT id, kind, name, data, created_at, updated_at FROM templates WHERE user_id=?", (uid,)),
     }
     data = {t: [dict(r) for r in c.execute(sql, args)] for t, (sql, args) in q.items()}
     data["user"] = user_public(g.user)
@@ -3302,6 +3476,610 @@ def me_drop_token():
     return jsonify(drop_token=tok)
 
 
+# ---------------------------------------------------------------- templates (private per user)
+# A task template = {"task": node}, a list template = {"name", "color", "view", "sections": [name, ...],
+# "tasks": [node + "section": index into sections | null]}. node = {title, content, priority, tags, url,
+# due_offset, start_offset, due_time, duration, reminders, repeat, repeat_from, children: [node, ...]}.
+# Offsets are days relative to the day the template was saved (never negative); a template used
+# today puts the dates relative to today. Subtasks up to MAX_DEPTH levels; assignees are not kept.
+TPL_MAX_NODES = 500
+TPL_MAX_PER_USER = 200
+HHMM_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
+
+
+def tpl_node_from_task(c, t, base, uid, depth=0):
+    def off(d):
+        return max(0, (date.fromisoformat(d) - base).days) if d else None
+    tags = [r[0] for r in c.execute("SELECT tag FROM task_tags WHERE task_id=? AND user_id=? ORDER BY tag", (t["id"], uid))]
+    kids = c.execute("SELECT * FROM tasks WHERE parent_id=? AND deleted_at IS NULL ORDER BY sort, id",
+                     (t["id"],)).fetchall() if depth < MAX_DEPTH - 1 else []
+    return {"title": t["title"], "content": t["content"] or "", "priority": t["priority"] or 0, "tags": tags,
+            "url": t["url"], "due_offset": off(t["due"]), "start_offset": off(t["start"]) if t["due"] else None,
+            "due_time": t["due_time"] if t["due"] else None, "duration": t["duration"] if t["due_time"] else None,
+            "reminders": t["reminders"] or "", "repeat": t["repeat"] or "", "repeat_from": t["repeat_from"] or "due",
+            "children": [tpl_node_from_task(c, k, base, uid, depth + 1) for k in kids]}
+
+
+def tpl_clean_node(n, depth, count):
+    """Validates one node from the client (edited template); raises ValueError with a message."""
+    if not isinstance(n, dict):
+        raise ValueError(tr("Invalid template"))
+    count[0] += 1
+    if count[0] > TPL_MAX_NODES:
+        raise ValueError(tr("Template too large (at most {0} tasks)", TPL_MAX_NODES))
+    title = str(n.get("title") or "").strip()[:500]
+    if not title:
+        raise ValueError(tr("Title missing"))
+
+    def num(k, lo, hi):
+        v = n.get(k)
+        if v in (None, ""):
+            return None
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            raise ValueError(tr("Invalid template")) from None
+        return min(hi, max(lo, v))
+    due_off = num("due_offset", 0, 3650)
+    due_time = n.get("due_time") if isinstance(n.get("due_time"), str) and HHMM_RE.fullmatch(n.get("due_time")) else None
+    rep = str(n.get("repeat") or "").strip()[:300]
+    if rep:
+        try:
+            rrulestr(rep.removeprefix("RRULE:"), dtstart=datetime(2026, 1, 1))
+        except (ValueError, TypeError):
+            rep = ""
+    rems = ",".join(dict.fromkeys(x.strip() for x in str(n.get("reminders") or "").split(",") if x.strip().isdigit()))
+    url = str(n.get("url") or "").strip() or None
+    kids = n.get("children") or []
+    return {"title": title, "content": str(n.get("content") or "")[:20000],
+            "priority": num("priority", 0, 5) if num("priority", 0, 5) in (0, 1, 3, 5) else 0,
+            "tags": [str(x).strip().lstrip("#")[:60] for x in (n.get("tags") or []) if str(x).strip().lstrip("#")][:30]
+            if isinstance(n.get("tags"), list) else [],
+            "url": url if url and valid_url(url) else None,
+            "due_offset": due_off, "start_offset": num("start_offset", 0, 3650) if due_off is not None else None,
+            "due_time": due_time if due_off is not None else None,
+            "duration": num("duration", 5, 1440) if due_time and due_off is not None else None,
+            "reminders": rems if due_off is not None else "", "repeat": rep if due_off is not None else "",
+            "repeat_from": "done" if n.get("repeat_from") == "done" else "due",
+            "children": [tpl_clean_node(k, depth + 1, count) for k in kids] if depth < MAX_DEPTH - 1 and isinstance(kids, list) else []}
+
+
+def tpl_clean(kind, d):
+    if not isinstance(d, dict):
+        raise ValueError(tr("Invalid template"))
+    count = [0]
+    if kind == "task":
+        return {"task": tpl_clean_node(d.get("task"), 0, count)}
+    secs = [str(x).strip()[:200] for x in (d.get("sections") or []) if str(x).strip()][:50]
+    tasks = []
+    for n in d.get("tasks") or []:
+        x = tpl_clean_node(n, 0, count)
+        si = n.get("section") if isinstance(n, dict) else None
+        x["section"] = si if isinstance(si, int) and not isinstance(si, bool) and 0 <= si < len(secs) else None
+        tasks.append(x)
+    color = str(d.get("color") or "")
+    return {"name": str(d.get("name") or "").strip()[:200], "color": color if re.fullmatch(r"#[0-9a-fA-F]{3,8}", color) else "",
+            "view": d.get("view") if d.get("view") in ("list", "kanban", "timeline") else "list",
+            "sections": secs, "tasks": tasks}
+
+
+def tpl_count(d):
+    def n(x):
+        return 1 + sum(n(k) for k in x.get("children") or [])
+    return n(d["task"]) if "task" in d else sum(n(x) for x in d.get("tasks") or [])
+
+
+def tpl_dict(r):
+    d = json.loads(r["data"] or "{}")
+    return {"id": r["id"], "kind": r["kind"], "name": r["name"], "data": d, "count": tpl_count(d),
+            "created_at": r["created_at"], "updated_at": r["updated_at"]}
+
+
+def need_template(c, tid):
+    r = c.execute("SELECT * FROM templates WHERE id=? AND user_id=?", (tid, me())).fetchone()
+    if not r:
+        raise Denied(404)
+    return r
+
+
+@app.get("/api/templates")
+def templates_list():
+    return jsonify(templates=[tpl_dict(r) for r in db().execute(
+        "SELECT * FROM templates WHERE user_id=? ORDER BY kind DESC, name COLLATE NOCASE, id", (me(),))])
+
+
+@app.post("/api/templates")
+def template_create():
+    """{task_id} = this task with its subtasks, {list_id} = the list's sections and open tasks (with subtasks),
+    or {kind, data} as sent by the template editor. name optional (default: the task title / list name)."""
+    b = body()
+    c = db()
+    uid = me()
+    if c.execute("SELECT COUNT(*) FROM templates WHERE user_id=?", (uid,)).fetchone()[0] >= TPL_MAX_PER_USER:
+        return err(tr("At most {0} templates", TPL_MAX_PER_USER))
+    base = local_now().date()
+    try:
+        if b.get("task_id"):
+            tid = int(b["task_id"])
+            need_task(c, tid, write=False)
+            t = c.execute("SELECT * FROM tasks WHERE id=? AND deleted_at IS NULL", (tid,)).fetchone()
+            if not t:
+                raise Denied(404)
+            kind, data, name = "task", {"task": tpl_node_from_task(c, t, base, uid)}, t["title"]
+        elif b.get("list_id"):
+            lid = int(b["list_id"])
+            need_list(c, lid, write=False)
+            lst = c.execute("SELECT * FROM lists WHERE id=?", (lid,)).fetchone()
+            secs = c.execute("SELECT id, name FROM sections WHERE list_id=? ORDER BY sort, id", (lid,)).fetchall()
+            sidx = {s["id"]: i for i, s in enumerate(secs)}
+            tasks = []
+            for t in c.execute("""SELECT * FROM tasks WHERE list_id=? AND parent_id IS NULL AND status=0 AND deleted_at IS NULL
+                                  ORDER BY sort, id""", (lid,)).fetchall():
+                n = tpl_node_from_task(c, t, base, uid)
+                n["section"] = sidx.get(t["section_id"])
+                tasks.append(n)
+            role = list_role(c, lid)
+            name = tr("Inbox") if lst["is_inbox"] and lst["name"] == "Eingang" else lst["name"]
+            kind, data = "list", {"name": name, "color": lst["color"],
+                                  "view": lst["view"] if role == "owner" else (c.execute(
+                                      "SELECT COALESCE(view, ?) FROM list_members WHERE list_id=? AND user_id=?",
+                                      (lst["view"], lid, uid)).fetchone() or ["list"])[0],
+                                  "sections": [s["name"] for s in secs], "tasks": tasks}
+        else:
+            kind = b.get("kind") if b.get("kind") in ("task", "list") else None
+            if not kind:
+                return err(tr("Invalid template"))
+            data = b.get("data")
+            name = ""
+        data = tpl_clean(kind, data)
+    except (ValueError, TypeError) as e:
+        return err(str(e) or tr("Invalid template"))
+    name = (str(b.get("name") or "").strip() or name or (data.get("name") if kind == "list" else data["task"]["title"]))[:200]
+    if not name:
+        return err(tr("Name missing"))
+    ts = iso(now_utc())
+    cur = c.execute("INSERT INTO templates(user_id,kind,name,data,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (uid, kind, name, json.dumps(data, ensure_ascii=False), ts, ts))
+    bump(c)
+    c.commit()
+    return jsonify(tpl_dict(c.execute("SELECT * FROM templates WHERE id=?", (cur.lastrowid,)).fetchone()))
+
+
+@app.patch("/api/templates/<int:tid>")
+def template_update(tid):
+    b = body()
+    c = db()
+    r = need_template(c, tid)
+    if "name" in b:
+        name = str(b["name"] or "").strip()[:200]
+        if not name:
+            return err(tr("Name missing"))
+        c.execute("UPDATE templates SET name=? WHERE id=?", (name, tid))
+    if "data" in b:
+        try:
+            data = tpl_clean(r["kind"], b["data"])
+        except (ValueError, TypeError) as e:
+            return err(str(e) or tr("Invalid template"))
+        c.execute("UPDATE templates SET data=? WHERE id=?", (json.dumps(data, ensure_ascii=False), tid))
+    c.execute("UPDATE templates SET updated_at=? WHERE id=?", (iso(now_utc()), tid))
+    bump(c)
+    c.commit()
+    return jsonify(tpl_dict(c.execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()))
+
+
+@app.delete("/api/templates/<int:tid>")
+def template_delete(tid):
+    c = db()
+    need_template(c, tid)
+    c.execute("DELETE FROM templates WHERE id=?", (tid,))
+    bump(c)
+    c.commit()
+    return jsonify(ok=True)
+
+
+def tpl_insert(c, n, lid, sec, parent, base, sort, uid):
+    """Creates the task of one template node (and its subtasks); returns the new id."""
+    due = (base + timedelta(days=n["due_offset"])).isoformat() if n.get("due_offset") is not None else None
+    start = (base + timedelta(days=n["start_offset"])).isoformat() if due and n.get("start_offset") is not None else None
+    if start and start >= due:
+        start = None
+    tm = n.get("due_time") if due else None
+    f = {"list_id": lid, "section_id": sec, "parent_id": parent, "title": n["title"], "content": n.get("content") or "",
+         "priority": n.get("priority") or 0, "due": due, "due_time": tm, "start": start,
+         "duration": n.get("duration") if tm else None, "reminders": n.get("reminders") or "" if due else "",
+         "repeat": n.get("repeat") or "" if due else "", "repeat_from": n.get("repeat_from") or "due",
+         "url": n.get("url"), "sort": sort, "created_by": uid}
+    ts = iso(now_utc())
+    cols = list(f) + ["created_at", "updated_at"]
+    tid = c.execute(f"INSERT INTO tasks({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
+                    [f[k] for k in f] + [ts, ts]).lastrowid
+    if n.get("tags"):
+        set_tags(c, tid, n["tags"], uid)
+    log_act(c, tid, "created")
+    for i, k in enumerate(n.get("children") or []):
+        tpl_insert(c, k, lid, sec, tid, base, i + 1, uid)
+    return tid
+
+
+@app.post("/api/templates/<int:tid>/apply")
+def template_apply(tid):
+    """Task template: new task (+ subtasks) in {list_id, section_id} (default: inbox).
+    List template: a new list of mine ({name} optional). Dates relative to today."""
+    b = body()
+    c = db()
+    uid = me()
+    r = need_template(c, tid)
+    d = json.loads(r["data"] or "{}")
+    base = local_now().date()
+    if r["kind"] == "task":
+        lid = int(b.get("list_id") or 0) or my_inbox(c)
+        need_list(c, lid)
+        sec = b.get("section_id")
+        if sec and not c.execute("SELECT 1 FROM sections WHERE id=? AND list_id=?", (sec, lid)).fetchone():
+            sec = None
+        srt = c.execute("SELECT COALESCE(MIN(sort),0)-1 FROM tasks WHERE list_id=? AND parent_id IS NULL", (lid,)).fetchone()[0]
+        new = tpl_insert(c, d["task"], lid, sec or None, None, base, srt, uid)
+        bump(c)
+        c.commit()
+        return jsonify(task=one_task(c, new))
+    name = str(b.get("name") or "").strip()[:200] or d.get("name") or r["name"]
+    lid = c.execute("INSERT INTO lists(name,color,folder,sort,view,created_at,owner_id) VALUES(?,?,?,?,?,?,?)",
+                    (name, d.get("color") or "", "", my_max_sort(c, uid) + 1, d.get("view") or "list", iso(now_utc()), uid)).lastrowid
+    secs = [c.execute("INSERT INTO sections(list_id,name,sort) VALUES(?,?,?)", (lid, s, i)).lastrowid
+            for i, s in enumerate(d.get("sections") or [])]
+    for i, n in enumerate(d.get("tasks") or []):
+        si = n.get("section")
+        tpl_insert(c, n, lid, secs[si] if isinstance(si, int) and 0 <= si < len(secs) else None, None, base, i, uid)
+    bump(c)
+    c.commit()
+    return jsonify(list_id=lid)
+
+
+# ---------------------------------------------------------------- statistics (per user)
+# Completions count for the person who completed (tasks.completed_by; done copies of recurring tasks
+# are the completions of their occurrences), won't-do is not a completion. Tasks in the trash still
+# count until the trash is emptied. Window: the last 12 weeks (Monday-based, incl. the current one).
+# Overdue trend: at the end of each week (today for the current one), the tasks I am responsible for
+# (assigned to me, or unassigned in my own lists) whose due date had passed and that were still open,
+# based on today's due dates. On time: completed on or before the due day.
+STATS_WEEKS = 12
+
+
+def _local_day(ts):
+    return parse_iso(ts).astimezone(TZ).date() if ts else None
+
+
+@app.get("/api/stats")
+def stats_api():
+    c = db()
+    uid = me()
+    today = local_now().date()
+    mon0 = today - timedelta(days=today.weekday()) - timedelta(weeks=STATS_WEEKS - 1)
+    weeks = [mon0 + timedelta(weeks=i) for i in range(STATS_WEEKS)]
+    lo = iso(datetime(mon0.year, mon0.month, mon0.day, tzinfo=TZ))
+    vis = {l["id"]: l for l in visible_lists(c, uid)}
+    wk = lambda d: (d - mon0).days // 7  # noqa: E731
+
+    days_all, per_day, per_week, by_list = set(), {}, [0] * STATS_WEEKS, {}
+    with_due = ontime = 0
+    for r in c.execute("""SELECT list_id, due, completed_at FROM tasks WHERE completed_by=? AND status=2
+                          AND completed_at IS NOT NULL""", (uid,)):
+        d = _local_day(r["completed_at"])
+        days_all.add(d)
+        if d < mon0 or d > today:
+            continue
+        per_day[d.isoformat()] = per_day.get(d.isoformat(), 0) + 1
+        per_week[wk(d)] += 1
+        k = r["list_id"] if r["list_id"] in vis else 0
+        by_list[k] = by_list.get(k, 0) + 1
+        if r["due"]:
+            with_due += 1
+            ontime += d.isoformat() <= r["due"]
+
+    # streak: days in a row with at least one completion (today still counts as "running" when empty)
+    cur, d = 0, today if today in days_all else today - timedelta(days=1)
+    while d in days_all:
+        cur, d = cur + 1, d - timedelta(days=1)
+    best, run, prev = 0, 0, None
+    for d in sorted(days_all):
+        run = run + 1 if prev and (d - prev).days == 1 else 1
+        best, prev = max(best, run), d
+
+    samples = [w + timedelta(days=6) for w in weeks[:-1]] + [today]
+    over = [0] * len(samples)
+    for r in c.execute("""SELECT t.due, t.status, t.created_at, t.completed_at, t.deleted_at FROM tasks t JOIN lists l ON l.id=t.list_id
+                          WHERE t.due IS NOT NULL AND t.due<? AND (t.assignee_id=? OR (t.assignee_id IS NULL AND l.owner_id=?))
+                            AND (t.status=0 OR t.completed_at>=?)""", (today.isoformat(), uid, uid, lo)):
+        created, done, deleted = _local_day(r["created_at"]), _local_day(r["completed_at"]), _local_day(r["deleted_at"])
+        if r["status"] != 0 and not done:
+            continue
+        for i, s in enumerate(samples):
+            if r["due"] < s.isoformat() and created <= s and (not deleted or deleted > s) \
+                    and (r["status"] == 0 or done > s):
+                over[i] += 1
+
+    f_day, f_week, f_list = {}, [0.0] * STATS_WEEKS, {}
+    for p in c.execute("""SELECT p.*, t.list_id FROM pomos p LEFT JOIN tasks t ON t.id=p.task_id
+                          WHERE p.user_id=? AND p.kind IN ('focus','stopwatch') AND p.end IS NOT NULL AND p.start>=?""", (uid, lo)):
+        d = _local_day(p["start"])
+        if d < mon0 or d > today:
+            continue
+        m = pomo_elapsed(p) / 60
+        f_day[d.isoformat()] = f_day.get(d.isoformat(), 0) + m
+        f_week[wk(d)] += m
+        k = (p["list_id"] if p["list_id"] in vis else 0) if p["task_id"] else -1
+        f_list[k] = f_list.get(k, 0) + m
+
+    def lst(k):
+        l = vis.get(k)
+        return {"id": k, "name": l["name"] if l else "", "is_inbox": bool(l and l["is_inbox"]), "color": l["color"] if l else ""}
+    return jsonify(
+        today=today.isoformat(), weeks=[w.isoformat() for w in weeks],
+        done={"per_day": per_day, "per_week": per_week, "total": sum(per_week),
+              "today": per_day.get(today.isoformat(), 0), "this_week": per_week[-1],
+              "by_list": sorted(({**lst(k), "n": n} for k, n in by_list.items()), key=lambda x: (-x["n"], x["id"] == 0))},
+        ontime={"with_due": with_due, "ontime": ontime, "rate": round(100 * ontime / with_due) if with_due else None},
+        streak={"current": cur, "best": best},
+        overdue=[{"date": s.isoformat(), "n": n} for s, n in zip(samples, over)],
+        focus={"per_day": {k: round(v) for k, v in f_day.items()}, "per_week": [round(v) for v in f_week],
+               "total": round(sum(f_week)), "this_week": round(f_week[-1]),
+               "by_list": sorted(({**lst(k), "minutes": round(v)} for k, v in f_list.items() if round(v)),
+                                 key=lambda x: -x["minutes"])},
+    )
+
+
+# ---------------------------------------------------------------- calendar feed (ICS subscription)
+# GET /ical/<user id>.<secret>.ics — a subscribable calendar of the user's open tasks with a date (all
+# visible lists, or only "mine": unassigned in my own lists + assigned to me). The token in the path is
+# the only credential: this path must bypass a login proxy and never trusts the proxy header.
+# Timed tasks are events with their duration (default 30 min) in the server time zone (VTIMEZONE
+# included), all-day tasks all-day events (a start date makes it a range). Recurring tasks carry their
+# RRULE, so calendars show every future occurrence of the open instance (completing it moves the
+# series on); "repeat from completion date" tasks only show their next date. Reminders -> VALARM.
+ICAL_FAIL_LIMIT = 30  # wrong tokens per client IP within FAIL_WINDOW, then 429
+ICAL_MAX = 3000
+
+
+def ics_text(s):
+    return (str(s or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n"))
+
+
+def ics_fold(line):
+    """RFC 5545 folding: lines of at most 75 octets, never inside a UTF-8 sequence."""
+    if len(line.encode("utf-8")) <= 75:
+        return line
+    out, cur, n, limit = [], "", 0, 75
+    for ch in line:
+        k = len(ch.encode("utf-8"))
+        if n + k > limit:
+            out.append(cur)
+            cur, n, limit = "", 0, 74  # continuation lines start with a space
+        cur += ch
+        n += k
+    out.append(cur)
+    return "\r\n ".join(out)
+
+
+def ics_utc(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def ics_dur(minutes):
+    sign, m = ("-" if minutes < 0 else ""), abs(int(minutes))
+    d, m = divmod(m, 1440)
+    h, m = divmod(m, 60)
+    t = (f"{h}H" if h else "") + (f"{m}M" if m else "")
+    return f"{sign}P{f'{d}D' if d else ''}{'T' + t if t else ''}" if d or t else "PT0S"
+
+
+def ics_vtimezone(tz, year):
+    """VTIMEZONE of tz, derived from its transitions in `year` (yearly rules like the EU / US ones)."""
+    key = getattr(tz, "key", "UTC")
+
+    def off(x):
+        o = int(x.utcoffset().total_seconds() // 60)
+        return f"{'+' if o >= 0 else '-'}{abs(o) // 60:02d}{abs(o) % 60:02d}"
+    utc0 = datetime(year, 1, 1, tzinfo=timezone.utc)
+    trans, prev = [], utc0.astimezone(tz)
+    for h in range(1, 366 * 24):
+        cur = (utc0 + timedelta(hours=h)).astimezone(tz)
+        if cur.utcoffset() != prev.utcoffset():
+            for m in range(60):  # to the minute
+                x = (utc0 + timedelta(hours=h - 1, minutes=m + 1)).astimezone(tz)
+                if x.utcoffset() != prev.utcoffset():
+                    trans.append((prev, x))
+                    break
+        prev = cur
+    lines = ["BEGIN:VTIMEZONE", f"TZID:{key}"]
+    if not trans:
+        o = off(utc0.astimezone(tz))
+        return lines + ["BEGIN:STANDARD", "DTSTART:19700101T000000", f"TZOFFSETFROM:{o}", f"TZOFFSETTO:{o}",
+                        f"TZNAME:{utc0.astimezone(tz).tzname()}", "END:STANDARD", "END:VTIMEZONE"]
+    from dateutil.rrule import rrule, YEARLY, weekdays
+    for before, after in trans[:2]:
+        wall = (after.astimezone(timezone.utc) + before.utcoffset()).replace(tzinfo=None)  # old wall clock
+        last = (wall.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        nth = -1 if wall.day + 7 > last.day else (wall.day - 1) // 7 + 1
+        wd = weekdays[wall.weekday()]
+        first = rrule(YEARLY, bymonth=wall.month, byweekday=wd(nth), dtstart=datetime(1970, 1, 1, wall.hour, wall.minute))[0]
+        kind = "DAYLIGHT" if after.utcoffset() > before.utcoffset() else "STANDARD"
+        lines += [f"BEGIN:{kind}", f"DTSTART:{first:%Y%m%dT%H%M%S}",
+                  f"RRULE:FREQ=YEARLY;BYMONTH={wall.month};BYDAY={nth}{['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'][wall.weekday()]}",
+                  f"TZOFFSETFROM:{off(before)}", f"TZOFFSETTO:{off(after)}", f"TZNAME:{after.tzname()}", f"END:{kind}"]
+    return lines + ["END:VTIMEZONE"]
+
+
+RRULE_OK = re.compile(r"[A-Z]+=[A-Za-z0-9,+\-]+(;[A-Z]+=[A-Za-z0-9,+\-]+)*")
+
+
+def ics_rrule(rep, dtstart, timed):
+    """-> (rule text for the calendar or None, first occurrence). The rule is only used when dateutil can
+    parse it; UNTIL becomes a UTC date-time for timed events (RFC 5545)."""
+    rep = (rep or "").removeprefix("RRULE:").strip().rstrip(";")
+    if not rep or not RRULE_OK.fullmatch(rep):
+        return None, None
+    parts = []
+    for p in rep.split(";"):
+        k, v = p.split("=", 1)
+        if k == "UNTIL":
+            try:
+                d = date(int(v[:4]), int(v[4:6]), int(v[6:8]))
+            except ValueError:
+                return None, None
+            v = ics_utc(datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=TZ)) if timed else f"{d:%Y%m%d}"
+        parts.append(f"{k}={v}")
+    rule = ";".join(parts)
+    try:
+        first = next(iter(rrulestr(rule.replace("Z", "") if timed else rule, dtstart=dtstart,
+                                   ignoretz=True)), None)
+    except (ValueError, TypeError, StopIteration):
+        return None, None
+    return rule, first
+
+
+def ics_event(t, s, lg, host, key, stamp):
+    """VEVENT lines (1 or 2: an occurrence that does not fit its own RRULE is split off)."""
+    due = date.fromisoformat(t["due"])
+    timed = bool(t["due_time"])
+    if timed:
+        hh, mm = map(int, t["due_time"].split(":"))
+        start = datetime(due.year, due.month, due.day, hh, mm)
+    else:
+        start = datetime(due.year, due.month, due.day)
+    lname = tr("Inbox", lg=lg) if t["list_inbox"] and t["list_name"] == "Eingang" else t["list_name"]
+    deep = f"{PUBLIC_URL}/#t/{t['id']}"
+    desc = ([t["content"].strip()] if (t["content"] or "").strip() else []) + \
+        [tr("List: {0}", lname, lg=lg)] + ([tr("Link: {0}", t["url"], lg=lg)] if t["url"] else []) + \
+        [tr("Open in Abhako: {0}", deep, lg=lg)]
+    rule, first = (None, None)
+    if t["repeat"] and t["repeat_from"] != "done":
+        rule, first = ics_rrule(t["repeat"], start, timed)
+
+    def when(st):
+        if timed:
+            en = st + timedelta(minutes=max(5, t["duration"] or 30))
+            return [f"DTSTART;TZID={key}:{st:%Y%m%dT%H%M%S}", f"DTEND;TZID={key}:{en:%Y%m%dT%H%M%S}"]
+        s0 = st.date()
+        if t["start"] and t["start"] < t["due"]:  # timeline range: same length for every occurrence
+            s0 -= due - date.fromisoformat(t["start"])
+        return [f"DTSTART;VALUE=DATE:{s0:%Y%m%d}", f"DTEND;VALUE=DATE:{st.date() + timedelta(days=1):%Y%m%d}"]
+
+    def alarms():
+        if s.get("ical_alarms") == "0" or not t["reminders"]:
+            return []
+        out = []
+        base = 0 if timed else hm_minutes(s.get("allday_time") or "09:00")
+        for off in t["reminders"].split(","):
+            if off.strip().isdigit():
+                out += ["BEGIN:VALARM", "ACTION:DISPLAY", f"DESCRIPTION:{ics_text(t['title'])}",
+                        f"TRIGGER:{ics_dur(base - int(off))}", "END:VALARM"]
+        return out
+
+    def vevent(uid, st, rr):
+        prio = {5: 1, 3: 5, 1: 9}.get(t["priority"])
+        return (["BEGIN:VEVENT", f"UID:{uid}", f"DTSTAMP:{stamp}", f"CREATED:{ics_utc(parse_iso(t['created_at']))}",
+                 f"LAST-MODIFIED:{ics_utc(parse_iso(t['updated_at']))}", f"SUMMARY:{ics_text(t['title'])}"] + when(st) +
+                ([f"RRULE:{rr}"] if rr else []) +
+                [f"DESCRIPTION:{ics_text(chr(10).join(desc))}", f"URL:{deep}", "TRANSP:TRANSPARENT"] +
+                ([f"PRIORITY:{prio}"] if prio else []) + alarms() + ["END:VEVENT"])
+    uid = f"task-{t['id']}@{host}"
+    if not rule:
+        return vevent(uid, start, None)
+    if first == start:
+        return vevent(uid, start, rule)
+    # the open occurrence is not on the rule's pattern (moved by hand): own event + the series after it
+    cnt = rr_count(rule)
+    if cnt is not None:
+        if cnt <= 1:
+            return vevent(uid, start, None)
+        rule = rr_with_count(rule, cnt - 1)
+    return vevent(uid, start, None) + (vevent(f"task-{t['id']}-series@{host}", first, rule) if first else [])
+
+
+def hm_minutes(s):
+    try:
+        h, m = map(int, s.split(":"))
+        return h * 60 + m
+    except ValueError:
+        return 540
+
+
+def ics_build(c, u):
+    uid = u["id"]
+    s = usettings(c, uid)
+    lg = s.get("lang") if s.get("lang") in LANGS else "en"
+    where, args = f"t.status=0 AND t.deleted_at IS NULL AND t.due IS NOT NULL AND t.list_id IN {vis_sql()}", [uid, uid]
+    if s.get("ical_scope") == "mine":
+        where += " AND ((l.owner_id=? AND (t.assignee_id IS NULL OR t.assignee_id=?)) OR t.assignee_id=?)"
+        args += [uid, uid, uid]
+    rows = c.execute(f"""SELECT t.*, l.name AS list_name, l.is_inbox AS list_inbox FROM tasks t JOIN lists l ON l.id=t.list_id
+                         WHERE {where} ORDER BY t.due, t.id LIMIT {ICAL_MAX}""", args).fetchall()
+    host = urllib.parse.urlparse(PUBLIC_URL).hostname or "abhako"
+    key = getattr(TZ, "key", "UTC")
+    stamp = ics_utc(now_utc())
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Abhako//Tasks//EN", "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+             f"X-WR-CALNAME:{ics_text(APP_NAME + ' · ' + (u['display_name'] or u['username']))}",
+             f"X-WR-CALDESC:{ics_text(tr('Open tasks with a date', lg=lg))}", f"X-WR-TIMEZONE:{key}",
+             "REFRESH-INTERVAL;VALUE=DURATION:PT15M", "X-PUBLISHED-TTL:PT15M"]
+    if any(r["due_time"] for r in rows):
+        lines += ics_vtimezone(TZ, local_now().year)
+    for t in rows:
+        try:
+            lines += ics_event(t, s, lg, host, key, stamp)
+        except (ValueError, TypeError) as e:  # one broken row never breaks the whole feed
+            print("ical: skipping task", t["id"], e, flush=True)
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(ics_fold(x) for x in lines) + "\r\n"
+
+
+@app.get("/ical/<token>.ics")
+def ical_feed(token):
+    keys = [("ical:" + client_ip(), ICAL_FAIL_LIMIT)]
+    if _rate_blocked(keys):
+        return Response("Too many requests\n", 429, content_type="text/plain; charset=utf-8")
+    c = db()
+    uid_s, _, secret = token.partition(".")
+    u = None
+    if uid_s.isdigit() and secret:
+        r = c.execute("SELECT * FROM users WHERE id=? AND disabled=0", (int(uid_s),)).fetchone()
+        if r and r["ical_token"] and hmac.compare_digest(r["ical_token"].encode(), secret.encode()):
+            u = r
+    if not u:
+        _rate_fail(keys)
+        return Response("Not found\n", 404, content_type="text/plain; charset=utf-8")
+    return Response(ics_build(c, u), content_type="text/calendar; charset=utf-8",
+                    headers={"Cache-Control": "no-cache, private", "Content-Disposition": 'inline; filename="abhako.ics"',
+                             "X-Robots-Tag": "noindex"})
+
+
+def ical_url(u):
+    return f"{PUBLIC_URL}/ical/{u['id']}.{u['ical_token']}.ics" if u["ical_token"] else None
+
+
+@app.get("/api/ical")
+def ical_info():
+    u = db().execute("SELECT id, ical_token FROM users WHERE id=?", (me(),)).fetchone()
+    return jsonify(url=ical_url(u))
+
+
+@app.post("/api/ical")
+def ical_set():
+    """{action: create | rotate | off}: create keeps an existing link, rotate replaces it (the old URL
+    stops working at once), off removes it."""
+    a = body().get("action")
+    c = db()
+    u = c.execute("SELECT id, ical_token FROM users WHERE id=?", (me(),)).fetchone()
+    if a == "off":
+        c.execute("UPDATE users SET ical_token=NULL WHERE id=?", (me(),))
+    elif a == "rotate" or (a == "create" and not u["ical_token"]):
+        c.execute("UPDATE users SET ical_token=? WHERE id=?", (secrets.token_urlsafe(32), me()))
+    elif a != "create":
+        return err(tr("unknown"))
+    c.commit()
+    return jsonify(url=ical_url(c.execute("SELECT id, ical_token FROM users WHERE id=?", (me(),)).fetchone()))
+
+
 # ---------------------------------------------------------------- TickTick import
 
 def tt_date(s, all_day):
@@ -3410,11 +4188,11 @@ def import_ticktick(c, text, uid):
             repeat = ""  # ERULE / custom date lists are not supported
         cur = c.execute(
             """INSERT INTO tasks(list_id,section_id,title,content,priority,status,due,due_time,reminders,
-               reminded,repeat,sort,created_at,updated_at,completed_at,tt_id,start,created_by)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               reminded,repeat,sort,created_at,updated_at,completed_at,tt_id,start,created_by,completed_by)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (lid, sec, (r.get("Title") or tr("(untitled)", lg=lang(c, uid))).strip(), content, int(r.get("Priority") or 0),
              status, due, due_time, rems, json.dumps(reminded), repeat, stats["tasks"], created, ts, completed, tt,
-             start, uid))
+             start, uid, uid if completed else None))
         idmap[tt] = cur.lastrowid
         tags = [t.strip() for t in (r.get("Tags") or "").split(",") if t.strip()]
         if tags:

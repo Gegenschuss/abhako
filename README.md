@@ -21,11 +21,14 @@ Lists, calendar, Eisenhower matrix, habits, a focus timer, comments and shared l
 - Recurring tasks (daily, weekdays, weekly, monthly, yearly, any RRULE) with end date, count and skip
 - Smart lists (today, tomorrow, next 7 days, inbox, all), combinable filters (list, date, priority, tag)
 - Multi-select with batch actions, snooze, trash with restore, search in titles, notes and links
+- **Undo** for completing, reopening, deleting, moving, snoozing and batch actions (toast or Ctrl/Cmd+Z), also offline
+- **Templates**: save a task with its subtasks, or a whole list with sections, and reuse it with dates relative to today
 
 **Views**
 - Calendar (month, week, day) and a timeline, drag tasks onto days
 - Eisenhower matrix (priority x due date)
 - Kanban per list
+- **Statistics**: completions per week / day and per list, on-time rate, overdue trend, focus time, habit streaks
 
 **Habits and focus**
 - Habits per day or *n* times per week, counters (e.g. 8 glasses of water), notes per day, streaks
@@ -45,7 +48,8 @@ Lists, calendar, Eisenhower matrix, habits, a focus timer, comments and shared l
 - Installable web app (PWA) for phone and desktop, works offline: changes queue up and sync later, with conflict detection
 - Mobile layout with swipe gestures, long-press drag, configurable tab bar per device
 - Push notifications via [ntfy](https://ntfy.sh): reminders, focus end, habit reminders, daily digest
-- Share from Android into the inbox (see below)
+- Share from Android into the inbox (see below), app shortcuts (long-press the icon: new task, today, news, search)
+- **Calendar subscription**: your open tasks with a date as an ICS feed for Google Calendar, Apple Calendar, Outlook or Thunderbird
 - Optional [Paperless-ngx](https://docs.paperless-ngx.com) integration: link documents to tasks, send attachments to Paperless
 - Import TickTick CSV backups, export everything as JSON
 - Dark and light theme, English and German interface (translations are plain JSON files, [add yours](TRANSLATING.md))
@@ -109,7 +113,7 @@ To remove the test again: `docker compose down` and delete the folder (your test
 - **Assignment:** in shared lists a task can be assigned to the owner or a member (task panel > *Assignee*).
   Reminders go to the assignee, otherwise to whoever created the task. The daily digest contains your own
   lists' tasks plus everything assigned to you.
-- **Export** (*Settings > Data > Export*) contains your data and the lists you own (tasks with links, comments and history).
+- **Export** (*Settings > Data > Export*) contains your data and the lists you own (tasks with links, comments and history) and your templates.
 
 ### Comments and activity
 
@@ -160,6 +164,44 @@ To remove the test again: `docker compose down` and delete the folder (your test
   *Mark all as read* and *Only mentions* are at the top. The unread badge updates with the normal sync.
 - Items are kept for 90 days, at most 500 per person (`TASKS_NEWS_DAYS`, `TASKS_NEWS_MAX`).
 
+## Calendar subscription
+
+*Settings > Integrations > Calendar subscription > Create subscription link* gives you a private URL
+(`https://tasks.example.com/ical/<id>.<secret>.ics`) that any calendar app can subscribe to (read-only):
+
+- **Google Calendar / Android:** calendar.google.com > *Other calendars* > *+* > *From URL*. It then syncs to the phone.
+- **iPhone / iPad:** *Settings > Apps > Calendar > Calendar Accounts > Add Account > Other > Add Subscribed Calendar*;
+  **Mac:** *Calendar > File > New Calendar Subscription*. **Thunderbird:** *New Calendar > On the Network*. **Outlook:** *Add calendar > Subscribe from web*.
+
+What is in it: open tasks with a due date from all lists you can see (or, per setting, only your own and those
+assigned to you). Timed tasks are events with their duration (30 minutes if none is set), all-day tasks are all-day
+events (a start date makes it a range), recurring tasks carry their RRULE so every future date shows up (tasks that
+repeat from the completion date only show their next date), reminders become alarms (can be switched off), and the
+description holds the notes, the list and a link back to the task. Completed tasks disappear on the next refresh;
+how often that happens is up to the calendar app (Google: every few hours).
+
+The secret in the URL is the only credential: anyone with the link can read these tasks. *New link* replaces it
+(the old URL stops working at once), *Turn off* removes it. Wrong tokens answer 404 and are rate-limited per
+address. With a login proxy, let `/ical/*` bypass it (see *Reverse proxy*); Abhako never reads the proxy header there.
+
+## Templates, undo, statistics
+
+- **Templates:** *Save as template* in a task's menu (the task with its subtasks, priority, tags, notes, repeat and
+  dates as "days after use") or in the list dialog (sections and open tasks). The template button in the add bar
+  creates the task in the current list, *Lists > + > New list from template* a new list. Templates are private and
+  can be renamed, edited as a plain outline (one task per line, two spaces per level, `# Name` = section) or deleted
+  under *Settings > Data*.
+- **Undo:** after completing, reopening, deleting, moving to another list, snoozing or changing the date and after
+  batch actions, a toast offers *Undo* for six seconds (Ctrl/Cmd+Z while it is shown). Offline, the queued change is
+  simply taken out of the queue; once sent, the reverse goes to the server and never overwrites a change made
+  elsewhere in the meantime.
+- **Statistics** (module, on by default; sidebar, rail or a pinned tab) for the last 12 weeks: completed tasks per
+  week or per day and per list, on-time rate (completed on or before the due day), the overdue trend (your open
+  tasks past their due date at the end of each week), focus minutes per week and per list, habit rates and streaks.
+  A completion counts for the person who ticked the task off, also in shared lists.
+
+<p align="center"><img src="docs/stats.png" alt="Statistics view with completed tasks per week, by list, overdue trend, focus time and habits"></p>
+
 ## Login
 
 **Built-in (default):** username and password (hashed with scrypt), an HttpOnly `SameSite=Lax` session cookie
@@ -174,7 +216,7 @@ untrusted address) Abhako falls back to its own login page.
 
 > [!CAUTION]
 > The header is a password: whoever can send it to Abhako is that user. Abhako only trusts it from
-> `AUTH_TRUSTED_PROXIES` (the **direct** peer address), never on `/drop`, `/manifest.json` and static files, and
+> `AUTH_TRUSTED_PROXIES` (the **direct** peer address), never on `/drop`, `/ical/`, `/manifest.json` and static files, and
 > your proxy **must remove client-supplied copies** before its auth step, especially on paths that bypass the login.
 > With Docker port publishing every connection (your proxy, other containers, monitoring) usually arrives from the
 > Docker bridge gateway address; then also set `AUTH_PROXY_PORT=3045` and publish that container port only
@@ -191,7 +233,9 @@ except these paths:
 | Path | Why it must bypass the login |
 |---|---|
 | `/manifest.json`, `/static/icon-192.png`, `/static/icon-512.png` | Browsers fetch these without cookies when installing the PWA. They contain no data. |
+| `/static/shortcuts/*` | Icons of the app shortcuts in the manifest, also fetched without cookies. |
 | `/drop` | Upload endpoint for share apps. Protected by each user's own bearer token. |
+| `/ical/*` | Calendar subscription. Calendar apps cannot log in; the secret token in the URL protects it. |
 
 Example for Caddy with Authelia (single sign-on). The `route` keeps the order: first strip any client-sent
 `Remote-*` headers, then let `forward_auth` set the real ones:
@@ -203,7 +247,7 @@ tasks.example.com {
 		request_header -Remote-Groups
 		request_header -Remote-Email
 		request_header -Remote-Name
-		@gated not path /manifest.json /static/icon-192.png /static/icon-512.png /drop
+		@gated not path /manifest.json /static/icon-192.png /static/icon-512.png /static/shortcuts/* /drop /ical/*
 		forward_auth @gated authelia:9091 {
 			uri /api/authz/forward-auth
 			copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
