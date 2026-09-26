@@ -7,7 +7,7 @@ Lists, calendar, Eisenhower matrix, habits, a focus timer, comments and shared l
 
 <p align="center"><img src="docs/today.png" alt="Today view with overdue and today's tasks, subtasks, tags and the list sidebar"></p>
 
-> **Language:** the interface is **English** by default, with **German** included (switch under *Settings > Language*); more languages are welcome, see [TRANSLATING.md](TRANSLATING.md). The name comes from the German *abhaken*, to tick off.
+> **Language:** the interface is **English** by default, with **German** included (switch under *Settings > General > Language*); more languages are welcome, see [TRANSLATING.md](TRANSLATING.md). The name comes from the German *abhaken*, to tick off.
 > Abhako is an independent hobby project and not affiliated with TickTick or Asana.
 
 ## Features
@@ -36,6 +36,7 @@ Lists, calendar, Eisenhower matrix, habits, a focus timer, comments and shared l
 - Share a list with others (can edit or view only); shared lists show up in their smart lists, calendar and search
 - Assign tasks in shared lists: reminders go to the assignee, plus an *Assigned to me* list
 - Comments on every task with @mentions and files, an activity history (who changed what, when) and unread markers
+- A *News* inbox (bell icon with an unread badge): mentions, comments on your tasks, assignments, completions and lists shared with you, newest first
 - Push notifications for new comments, mentions, assignments and completions, bundled so a busy task does not spam you
 - One switch (*Collaboration*) turns all of this off for a simple personal task list
 - Built-in login or single sign-on through your reverse proxy (Authelia, Authentik, oauth2-proxy)
@@ -108,7 +109,7 @@ To remove the test again: `docker compose down` and delete the folder (your test
 - **Assignment:** in shared lists a task can be assigned to the owner or a member (task panel > *Assignee*).
   Reminders go to the assignee, otherwise to whoever created the task. The daily digest contains your own
   lists' tasks plus everything assigned to you.
-- **Export** (*Settings > Export*) contains your data and the lists you own (tasks with links, comments and history).
+- **Export** (*Settings > Data > Export*) contains your data and the lists you own (tasks with links, comments and history).
 
 ### Comments and activity
 
@@ -138,10 +139,26 @@ To remove the test again: `docker compose down` and delete the folder (your test
     summary push ("2 more comments · 1 more change").
 - **Offline:** comments need a connection. Offline, the text stays in the box with a notice (task edits still
   queue up and sync later as before).
-- **Simple mode:** *Settings > Modules > Collaboration* (per user) hides comments, activity, mentions, unread and
-  assignee chips, the sharing section, the assignee field and *Assigned to me*, and stops these notifications.
-  Shared lists you are in stay visible as normal lists, nothing is deleted. *Website link* is a separate switch
-  for the link field and chips.
+- **Simple mode:** *Settings > Layout > Collaboration* (per user) hides comments, activity, mentions, unread and
+  assignee chips, the sharing section, the assignee field, *Assigned to me* and the News inbox, and stops these
+  notifications and News entries. Shared lists you are in stay visible as normal lists, nothing is deleted.
+  The website link field is always available.
+
+### News and notifications
+
+<p align="center"><img src="docs/news.png" alt="News inbox with mentions, grouped comments, an assignment, a completion and a shared list"></p>
+
+- **News** (bell icon in the top bar, also as a sidebar entry and a pinnable tab) lists what concerns you,
+  newest first: *@mentions*, new comments on tasks you take part in (creator, assignee, earlier commenter),
+  *assigned you* / *unassigned you*, completions by others (same rule as the push), and lists someone shared
+  with you, your role changes and *removed you from a list*. Never your own actions.
+- Same recipients as the push notifications, but nothing is bundled: every event is kept (people without an
+  ntfy topic get them too). Consecutive comments on the same task are shown as one row with a count.
+- Only items you may still see: if you lose access to a list or a task goes to the trash, its items disappear;
+  deleted comments disappear as well. Comment items show a short excerpt with mentions highlighted.
+- Tapping an item opens the task and marks it read; opening a task any other way also marks its items read.
+  *Mark all as read* and *Only mentions* are at the top. The unread badge updates with the normal sync.
+- Items are kept for 90 days, at most 500 per person (`TASKS_NEWS_DAYS`, `TASKS_NEWS_MAX`).
 
 ## Login
 
@@ -221,12 +238,14 @@ All settings are environment variables in `.env` (see [.env.example](.env.exampl
 | `PAPERLESS_API`, `PAPERLESS_PUBLIC_URL`, `PAPERLESS_TOKEN` | | Paperless-ngx integration (internal API URL, URL for your browser, API token) |
 | `TASKS_MAX_FILE_MB` | `50` | Maximum size per attachment (task and comment files) |
 | `TASKS_PUSH_GAP` | `60` | Seconds in which further comments / changes on a task are bundled into one summary push |
+| `TASKS_NEWS_DAYS` | `90` | Days a News item is kept |
+| `TASKS_NEWS_MAX` | `500` | News items kept per user (newest) |
 
 Everything else (language, reminder defaults, digest time, pomodoro lengths, which modules are shown) is set per user in the app under *Settings*.
 
 ## Language
 
-Abhako starts in **English**. Open *Settings > Language* (in German: *Einstellungen > Sprache*) to switch; **Deutsch**
+Abhako starts in **English**. Open *Settings > General > Language* (in German: *Einstellungen > Allgemein > Sprache*) to switch; **Deutsch**
 is included. The choice is stored per user on the server, so it applies to all your devices and also to your push
 notifications (reminders, focus end, habit reminders, daily digest) and server messages.
 
@@ -249,7 +268,7 @@ Task titles, list names, tags and notes are never translated.
 ## Notifications
 
 1. Install the ntfy app ([Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy), [iOS](https://apps.apple.com/app/ntfy/id1625396347)).
-2. Open Abhako > *Settings*: your topic is shown there (every user has an own one). Subscribe to it in the ntfy app.
+2. Open Abhako > *Settings > Notifications*: your topic is shown there (every user has an own one). Subscribe to it in the ntfy app.
 3. Press *Send test*.
 
 Besides reminders, focus end, habit reminders and the daily digest, Abhako pushes new comments, @mentions,
@@ -272,7 +291,7 @@ Chrome currently passes no files to installed web apps via the share sheet (link
 
 ## Backup and update
 
-- Backup: stop the container and copy `./data` (database `tasks.db` plus `attachments/`), or use *Settings > Export* for a JSON dump.
+- Backup: stop the container and copy `./data` (database `tasks.db` plus `attachments/`), or use *Settings > Data > Export* for a JSON dump.
 - Update: `git pull && docker compose up -d --build`. The database schema migrates itself on start.
 
 ## Tech

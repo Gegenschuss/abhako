@@ -718,3 +718,64 @@ code.topic{background:var(--bg3);padding:3px 8px;border-radius:6px;font-family:v
 .featgrid label span{display:flex;flex-direction:column}
 .featgrid label small{font-size:12px;line-height:1.4}
 @media (hover:none){ .cacts{opacity:1} }
+
+/* ---------- News ("Neuigkeiten") ---------- */
+.iconbtn.bell,#tabs button,.rbtn{position:relative}
+.nbadge{position:absolute;top:1px;right:-1px;min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:var(--accent);color:var(--accent-ink);font-size:10px;font-weight:700;line-height:16px;text-align:center;font-family:var(--sans);pointer-events:none}
+.rbtn .nbadge{top:3px;right:1px}
+#tabs button .nbadge{top:5px;right:auto;left:calc(50% + 5px)}
+.srow .c.nunread{color:var(--accent);font-weight:600}
+.nbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:2px 0 12px;max-width:760px}
+.nbar .btn{display:inline-flex;align-items:center;gap:6px}
+.nlist{display:flex;flex-direction:column;gap:2px;max-width:760px}
+.nitem{display:flex;gap:12px;align-items:flex-start;padding:10px;border-radius:10px;cursor:pointer}
+.nitem:hover{background:var(--bg2)}
+.nitem:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.nitem.unread{background:color-mix(in srgb,var(--accent) 8%,transparent);box-shadow:inset 2px 0 0 var(--accent)}
+.nitem .avatar{position:relative;width:32px;height:32px;font-size:12px}
+.nitem .nk{position:absolute;right:-5px;bottom:-5px;width:17px;height:17px;border-radius:50%;background:var(--bg3);color:var(--muted);display:grid;place-items:center;box-shadow:0 0 0 2px var(--bg)}
+.nitem .nk svg.i.s{width:10px;height:10px}
+.nitem.k-mention .nk{color:var(--accent)}
+.nmain{flex:1;min-width:0}
+.ntext{font-size:14px;line-height:1.4;overflow-wrap:anywhere}
+.ntext b{font-weight:600}
+.ntask{display:flex;gap:8px;align-items:baseline;min-width:0;margin-top:2px;font-size:13px}
+.ntask .nt{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.ntask .muted{flex:none;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+.nexc{margin-top:4px;font-size:13px;line-height:1.45;color:color-mix(in srgb,var(--text) 78%,var(--muted));overflow:hidden;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.nitem time{flex:none;font-size:12px;color:var(--muted);white-space:nowrap;padding-top:1px}
+.nitem.unread time{color:var(--accent)}
+
+/* ---------- settings: sectioned dialog ---------- */
+.smodal .card{width:min(880px,100%);height:min(700px,90dvh);max-height:none;padding:0;display:flex;flex-direction:column;overflow:hidden}
+.shdr{display:flex;align-items:center;gap:8px;padding:14px 14px 12px 22px;border-bottom:1px solid var(--line)}
+.shdr h3{margin:0;flex:1}
+.sbody{display:flex;flex:1;min-height:0}
+.snav{flex:none;width:200px;display:flex;flex-direction:column;gap:2px;padding:10px 8px;border-right:1px solid var(--line);overflow-y:auto}
+.snav button{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;color:var(--muted);font-size:14px;text-align:left;white-space:nowrap}
+.snav button:hover{background:var(--bg3);color:var(--text)}
+.snav button.on{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--text)}
+.snav button.on svg{color:var(--accent)}
+.spanes{flex:1;min-width:0;overflow-y:auto;padding:0 24px 22px}
+.spane > h4:first-child{margin-top:18px}
+.smodal h4{display:flex;align-items:center;gap:8px}
+.devtag{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;background:var(--bg3);color:var(--muted);font-size:10px;font-weight:600;letter-spacing:.02em;text-transform:none}
+.shint{font-size:12px;line-height:1.5;color:var(--muted);margin:-2px 0 10px}
+.shint a{color:var(--accent)}
+.shelp{font-size:13px;line-height:1.7;color:var(--muted)}
+.slist{margin:0;padding-left:18px;font-size:13px;line-height:1.7;color:var(--muted)}
+.slist li{margin-bottom:6px}
+.sfoot{margin:0!important;padding:12px 16px 12px 22px;border-top:1px solid var(--line);align-items:center}
+.sdirty{font-size:12px;visibility:hidden}
+.smodal.dirty .sdirty{visibility:visible;color:var(--accent)}
+@media (max-width:899px){
+  .smodal .card{height:92dvh;border-radius:16px 16px 0 0}
+  .shdr{padding:12px 8px 8px 16px;border-bottom:0}
+  .sbody{flex-direction:column}
+  .snav{width:auto;flex-direction:row;gap:6px;padding:2px 16px 10px;border-right:0;border-bottom:1px solid var(--line);overflow-x:auto;overflow-y:hidden;scrollbar-width:none}
+  .snav::-webkit-scrollbar{display:none}
+  .snav button{flex:none;padding:6px 12px;border-radius:999px;background:var(--bg3);font-size:13px;gap:6px}
+  .snav button.on{background:color-mix(in srgb,var(--accent) 22%,var(--bg3))}
+  .spanes{padding:0 16px 18px}
+  .sfoot{padding:10px 16px calc(10px + var(--safe-b))}
+}

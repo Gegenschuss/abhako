@@ -202,6 +202,14 @@ CREATE TABLE IF NOT EXISTS task_push (                -- burst rule for collabor
   pending INTEGER NOT NULL DEFAULT 0,           -- comments / changes counted since then (summary)
   events INTEGER NOT NULL DEFAULT 0, mentioned INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (user_id, task_id));
+CREATE TABLE IF NOT EXISTS notifications (            -- "News" feed per user (structured, rendered by the client)
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,                           -- mention|comment|assign|unassign|complete|share|role|unshare
+  task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+  list_id INTEGER REFERENCES lists(id) ON DELETE SET NULL,
+  actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  comment_id INTEGER,                           -- comment kinds: the (live) comment, excerpt read at display time
+  data TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, read_at TEXT);
 """
 # additive migrations: (table, column, ddl)
 MIGRATIONS = [
@@ -233,6 +241,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS tasks_tt_user ON tasks(created_by, tt_id) WHER
 CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id);
 CREATE INDEX IF NOT EXISTS activity_task ON activity(task_id, id);
 CREATE INDEX IF NOT EXISTS attachments_comment ON attachments(comment_id) WHERE comment_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, id);
+CREATE INDEX IF NOT EXISTS notifications_task ON notifications(task_id);
 """
 MAX_DEPTH = 3  # task > subtask > sub-subtask
 # per user (table user_settings)
@@ -245,11 +255,11 @@ USER_DEFAULTS = {
     "ntfy_topic": "",           # set by an admin (a user could otherwise push into someone else's topic)
     "show_completed": "1",      # show the collapsed "Completed" group / done tasks in the calendar
     # modules that can be switched off in the settings (hidden from nav, data stays)
-    # collab = comments, activity, mentions, sharing / assigning UI; links = website link per task
-    "features": "cal,timeline,matrix,habits,pomo,kanban,paperless,collab,links",
+    # collab = comments, activity, mentions, News feed, sharing / assigning UI
+    "features": "cal,timeline,matrix,habits,pomo,kanban,paperless,collab",
     "nav_order": "tasks,cal,matrix,habits,pomo",   # order of the mobile tab bar / desktop rail
     "folders": "[]",            # json list: folder order in the sidebar (also keeps empty folders)
-    "features_rev": "3",        # one-shot migrations of the features list
+    "features_rev": "4",        # one-shot migrations of the features list
     "paperless_keep": "0",      # 1 = keep the local attachment after it was consumed by Paperless
     "lang": "en",               # UI + push language: en or a static/i18n/<code>.json
 }
@@ -478,15 +488,17 @@ def init_db():
             for k, v in USER_DEFAULTS.items():
                 c.execute("INSERT OR IGNORE INTO user_settings(user_id,key,value) VALUES(?,?,?)", (uid, k, v))
             # features_rev 2: paperless module added -> on by default for existing installs
-            # features_rev 3: collab + links added (2026-09-26) -> on by default
+            # features_rev 3: collab added (2026-09-26) -> on by default
+            # features_rev 4: the "links" switch is gone (website link always on) -> dropped from the list
             s = usettings(c, uid)
             rev, fs = int(s.get("features_rev") or 1), [x for x in s["features"].split(",") if x]
-            if rev < 3:
-                for f, since in (("paperless", 2), ("collab", 3), ("links", 3)):
+            if rev < 4:
+                for f, since in (("paperless", 2), ("collab", 3)):
                     if rev < since and f not in fs:
                         fs.append(f)
+                fs = [f for f in fs if f != "links"]
                 uset(c, uid, "features", ",".join(fs))
-                uset(c, uid, "features_rev", "3")
+                uset(c, uid, "features_rev", "4")
         c.execute("COMMIT")
     except Exception:
         c.execute("ROLLBACK")
@@ -1121,7 +1133,8 @@ def health():
 
 @app.get("/api/version")
 def version():
-    return jsonify(v=int(gsetting(db(), "version")))
+    c = db()
+    return jsonify(v=int(gsetting(c, "version")), n=news_sig(c, me()))
 
 
 # ---------------------------------------------------------------- state
@@ -1202,6 +1215,7 @@ def state():
         ntfy_inbox={"enabled": bool(NTFY_IN["token"]), "server": NTFY_IN["public"], "topic": NTFY_IN["topic"]},
         ntfy_url=NTFY_URL,
         languages=languages(),
+        news={"unread": news_unread(c, uid, s), "sig": news_sig(c, uid)},
     )
 
 
@@ -1222,6 +1236,17 @@ def task_query():
         rows = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND status!=0 ORDER BY completed_at DESC LIMIT ?",
                           (uid, uid, limit))
     return jsonify(tasks=rows)
+
+
+@app.get("/api/tasks/<int:tid>")
+def task_get(tid):
+    """One task I can see (e.g. an old completed one opened from the News feed)."""
+    c = db()
+    need_task(c, tid, write=False)
+    rows = load_tasks(c, "id=? AND deleted_at IS NULL", (tid,))
+    if not rows:
+        raise Denied(404)
+    return jsonify(rows[0])
 
 
 # ---------------------------------------------------------------- lists / sections
@@ -1319,11 +1344,16 @@ def member_set(lid):
     u = c.execute("SELECT id FROM users WHERE id=? AND disabled=0", (uid,)).fetchone()
     if not u or uid == me():
         return err(tr("unknown user"), 404)
-    if c.execute("SELECT 1 FROM list_members WHERE list_id=? AND user_id=?", (lid, uid)).fetchone():
+    lname = c.execute("SELECT name FROM lists WHERE id=?", (lid,)).fetchone()[0]
+    old = c.execute("SELECT role FROM list_members WHERE list_id=? AND user_id=?", (lid, uid)).fetchone()
+    if old:
         c.execute("UPDATE list_members SET role=? WHERE list_id=? AND user_id=?", (role, lid, uid))
+        if old[0] != role:
+            news_add(c, uid, "role", list_id=lid, data={"role": role, "old": old[0], "name": lname})
     else:
         c.execute("INSERT INTO list_members(list_id,user_id,role,sort,added_at) VALUES(?,?,?,?,?)",
                   (lid, uid, role, my_max_sort(c, uid) + 1, iso(now_utc())))
+        news_add(c, uid, "share", list_id=lid, data={"role": role, "name": lname})
     bump(c)
     c.commit()
     return jsonify(ok=True)
@@ -1340,6 +1370,9 @@ def member_remove(lid, uid):
         return err(tr("unknown"), 404)
     c.execute("DELETE FROM list_members WHERE list_id=? AND user_id=?", (lid, uid))
     c.execute("UPDATE tasks SET assignee_id=NULL WHERE list_id=? AND assignee_id=?", (lid, uid))
+    if uid != me():  # removed by the owner (leaving on your own is no news for you)
+        news_add(c, uid, "unshare", list_id=lid,
+                 data={"name": c.execute("SELECT name FROM lists WHERE id=?", (lid,)).fetchone()[0]})
     bump(c)
     c.commit()
     return jsonify(ok=True)
@@ -2501,6 +2534,7 @@ def timeline_seen(tid):
     top = c.execute("SELECT COALESCE(MAX(id),0) FROM comments WHERE task_id=?", (tid,)).fetchone()[0]
     c.execute("INSERT INTO task_seen(user_id,task_id,seen_id) VALUES(?,?,?) "
               "ON CONFLICT(user_id,task_id) DO UPDATE SET seen_id=MAX(seen_id, excluded.seen_id)", (me(), tid, top))
+    c.execute("UPDATE notifications SET read_at=? WHERE user_id=? AND task_id=? AND read_at IS NULL", (iso(now_utc()), me(), tid))
     c.commit()
     return jsonify(ok=True, seen=top)
 
@@ -2601,13 +2635,15 @@ def collab_on(s):
     return "collab" in (s.get("features") or "").split(",")
 
 
-def push_target(c, uid, lid):
-    """Settings of a user who may get a collaboration push about a task in list lid, else None."""
+def collab_user(c, uid, lid=None):
+    """Settings of a user who takes part in collaboration notifications (News feed and pushes) about
+    list lid -- enabled, module "collab" on, still sees the list (lid None: no list check) -- else None.
+    The feed entry is written for every such user; the push additionally needs an ntfy topic + burst gate."""
     u = c.execute("SELECT disabled FROM users WHERE id=?", (uid,)).fetchone()
-    if not u or u["disabled"] or not list_role(c, lid, uid):
+    if not u or u["disabled"] or (lid is not None and not list_role(c, lid, uid)):
         return None
     s = usettings(c, uid)
-    return s if collab_on(s) and s.get("ntfy_topic") else None
+    return s if collab_on(s) else None
 
 
 def burst_gate(c, uid, tid, mentioned=False, event=False):
@@ -2644,9 +2680,12 @@ def comment_pushes(c, t, cid, text, mentions, notify_mentions, nfiles, only=None
     snippet = snippet[:280] + ("…" if len(snippet) > 280 else "")
     out = []
     for uid in sorted(ids):
-        s = push_target(c, uid, t["list_id"])
+        s = collab_user(c, uid, t["list_id"])
+        if not s:
+            continue
         mentioned = uid in notify_mentions
-        if not s or not burst_gate(c, uid, t["id"], mentioned=mentioned):
+        news_add(c, uid, "mention" if mentioned else "comment", task_id=t["id"], comment_id=cid, actor=author)
+        if not s.get("ntfy_topic") or not burst_gate(c, uid, t["id"], mentioned=mentioned):
             continue
         lg = lang_of(s)
         what = snippet or trn("{0} file", "{0} files", nfiles, lg=lg)
@@ -2681,8 +2720,11 @@ def task_event(c, tid, kind, prev_assignee=None):
     rcpt.discard(actor)
     who = user_names(c, [actor]).get(actor, "?")
     for uid in sorted(rcpt):
-        s = push_target(c, uid, t["list_id"])
-        if not s or not burst_gate(c, uid, tid, event=True):
+        s = collab_user(c, uid, t["list_id"])
+        if not s:
+            continue
+        news_add(c, uid, kind, task_id=tid, actor=actor)
+        if not s.get("ntfy_topic") or not burst_gate(c, uid, tid, event=True):
             continue
         lg = lang_of(s)
         lname = tr("Inbox", lg=lg) if t["list_inbox"] and t["list_name"] == "Eingang" else t["list_name"]
@@ -2738,6 +2780,146 @@ def task_push_tick(c, users, S, LG):
         ntfy(p["title"], " · ".join(parts), "default", f"{PUBLIC_URL}/#t/{p['task_id']}", topic=S[uid]["ntfy_topic"])
     c.execute("DELETE FROM task_push WHERE pending=0 AND events=0 AND sent_at<?", (now - 86400,))
     c.commit()
+
+
+# ---------------------------------------------------------------- News feed ("Neuigkeiten")
+# One row per event that concerns a user, written at the same points (and for the same recipients) as
+# the collaboration pushes, plus list sharing (share / role / unshare; these have no push). Never my own
+# actions; only users with module "collab" on get entries (collab off: nothing is written, the feed and
+# its badge are hidden). The push burst rule does not apply: the feed keeps every item; consecutive
+# plain comments on the same task are grouped into one row (with a count) when the feed is read.
+# Visibility is re-checked at read time: items of tasks / lists I no longer see, tasks in the trash and
+# deleted comments disappear. Retention: NEWS_KEEP_DAYS days and at most NEWS_KEEP_MAX items per user
+# (watchdog, hourly).
+NEWS_KEEP_DAYS = int(os.environ.get("TASKS_NEWS_DAYS", "90"))
+NEWS_KEEP_MAX = int(os.environ.get("TASKS_NEWS_MAX", "500"))
+NEWS_KINDS = ("mention", "comment", "assign", "unassign", "complete", "share", "role", "unshare")
+NEWS_EXCERPT = 300
+
+
+def news_add(c, uid, kind, task_id=None, list_id=None, comment_id=None, data=None, actor=None):
+    """Feed entry for uid (caller commits). Skipped for my own actions and for users without collab."""
+    actor = actor or me()
+    if not uid or uid == actor or not collab_user(c, uid, None):
+        return
+    c.execute("INSERT INTO notifications(user_id,kind,task_id,list_id,actor_id,comment_id,data,created_at) "
+              "VALUES(?,?,?,?,?,?,?,?)", (uid, kind, task_id, list_id, actor, comment_id,
+                                          json.dumps(data or {}, ensure_ascii=False), iso_ms(now_utc())))
+
+
+def news_sig(c, uid):
+    """Cheap change marker of my unread items (in /api/version): clients reload the state when it moves."""
+    r = c.execute("SELECT COUNT(*), COALESCE(MAX(id),0) FROM notifications WHERE user_id=? AND read_at IS NULL",
+                  (uid,)).fetchone()
+    return f"{r[0]}.{r[1]}"
+
+
+def news_items(c, uid, s=None, mentions_only=False):
+    """My visible feed, newest first, consecutive comments on one task grouped. [] if collab is off."""
+    if not collab_on(s or usettings(c, uid)):
+        return [], {}
+    rows = c.execute("""SELECT n.*, t.title AS t_title, t.list_id AS t_list, t.deleted_at AS t_del,
+                               k.body AS c_body, k.deleted_at AS c_del
+                        FROM notifications n LEFT JOIN tasks t ON t.id=n.task_id LEFT JOIN comments k ON k.id=n.comment_id
+                        WHERE n.user_id=? ORDER BY n.id DESC LIMIT ?""", (uid, NEWS_KEEP_MAX)).fetchall()
+    roles = {}
+
+    def sees(lid):
+        if lid not in roles:
+            roles[lid] = bool(lid) and bool(list_role(c, lid, uid))
+        return roles[lid]
+    out, uids = [], set()
+    for r in rows:
+        kind = r["kind"]
+        if mentions_only and kind != "mention":
+            continue
+        if kind in ("share", "role"):
+            if not sees(r["list_id"]):
+                continue
+        elif kind != "unshare":
+            if r["t_title"] is None or r["t_del"] or not sees(r["t_list"]):
+                continue
+            if kind in ("mention", "comment") and (r["c_body"] is None or r["c_del"]):
+                continue
+        read = r["read_at"] is not None
+        prev = out[-1] if out else None
+        if kind == "comment" and prev and prev["kind"] == "comment" and prev["task_id"] == r["task_id"]:
+            prev["ids"].append(r["id"])
+            prev["count"] += 1
+            prev["read"] = prev["read"] and read
+            if r["actor_id"] not in prev["actors"]:
+                prev["actors"].append(r["actor_id"])
+            uids.add(r["actor_id"])
+            continue
+        body = ""
+        if kind in ("mention", "comment"):
+            body = r["c_body"] or ""
+            if len(body) > NEWS_EXCERPT:
+                body = re.sub(r"<@?\d*$", "", body[:NEWS_EXCERPT]).rstrip() + "…"
+            uids.update(int(x) for x in MENTION_RE.findall(body))
+        data = json.loads(r["data"] or "{}")
+        uids.add(r["actor_id"])
+        out.append({"id": r["id"], "ids": [r["id"]], "kind": kind, "count": 1, "actor_id": r["actor_id"],
+                    "actors": [r["actor_id"]], "task_id": r["task_id"] if kind not in ("share", "role", "unshare") else None,
+                    "task_title": r["t_title"] if kind not in ("share", "role", "unshare") else None,
+                    "list_id": r["t_list"] if r["task_id"] and kind not in ("share", "role", "unshare") else r["list_id"],
+                    "comment_id": r["comment_id"], "excerpt": body, "data": data, "created_at": r["created_at"],
+                    "read": read})
+    return out, user_names(c, uids)
+
+
+def news_unread(c, uid, s=None):
+    return sum(1 for x in news_items(c, uid, s)[0] if not x["read"])
+
+
+@app.get("/api/news")
+def news_list():
+    """My feed (only my own rows). ?filter=mentions: mentions only."""
+    c = db()
+    uid = me()
+    s = usettings(c, uid)
+    items, names = news_items(c, uid, s, mentions_only=request.args.get("filter") == "mentions")
+    return jsonify(items=items, users={str(k): v for k, v in names.items()}, unread=news_unread(c, uid, s),
+                   sig=news_sig(c, uid), enabled=collab_on(s))
+
+
+@app.post("/api/news/read")
+def news_read():
+    """{ids: [...]} or {all: true}: marks my items read (other users' ids are ignored). No version bump."""
+    b = body()
+    c = db()
+    uid = me()
+    ts = iso(now_utc())
+    if b.get("all"):
+        c.execute("UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL", (ts, uid))
+    else:
+        try:
+            ids = [int(x) for x in (b.get("ids") or [])][:1000]
+        except (TypeError, ValueError):
+            return err(tr("Invalid data"))
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            c.execute(f"UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL AND id IN ({','.join('?' * len(part))})",
+                      (ts, uid, *part))
+    c.commit()
+    return jsonify(ok=True, unread=news_unread(c, uid), sig=news_sig(c, uid))
+
+
+NEWS_CLEAN = {"at": 0.0}
+
+
+def news_cleanup(c, force=False):
+    """Watchdog, at most hourly: drops items older than NEWS_KEEP_DAYS and all but the newest NEWS_KEEP_MAX per user."""
+    if not force and time.time() - NEWS_CLEAN["at"] < 3600:
+        return 0
+    NEWS_CLEAN["at"] = time.time()
+    n = c.execute("DELETE FROM notifications WHERE created_at<?",
+                  (iso(now_utc() - timedelta(days=NEWS_KEEP_DAYS)),)).rowcount
+    n += c.execute("""DELETE FROM notifications WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER
+                      (PARTITION BY user_id ORDER BY id DESC) AS rn FROM notifications) WHERE rn>?)""",
+                   (NEWS_KEEP_MAX,)).rowcount
+    c.commit()
+    return n
 
 
 # ---------------------------------------------------------------- habits (private per user)
@@ -3296,6 +3478,7 @@ def watchdog_tick(c):
     S = {uid: usettings(c, uid) for uid in users}
     LG = {uid: s.get("lang") if s.get("lang") in LANGS else "en" for uid, s in S.items()}
     task_push_tick(c, users, S, LG)
+    news_cleanup(c)
     now = local_now()
     # task reminders -- fire once per (due, offset); skip if missed by > 6 h. Goes to the assignee,
     # unassigned tasks to their creator.

@@ -66,6 +66,9 @@ const P = {
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
   key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
   link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  at: '<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/>',
+  sliders: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+  help: '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01"/>',
   comment: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
 };
@@ -131,11 +134,13 @@ const S = {
   calMode: LS.get('calMode', 'month'), tlStart: null, quickPreset: {}, editContent: false,
   tl: {id: null}, drafts: {}, cfiles: {}, cedit: null, editLink: false,  // comments timeline of the open task
 };
-const FEATS = [['cal', N_('Calendar')], ['timeline', N_('Timeline')], ['matrix', N_('Eisenhower matrix')], ['habits', N_('Habits')], ['pomo', N_('Focus (Pomodoro)')], ['kanban', N_('Kanban')], ['paperless', N_('Paperless link')], ['collab', N_('Collaboration')], ['links', N_('Website link')]];
-const FEAT_DESC = {collab: N_('Comments, activity history, @mentions, sharing lists and assigning tasks'), links: N_('One website link per task, shown as a small chip')};
+const FEATS = [['cal', N_('Calendar')], ['timeline', N_('Timeline')], ['matrix', N_('Eisenhower matrix')], ['habits', N_('Habits')], ['pomo', N_('Focus (Pomodoro)')], ['kanban', N_('Kanban')], ['paperless', N_('Paperless link')], ['collab', N_('Collaboration')]];
+const FEAT_DESC = {collab: N_('Comments, activity history, @mentions, News, sharing lists and assigning tasks')};
 const feat = f => (S.settings.features ?? FEATS.map(x => x[0]).join(',')).split(',').includes(f);
 // collaboration module off: no comments / activity / mentions / sharing / assigning in the UI (data stays, API works)
 const collab = () => feat('collab');
+// module views: tasks always, News with the collaboration module, the rest by their own switch
+const modOn = m => m === 'tasks' || (m === 'news' ? collab() : feat(m));
 const inbox = () => S.lists.find(l => l.is_inbox);
 const listById = id => S.lists.find(l => l.id === id);
 // sharing: role of the logged-in user in a list (owner | edit | view); view = read only
@@ -338,6 +343,7 @@ function applyState(j) {
   S.filters = j.filters || [];
   S.paperless = j.paperless || {enabled: false};
   S.ntfyInbox = j.ntfy_inbox || {enabled: false};
+  S.news = j.news || {unread: 0, sig: ''};
   // language changed on another device: switch once its file is loaded (the boot awaits it itself)
   if (S.booted && (j.settings.lang || 'en') !== I18N.code) i18nLoad(j.settings.lang).then(ok => { if (ok) render(); });
 }
@@ -366,7 +372,7 @@ async function loadExtra() {
   const k = S.route.key;
   if (S.route.mod === 'tasks' && (k === 'done' || k === 'trash')) {
     S.extra = (await api('GET', `/api/tasks?scope=${k}`)).tasks;
-  } else S.extra = null;
+  } else if (S.route.mod !== 'news') S.extra = null;  // News: tasks fetched on demand stay
 }
 function putTask(t) { S.tasks.set(t.id, t); }
 
@@ -375,8 +381,8 @@ setInterval(async () => {
   if (document.hidden) return;
   try {
     if (OUT.q.length) { flush(); return; }
-    const {v} = await api('GET', '/api/version');
-    if (v !== S.v && !editing()) { await load(); render(); }
+    const {v, n} = await api('GET', '/api/version');
+    if ((v !== S.v || (n !== undefined && collab() && n !== S.news?.sig)) && !editing()) { await load(); render(); }
   } catch { /* offline */ }
 }, 4000);
 document.addEventListener('visibilitychange', async () => {
@@ -406,20 +412,20 @@ function parseHash() {
   if (a === 'f' && b) return {mod: 'tasks', key: 'f:' + b};
   if (a === 'l') return {mod: 'tasks', key: 'l:' + b};
   if (a === 'tag') return {mod: 'tasks', key: 'tag:' + b};
-  if (['cal', 'matrix', 'habits', 'pomo'].includes(a)) return {mod: a, key: a};
+  if (['cal', 'matrix', 'habits', 'pomo', 'news'].includes(a)) return {mod: a, key: a};
   if (SMART[a]) return {mod: 'tasks', key: a};
   return {mod: 'tasks', key: 'today'};
 }
 function go(hash) { if (location.hash !== '#' + hash) location.hash = hash; else route(); }
 async function route() {
   const r = parseHash();
-  if (r.mod !== 'tasks' && !feat(r.mod)) { r.mod = 'tasks'; r.key = LS.get('lastKey', 'today'); }
+  if (!modOn(r.mod)) { r.mod = 'tasks'; r.key = LS.get('lastKey', 'today'); }
   if (r.key.startsWith('f:') && !S.filters.some(f => f.id === +r.key.slice(2))) r.key = 'today';
   S.route = {mod: r.mod, key: r.key};
   if (S.route.mod !== 'tasks' || r.key !== S.lastRouteKey) { S.multi.clear(); S.multiMode = false; }
   S.lastRouteKey = r.key;
   if (r.mod === 'tasks' && r.key !== 'search') LS.set('lastKey', r.key);
-  S.extra = (r.key === 'done' || r.key === 'trash') ? [] : null;
+  S.extra = (r.key === 'done' || r.key === 'trash' || r.mod === 'news') ? [] : null;
   if (S.extra) await loadExtra().catch(() => { S.extra = []; });
   closeSide();
   if (r.task) { render(); openDetail(r.task); history.replaceState(null, '', '#' + keyToHash(S.route.key)); return; }
@@ -455,8 +461,8 @@ function parseQuick(text, ignore = new Set()) {
     const m = s.match(re);
     if (m) { const label = fn(m); if (label !== false) { out.chips.push({type, label}); s = s.replace(m[0], ' '); } }
   };
-  // website link (module "links"): the first http(s) URL goes into the link field, not the title
-  if (feat('links')) take(/\s(https?:\/\/[^\s]+)(?=\s)/i, 'link', m => { out.url = m[1].replace(/[.,;:!?]+$/, ''); return urlHost(out.url); });
+  // website link: the first http(s) URL goes into the link field, not the title
+  take(/\s(https?:\/\/[^\s]+)(?=\s)/i, 'link', m => { out.url = m[1].replace(/[.,;:!?]+$/, ''); return urlHost(out.url); });
   // repeat (before dates, "jeden montag" contains a weekday)
   take(new RegExp(`\\s(täglich|jeden tag|daily|every day|werktags|jeden werktag|weekdays|every weekday|wöchentlich|jede woche|weekly|every week|monatlich|jeden monat|monthly|every month|jährlich|jedes jahr|yearly|annually|every year|(?:jeden|every) (${WDAY_RE})|(?:alle|every) (\\d+) (tage|wochen|monate|days?|weeks?|months?))(?=\\s)`, 'i'), 'repeat', m => {
     const w = m[1].toLowerCase();
@@ -712,7 +718,7 @@ function quickDefaults() {
 function render() {
   renderRail(); renderSide(); renderTop(); renderView(); renderTabs();
   $('#fab').innerHTML = ic('plus'); $('#fab').setAttribute('aria-label', tr('New task'));
-  $('#fab').classList.toggle('gone', ['habits', 'pomo'].includes(S.route.mod) || ['done', 'trash', 'search'].includes(S.route.key) || S.multi.size > 0);
+  $('#fab').classList.toggle('gone', ['habits', 'pomo', 'news'].includes(S.route.mod) || ['done', 'trash', 'search'].includes(S.route.key) || S.multi.size > 0);
   if (S.sel && S.tasks.has(S.sel) && !$('#detail').contains(document.activeElement)) renderDetail();
   if (S.sel && !S.tasks.has(S.sel) && !(S.extra || []).some(t => t.id === S.sel)) closeDetail();
 }
@@ -748,6 +754,7 @@ function tabItem(id) {
   }
   if (kind === 'f') { const f = S.filters.find(x => x.id === +v); return f ? {id, go: 'f/' + v, icon: ic('filter', 'l'), label: f.name, key: 'f:' + v} : null; }
   if (kind === 'tag' && v) return {id, go: 'tag/' + encodeURIComponent(v), icon: ic('tag', 'l'), label: v, key: 'tag:' + v};
+  if (id === 'news') return collab() ? {id, go: 'news', icon: ic('bell', 'l'), label: tr('News'), mod: 'news'} : null;
   if (id === 'search') return {id, go: 'search', icon: ic('search', 'l'), label: tr('Search'), key: 'search'};
   if (id === 'settings') return {id, act: 'settings', icon: ic('gear', 'l'), label: tr('Settings')};
   return null;
@@ -762,7 +769,8 @@ function tabOn(items) {
 }
 function tabBtn(t, on, cls = '') {
   const tgt = t.go != null ? `data-go="${esc(t.go)}"` : `data-act="${t.act}"`;
-  return `<button class="${cls} ${on ? 'on' : ''}" ${tgt} title="${esc(t.label)}">${t.icon}<span>${esc(t.label)}</span>${t.mod === 'pomo' && S.pomo ? '<span class="dot"></span>' : ''}</button>`;
+  const nb = t.id === 'news' && S.news?.unread ? `<span class="nbadge">${S.news.unread > 99 ? '99+' : S.news.unread}</span>` : '';
+  return `<button class="${cls} ${on ? 'on' : ''}" ${tgt} title="${esc(t.label)}">${t.icon}<span>${esc(t.label)}</span>${t.mod === 'pomo' && S.pomo ? '<span class="dot"></span>' : ''}${nb}</button>`;
 }
 function renderRail() {
   const items = tabItems().filter(t => t.id !== 'search' && t.id !== 'settings'), on = tabOn(items);
@@ -778,20 +786,20 @@ function tabOverflow() {
   const items = tabItems(), shown = items.length > TAB_MAX ? items.slice(0, TAB_MAX - 1) : items;
   const rest = items.slice(shown.length);
   const mods2 = mods().filter(([m]) => !items.some(t => t.mod === m)).map(([m]) => tabItem('m:' + m));
-  const misc = ['search', 'settings'].filter(k => !items.some(t => t.id === k)).map(tabItem);
+  const misc = ['news', 'search', 'settings'].filter(k => !items.some(t => t.id === k)).map(tabItem).filter(Boolean);
   // search + settings are also in the side menu: they alone do not justify a "Mehr" tab
   return {shown, more: rest.length || mods2.length ? [...rest, ...mods2, ...misc] : []};
 }
 function renderTabs() {
   const {shown, more} = tabOverflow(), all = tabItems(), on = tabOn(all);
   // highlight "Mehr" when the current view is only reachable through it (overflow tab, unpinned module, search)
-  const moreOn = more.length > 0 && (on ? !shown.some(t => t.id === on) : S.route.mod !== 'tasks' || S.route.key === 'search');
+  const moreOn = more.length > 0 && (on ? !shown.some(t => t.id === on) : (S.route.mod !== 'tasks' && S.route.mod !== 'news') || S.route.key === 'search');
   $('#tabs').innerHTML = shown.map(t => tabBtn(t, t.id === on)).join('') +
     (more.length ? `<button class="${moreOn ? 'on' : ''}" data-act="tabs-more">${ic('dots', 'l')}<span>${tr('More')}</span></button>` : '');
 }
 function tabsMore(anchor) {
   const {more} = tabOverflow();
-  menu(anchor, [...more.map(t => ({label: t.label, icon: t.id === 'settings' ? 'gear' : t.id === 'search' ? 'search' : t.mod ? MODS.find(x => x[0] === t.mod)[1] : t.id.startsWith('f:') ? 'filter' : t.id.startsWith('tag:') ? 'tag' : t.id.startsWith('s:') ? SMART[t.key].icon : 'list',
+  menu(anchor, [...more.map(t => ({label: t.id === 'news' && S.news?.unread ? `${t.label} (${S.news.unread})` : t.label, icon: t.id === 'settings' ? 'gear' : t.id === 'search' ? 'search' : t.id === 'news' ? 'bell' : t.mod ? MODS.find(x => x[0] === t.mod)[1] : t.id.startsWith('f:') ? 'filter' : t.id.startsWith('tag:') ? 'tag' : t.id.startsWith('s:') ? SMART[t.key].icon : 'list',
     fn: () => t.act ? settingsModal() : go(t.go)})), '-', {label: tr('Customize tab bar'), icon: 'edit', fn: () => settingsModal('tabbar')}]);
 }
 function counts() {
@@ -839,7 +847,7 @@ function renderSide() {
     ${row('tomorrow', ic('sunrise'), tr('Tomorrow'), c.tomorrow)}
     ${row('week', ic('week'), tr('Next 7 days'), c.week)}
     ${row('inbox', ic('inbox'), tr('Inbox'), c.lists[inbox()?.id])}
-    ${collab() && (hasSharing() || c.assigned) ? row('assigned', ic('user'), tr('Assigned to me'), c.assigned) : ''}
+    ${collab() && (hasSharing() || c.assigned) ? row('assigned', ic('user'), tr('Assigned to me'), c.assigned) : ''}${collab() && (hasSharing() || S.news?.unread) ? `<button class="srow ${S.route.mod === 'news' ? 'on' : ''}" data-go="news">${ic('bell')}<span class="n">${tr('News')}</span><span class="c ${S.news?.unread ? 'nunread' : ''}">${S.news?.unread || ''}</span></button>` : ''}
     <div class="sgroup"><div class="shead lroot"><span class="spacer">${tr('Lists')}</span><button data-act="lists-reorder" class="${S.listReorder ? 'on' : ''}" title="${tr('Sort lists')}">${ic('sort', 's')}</button><button data-act="list-new" title="${tr('New list')}">${ic('plus', 's')}</button></div>${lh || `<div class="folder">${tr('No lists yet')}</div>`}</div>
     <div class="sgroup"><div class="shead"><span class="spacer">${tr('Filters')}</span><button data-act="filter-new" title="${tr('New filter')}">${ic('plus', 's')}</button></div>${S.filters.map(f => row('f:' + f.id, ic('filter'), f.name, c.filters[f.id])).join('') || `<div class="folder">${tr('Combine lists, dates, priorities, tags')}</div>`}</div>
     ${tags.length ? `<div class="sgroup"><div class="shead">${tr('Tags')}</div>${tags.map(t => row('tag:' + t, ic('tag'), t, c.tags[t])).join('')}</div>` : ''}
@@ -855,7 +863,7 @@ function renderSide() {
 }
 function renderTop() {
   const m = S.route.mod, k = S.route.key;
-  let title = m === 'tasks' ? titleFor(k) : tr({cal: N_('Calendar'), matrix: N_('Eisenhower matrix'), habits: N_('Habits'), pomo: N_('Focus')}[m]);
+  let title = m === 'tasks' ? titleFor(k) : tr({cal: N_('Calendar'), matrix: N_('Eisenhower matrix'), habits: N_('Habits'), pomo: N_('Focus'), news: N_('News')}[m]);
   let acts = '';
   if (m === 'tasks' && (k.startsWith('l:') || k === 'inbox')) {
     const l = k === 'inbox' ? inbox() : listById(+k.slice(2));
@@ -872,7 +880,7 @@ function renderTop() {
   const pm = S.pomo && m !== 'pomo' ? `<button class="pomo-mini" data-go="pomo">${ic(S.pomo.paused_at ? 'pause' : 'timer', 's')}<span data-pomo-mini>${pomoDisplay()}</span></button>` : '';
   const off = !OUT.online || OUT.q.length ? `<span class="offline" title="${tr('Changes are sent as soon as the server is reachable')}">${OUT.online ? 'sync' : 'offline'}${OUT.q.length ? ' · ' + OUT.q.length : ''}</span>` : '';
   const cf = S.conflicts?.length ? `<button class="cfpill" data-act="conflicts" title="${tr('Review conflicts')}">${ic('alert', 's')}${S.conflicts.length}</button>` : '';
-  $('#top').innerHTML = `<button class="iconbtn menu" data-act="side" aria-label="${tr('Menu')}">${ic('menu')}</button><h1>${esc(title)}</h1>${cf}${off}${pm}${acts}`;
+  $('#top').innerHTML = `<button class="iconbtn menu" data-act="side" aria-label="${tr('Menu')}">${ic('menu')}</button><h1>${esc(title)}</h1>${cf}${off}${pm}${acts}${bellBtn()}`;
 }
 function routeList() {
   const k = S.route.key;
@@ -890,6 +898,7 @@ function renderView() {
   else if (m === 'matrix') el.innerHTML = viewMatrix();
   else if (m === 'habits') el.innerHTML = viewHabits();
   else if (m === 'pomo') { el.innerHTML = viewPomo(); loadPomoStats(); }
+  else if (m === 'news') el.innerHTML = viewNews();
   else if (S.route.key === 'search') el.innerHTML = viewSearch();
   else if (S.route.key === 'done' || S.route.key === 'trash') el.innerHTML = viewHistory();
   else if (isKanban()) el.innerHTML = viewKanban();
@@ -916,7 +925,7 @@ function taskRow(t, opts = {}) {
   if (t.content && !opts.compact) meta.push(`<span>${ic('edit', 's')}</span>`);
   if (t.attachments?.length) meta.push(`<span>${ic('clip', 's')}${t.attachments.length}</span>`);
   if (t.paperless?.length && plOn()) meta.push(`<span>${ic('archive', 's')}${t.paperless.length}</span>`);
-  if (t.url && feat('links')) meta.push(`<a class="lnk" href="${esc(t.url)}" target="_blank" rel="noopener noreferrer" title="${esc(t.url)}">${ic('link', 's')}${esc(urlHost(t.url))}</a>`);
+  if (t.url) meta.push(`<a class="lnk" href="${esc(t.url)}" target="_blank" rel="noopener noreferrer" title="${esc(t.url)}">${ic('link', 's')}${esc(urlHost(t.url))}</a>`);
   if (t.comment_count && collab()) meta.push(`<span class="cmc ${t.unread ? 'unread' : ''}" title="${esc(t.unread ? trn('{0} new comment', '{0} new comments', t.unread) : trn('{0} comment', '{0} comments', t.comment_count))}">${ic('comment', 's')}${t.comment_count}</span>`);
   if (t.assignee_id && collab()) { const who = personName(t.list_id, t.assignee_id); meta.push(`<span class="who ${S.me && t.assignee_id === S.me.id ? 'me' : ''}" title="${esc(tr('Assigned to {0}', who || '?'))}">${esc(initials(who))}</span>`); }
   for (const g of t.tags) meta.push(`<span class="tag">#${esc(g)}</span>`);
@@ -1518,7 +1527,7 @@ function renderDetail() {
       <div class="dsec fields">
         <label>${tr('List')}</label><select id="d-list" ${ro ? 'disabled' : ''}>${S.lists.filter(x => (!x.archived && x.role !== 'view') || x.id === t.list_id).map(x => `<option value="${x.id}" ${x.id === t.list_id ? 'selected' : ''}>${esc(lname(x))}</option>`).join('')}</select>
         ${secs.length ? `<label>${tr('Section')}</label><select id="d-sec" ${ro ? 'disabled' : ''}><option value="">${tr('Unassigned')}</option>${secs.map(s => `<option value="${s.id}" ${s.id === t.section_id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>` : ''}
-        ${feat('links') ? `<label>${tr('Link')}</label>${linkField(t, ro)}` : ''}
+        <label>${tr('Link')}</label>${linkField(t, ro)}
         ${collab() && (shared || t.assignee_id) ? `<label>${tr('Assignee')}</label><select id="d-assignee" ${ro ? 'disabled' : ''}><option value="">${tr('Nobody')}</option>${listPeople(l).map(p => `<option value="${p.user_id}" ${p.user_id === t.assignee_id ? 'selected' : ''}>${esc(p.name)}${S.me && p.user_id === S.me.id ? ' ' + tr('(me)') : ''}</option>`).join('')}</select>` : ''}
       </div>
       ${collab() && t.id > 0 ? `<div class="dsec cmsec" id="d-tl">${timelineHtml(t)}</div>` : ''}
@@ -1541,6 +1550,98 @@ async function saveLink(v) {
   S.editLink = false;
   if ((t.url || '') === v) { renderDetail(); return; }
   await patchTask(t.id, {url: v || null});
+}
+
+// ------------------------------------------------------------------ News ("Neuigkeiten", module "collab")
+// Server feed of what concerns me (mentions, comments on my tasks, assignments, completions, sharing);
+// texts are built here from structured items. Unread count + a change marker come with /api/state and
+// /api/version, the feed itself is fetched while the view is open (never queued offline).
+S.nf = {items: null, users: {}, sig: null, filter: LS.get('newsFilter', '')};
+function bellBtn() {
+  if (!collab()) return '';
+  const n = S.news?.unread || 0;
+  return `<button class="iconbtn bell ${S.route.mod === 'news' ? 'on' : ''}" data-go="news" title="${esc(tr('News'))}" aria-label="${esc(n ? trn('{0} unread news item', '{0} unread news items', n) : tr('News'))}">${ic('bell')}${n ? `<span class="nbadge">${n > 99 ? '99+' : n}</span>` : ''}</button>`;
+}
+function relTime(iso) {
+  const min = Math.round((Date.now() - new Date(iso)) / 60000);
+  if (min < 1) return tr('just now');
+  if (min < 60) return trn('{0} min ago', '{0} min ago', min);
+  if (min < 12 * 60) return trn('{0} h ago', '{0} h ago', Math.round(min / 60));
+  return fmtWhen(iso);
+}
+// excerpt: one line, Markdown markers dropped, <@id> -> highlighted @name
+const newsExcerpt = (body, U) => esc(String(body || '').replace(/\s+/g, ' ').replace(/\*\*|__|~~|`/g, '').replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\w)/g, '$1$2').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1').trim())
+  .replace(/&lt;@(\d+)&gt;/g, (_, id) => `<span class="mention ${S.me && +id === S.me.id ? 'me' : ''}">@${esc(uname(+id, U))}</span>`);
+const roleLabel = r => r === 'view' ? tr('View only') : tr('Can edit');
+function newsListName(it) {
+  const l = it.list_id && listById(it.list_id);
+  return l ? (l.is_inbox ? tr('Inbox') : listName(l.name)) : listName(it.data?.name || '');
+}
+function newsText(it, U) {
+  const who = `<b>${esc(uname(it.actor_id, U))}</b>`, q = x => `<b>${esc(x)}</b>`, d = it.data || {};
+  switch (it.kind) {
+    case 'mention': return tr('{0} mentioned you', who);
+    case 'comment': return it.count > 1 ? trn('{1} left {0} comments', '{1} left {0} comments', it.count, (it.actors || [it.actor_id]).map(a => `<b>${esc(uname(a, U))}</b>`).join(', ')) : tr('{0} commented', who);
+    case 'assign': return tr('{0} assigned a task to you', who);
+    case 'unassign': return tr('{0} removed you as assignee', who);
+    case 'complete': return tr('{0} completed a task', who);
+    case 'share': return d.role === 'view' ? tr('{0} shared the list {1} with you (view only)', who, q(newsListName(it))) : tr('{0} shared the list {1} with you', who, q(newsListName(it)));
+    case 'role': return tr('{0} changed your role in {1} to {2}', who, q(newsListName(it)), q(roleLabel(d.role)));
+    case 'unshare': return tr('{0} removed you from the list {1}', who, q(newsListName(it)));
+  }
+  return tr('{0} changed something', who);
+}
+const NEWS_ICON = {mention: 'at', comment: 'comment', assign: 'user', unassign: 'user', complete: 'check', share: 'users', role: 'users', unshare: 'users'};
+function newsItemHtml(it, i) {
+  const U = S.nf.users;
+  const task = it.task_id ? `<div class="ntask"><span class="nt">${esc(it.task_title || '')}</span><span class="muted">${esc(newsListName(it))}</span></div>` : '';
+  const ex = it.excerpt ? `<div class="nexc">${newsExcerpt(it.excerpt, U)}</div>` : '';
+  return `<div class="nitem ${it.read ? '' : 'unread'} k-${it.kind}" role="button" tabindex="0" data-act="news-open" data-i="${i}">
+    <span class="avatar">${esc(initials(uname(it.actor_id, U)))}<i class="nk">${ic(NEWS_ICON[it.kind] || 'bell', 's')}</i></span>
+    <div class="nmain"><div class="ntext">${newsText(it, U)}</div>${task}${ex}</div>
+    <time title="${esc(fmtWhen(it.created_at))}">${relTime(it.created_at)}</time></div>`;
+}
+function viewNews() {
+  const f = S.nf.filter, fresh = S.nf.sig === (S.news?.sig ?? '') && S.nf.f === f;
+  if (!fresh && !S.nf.loading) setTimeout(loadNews, 0);
+  const bar = `<div class="nbar"><div class="seg"><button class="${f ? '' : 'on'}" data-act="news-filter" data-f="">${tr('All')}</button><button class="${f ? 'on' : ''}" data-act="news-filter" data-f="mentions">${ic('at', 's')}${tr('Only mentions')}</button></div><span class="spacer"></span>${S.news?.unread ? `<button class="btn sm" data-act="news-readall">${ic('check', 's')}${tr('Mark all as read')}</button>` : ''}</div>`;
+  if (S.nf.err && !S.nf.items) return bar + `<div class="empty">${S.nf.err === 'offline' ? tr('News are only available online.') : esc(S.nf.err)}</div>`;
+  if (!S.nf.items || S.nf.f !== f) return bar + `<div class="empty">${tr('Loading…')}</div>`;
+  if (!S.nf.items.length) return bar + `<div class="empty">${ic('bell')}${f ? tr('No mentions yet.') : tr('Nothing new. Mentions, comments on your tasks, assignments and shared lists show up here.')}</div>`;
+  return bar + `<div class="nlist">${S.nf.items.map(newsItemHtml).join('')}</div>`;
+}
+async function loadNews() {
+  if (!collab() || S.nf.loading) return;
+  const f = S.nf.filter;
+  S.nf.loading = true;
+  try {
+    const j = await rawFetch('GET', '/api/news' + (f ? '?filter=' + f : ''));
+    Object.assign(S.nf, {items: j.items, users: j.users || {}, sig: j.sig, f, err: null});
+    const changed = !S.news || S.news.unread !== j.unread || S.news.sig !== j.sig;
+    S.news = {unread: j.unread, sig: j.sig};
+    if (changed) { renderTop(); renderTabs(); renderRail(); renderSide(); }
+  } catch (e) {
+    if (e.message === 'auth') return;
+    S.nf.err = e instanceof Offline ? 'offline' : e.message; S.nf.sig = S.news?.sig ?? ''; S.nf.f = f;
+  } finally { S.nf.loading = false; }
+  if (S.route.mod === 'news') renderView();
+}
+async function newsRead(body) {
+  try {
+    const j = await rawFetch('POST', '/api/news/read', body);
+    S.news = {unread: j.unread, sig: j.sig}; S.nf.sig = j.sig;
+  } catch { /* offline: stays unread on the server */ }
+  render();
+}
+async function newsOpen(i) {
+  const it = (S.nf.items || [])[i]; if (!it) return;
+  if (!it.read) { it.read = true; newsRead({ids: it.ids}); }
+  if (!it.task_id) { if (it.list_id && listById(it.list_id)) go('l/' + it.list_id); return; }
+  if (!taskById(it.task_id)) {  // e.g. completed long ago: not in the state
+    try { (S.extra ||= []).push(await rawFetch('GET', `/api/tasks/${it.task_id}`)); }
+    catch (e) { toast(e instanceof Offline ? tr('News are only available online.') : tr('Task not found')); return; }
+  }
+  openDetail(it.task_id);
 }
 
 // ------------------------------------------------------------------ comments + activity (module "collab")
@@ -2145,49 +2246,85 @@ function listModal(id, folder = '') {
   });
   setTimeout(() => $('#l-name', md).focus(), 50);
 }
+// Settings: tabbed dialog (vertical tab list on the left on desktop, a horizontally scrollable tab strip on phones).
+// Every pane stays in the DOM, so one "Save" stores the server settings of all sections at once;
+// language, color scheme, tab bar and the account / user actions apply immediately, as before.
+// The last opened section is remembered per device (LS settingsSec).
+const SET_SECS = [['account', 'user', N_('Account')], ['general', 'sliders', N_('General')], ['notify', 'bell', N_('Notifications')],
+  ['layout', 'grid', N_('Layout')], ['focus', 'timer', N_('Focus')], ['integr', 'link', N_('Integrations')], ['data', 'download', N_('Data')],
+  ['users', 'users', N_('Users')], ['help', 'help', N_('Help')]];
+const SET_SAVE = '#s-allday,#s-defrem,#s-digest,#s-pf,#s-ps,#s-pl,#s-pe,#s-showdone,#s-plkeep,[data-feat]';
 function settingsModal(focus) {
   const s = S.settings;
   const topicUrl = `${S.ntfyUrl}/${s.ntfy_topic}`;
-  const md = modal(`<h3>${tr('Settings')}</h3>
-    <h4>${tr('Notifications (ntfy)')}</h4>
-    <div class="row"><label>${tr('Topic')}</label><code class="topic">${esc(s.ntfy_topic)}</code></div>
-    <div class="row"><label></label><span class="muted" style="font-size:13px;flex:1">${tr('Subscribe in the ntfy app: server {0}, topic as above', esc(S.ntfyUrl))}${/ntfy\.sh/.test(S.ntfyUrl) || !S.me?.ntfy_inbox ? '' : tr(', with a user that has read access')}. <a href="${esc(topicUrl)}" target="_blank" rel="noopener" style="color:var(--accent)">${tr('Web view')}</a></span></div>
-    <div class="row"><label></label><button class="btn sm" data-m="test">${ic('bell', 's')} ${tr('Send test')}</button></div>
-    <div class="row"><label>${tr('All-day reminder at')}</label><input type="time" id="s-allday" value="${esc(s.allday_time)}"></div>
-    <div class="row"><label>${tr('Default reminder')}</label><select id="s-defrem"><option value="">${tr('none')}</option>${REM_OPTS.map(([v, n]) => `<option value="${v}" ${s.default_reminder === v ? 'selected' : ''}>${tr(n)}</option>`).join('')}</select></div>
-    <div class="row"><label>${tr('Daily digest at')}</label><input type="time" id="s-digest" value="${esc(s.digest_time)}"><span class="muted" style="font-size:12px">${tr('empty = off')}</span></div>
-    <h4>${tr('Focus (minutes)')}</h4>
-    <div class="row"><label>${tr('Focus / short / long')}</label><input type="number" id="s-pf" value="${esc(s.pomo_focus)}" min="1" style="max-width:80px"><input type="number" id="s-ps" value="${esc(s.pomo_short)}" min="1" style="max-width:80px"><input type="number" id="s-pl" value="${esc(s.pomo_long)}" min="1" style="max-width:80px"></div>
-    <div class="row"><label>${tr('Long break after')}</label><input type="number" id="s-pe" value="${esc(s.pomo_long_every)}" min="1" style="max-width:80px"><span class="muted">${tr('pomos')}</span></div>
-    <h4 id="s-tabbar-h">${tr('Tab bar (this device)')}</h4>
-    <div class="muted" style="font-size:12px;margin:-2px 0 8px">${tr('Applies to this device only, at the bottom on a phone or on the left on desktop. A phone fits {0} tabs, the rest and everything not pinned goes under “More”.', TAB_MAX)}</div>
-    <div class="navlist" id="s-tabbar"></div>
-    <div class="row" style="margin-top:8px"><select id="s-tabadd" style="flex:1"></select><button class="btn sm" data-m="tab-reset">${tr('Default')}</button></div>
-    <h4>${tr('Modules')}</h4>
-    <div class="muted" style="font-size:12px;margin:-2px 0 8px">${tr('Checkbox = feature on/off. Order = default bar for devices without their own tab bar.')}</div>
-    <div class="navlist" id="s-nav">${navOrder().map(k => { const [m, i, n] = MODS.find(x => x[0] === k); return `<div class="navrow" data-mod="${m}">${m === 'tasks' ? '<input type="checkbox" checked disabled>' : `<input type="checkbox" data-feat="${m}" ${feat(m) ? 'checked' : ''}>`}${ic(i, 's')}<span>${tr(n)}</span><button class="iconbtn" data-nav="-1" title="${tr('move up / left')}">${ic('chev', 's up')}</button><button class="iconbtn" data-nav="1" title="${tr('move down / right')}">${ic('chev', 's')}</button></div>`; }).join('')}</div>
-    <div class="featgrid" style="margin-top:10px">${FEATS.filter(([k]) => !MODS.some(m => m[0] === k)).map(([k, n]) => `<label ${FEAT_DESC[k] ? 'class="wide"' : ''}><input type="checkbox" data-feat="${k}" ${feat(k) ? 'checked' : ''}><span>${tr(n)}${FEAT_DESC[k] ? `<small class="muted">${tr(FEAT_DESC[k])}</small>` : ''}</span></label>`).join('')}</div>
-    ${S.paperless?.enabled ? `<h4>Paperless</h4>
-    <div class="row"><label>${tr('After upload')}</label><label style="display:flex;gap:8px;align-items:center;min-width:0;color:var(--text)"><input type="checkbox" id="s-plkeep" ${s.paperless_keep === '1' ? 'checked' : ''} style="flex:none"> ${tr('Also keep the attachment in Abhako')}</label></div>` : ''}
-    ${S.ntfyInbox?.enabled && S.me?.ntfy_inbox ? `<h4>${tr('Share via ntfy (Android)')}</h4>
-    <div class="muted" style="font-size:13px;line-height:1.7">${tr('In the ntfy app, add server {0} once', `<code class="topic">${esc(S.ntfyInbox.server)}</code>`)}${tr(' and log in with a user that may write to the topic (Settings > Manage users).')} ${tr('Then: share an image or text > ntfy > server as above, topic {0}. A few seconds later it is a task in the inbox, files as attachments.', `<code class="topic">${esc(S.ntfyInbox.topic)}</code>`)}</div>` : ''}
-    <h4>${tr('Appearance (this device)')}</h4>
-    <div class="row"><label>${tr('Color scheme')}</label><div class="seg" id="s-theme">${[['auto', N_('Automatic')], ['dark', N_('Dark')], ['light', N_('Light')]].map(([k, n]) => `<button data-theme-set="${k}" class="${LS.get('theme', 'auto') === k ? 'on' : ''}">${tr(n)}</button>`).join('')}</div></div>
-    <h4 id="s-lang-h">Sprache / Language</h4>
-    <div class="row"><label>${tr('Language')}</label><div class="seg" id="s-lang">${(S.languages || []).map(({code, name}) => `<button data-lang-set="${esc(code)}" class="${(s.lang || 'en') === code ? 'on' : ''}">${esc(name)}</button>`).join('')}</div></div>
-    <div class="muted" style="font-size:12px;margin:-4px 0 8px">${tr('Applies to all devices and to the notifications. Quick add always understands German and English.')}</div>
-    <h4>${tr('Completed tasks')}</h4>
-    <div class="row"><label>${tr('Show in lists')}</label><label style="display:flex;gap:8px;align-items:center;min-width:0;color:var(--text)"><input type="checkbox" id="s-showdone" ${s.show_completed !== '0' ? 'checked' : ''} style="flex:none"> ${tr('Show completed|setting')}</label></div>
-    <div class="row"><label>${tr('Clean up')}</label><button class="btn sm danger" data-m="purge">${ic('trash', 's')} ${tr('Delete all completed')}</button><span class="muted" style="font-size:12px">${tr('they go to the trash')}</span></div>
-    <h4>${tr('Data')}</h4>
-    <div class="row"><label>${tr('TickTick import')}</label><input type="file" id="s-import" accept=".csv,text/csv"></div>
-    <div class="row"><label>${tr('Export')}</label><a class="btn sm" href="/api/export.json" download>${ic('download', 's')} ${tr('Download JSON')}</a></div>
-    <h4>${tr('Phone')}</h4>
-    <div class="muted" style="font-size:13px;line-height:1.7">${tr('Swipe right: complete · swipe left: snooze / delete · long-press and drag: reorder, move to another column, quadrant or onto a day; drag to the left edge and hold briefly to open the lists (dropping a subtask there = standalone task in that list). Android: share links directly via “Share” &gt; Abhako, images and files (also several) via the HTTP Shortcuts app, single ones also via the ntfy app.')}</div>
-    <h4>${tr('Quick add')}</h4>
-    <div class="muted" style="font-size:13px;line-height:1.7">${tr('today, tomorrow, day after tomorrow, friday, next monday, in 3 days, 12.10., 3pm, at 15:00<br>daily, weekdays, weekly, every monday, every 2 weeks, monthly, yearly<br>!high / !medium / !low (or !!!, !!, !) · #tag · ~list<br>German works too: morgen 15 uhr, jeden montag, !hoch<br>Keyboard: n = new task, / = search, Esc = close')}</div>
-    ${S.me ? accountHtml() : ''}
-    <div class="foot"><button class="btn" data-m="close">${tr('Close')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
+  const dev = `<span class="devtag">${tr('This device')}</span>`, hint = t => `<div class="shint">${t}</div>`;
+  const chk = (id, on, label) => `<label class="chkl"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
+  const pane = {
+    account: S.me ? accountHtml() : '',
+    general: `<h4 id="s-lang-h">${tr('Language')}</h4>
+      <div class="row"><div class="seg" id="s-lang">${(S.languages || []).map(({code, name}) => `<button data-lang-set="${esc(code)}" class="${(s.lang || 'en') === code ? 'on' : ''}">${esc(name)}</button>`).join('')}</div></div>
+      ${hint(tr('Applies to all devices and to the notifications. Quick add always understands German and English.'))}
+      <h4>${tr('Appearance')}${dev}</h4>
+      <div class="row"><label>${tr('Color scheme')}</label><div class="seg" id="s-theme">${[['auto', N_('Automatic')], ['dark', N_('Dark')], ['light', N_('Light')]].map(([k, n]) => `<button data-theme-set="${k}" class="${LS.get('theme', 'auto') === k ? 'on' : ''}">${tr(n)}</button>`).join('')}</div></div>
+      <h4>${tr('Completed tasks')}</h4>
+      <div class="row"><label>${tr('Show in lists')}</label>${chk('s-showdone', s.show_completed !== '0', tr('Show completed|setting'))}</div>`,
+    notify: `<h4>${tr('Notifications (ntfy)')}</h4>
+      <div class="row"><label>${tr('Topic')}</label><code class="topic">${esc(s.ntfy_topic)}</code><button class="btn sm" data-m="test">${ic('bell', 's')} ${tr('Send test')}</button></div>
+      ${hint(`${tr('Subscribe in the ntfy app: server {0}, topic as above', esc(S.ntfyUrl))}${/ntfy\.sh/.test(S.ntfyUrl) || !S.me?.ntfy_inbox ? '' : tr(', with a user that has read access')}. <a href="${esc(topicUrl)}" target="_blank" rel="noopener">${tr('Web view')}</a>`)}
+      <h4>${tr('Reminders')}</h4>
+      <div class="row"><label>${tr('All-day reminder at')}</label><input type="time" id="s-allday" value="${esc(s.allday_time)}"></div>
+      <div class="row"><label>${tr('Default reminder')}</label><select id="s-defrem"><option value="">${tr('none')}</option>${REM_OPTS.map(([v, n]) => `<option value="${v}" ${s.default_reminder === v ? 'selected' : ''}>${tr(n)}</option>`).join('')}</select></div>
+      <div class="row"><label>${tr('Daily digest at')}</label><input type="time" id="s-digest" value="${esc(s.digest_time)}"><span class="muted" style="font-size:12px">${tr('empty = off')}</span></div>`,
+    layout: `<h4 id="s-tabbar-h">${tr('Tab bar')}${dev}</h4>
+      ${hint(tr('At the bottom on a phone, on the left on desktop. A phone fits {0} tabs, the rest goes under “More”.', TAB_MAX))}
+      <div class="navlist" id="s-tabbar"></div>
+      <div class="row" style="margin-top:8px"><select id="s-tabadd" style="flex:1"></select><button class="btn sm" data-m="tab-reset">${tr('Default')}</button></div>
+      <h4>${tr('Modules')}</h4>
+      ${hint(tr('Checkbox = feature on/off. Order = default bar for devices without their own tab bar.'))}
+      <div class="navlist" id="s-nav">${navOrder().map(k => { const [m, i, n] = MODS.find(x => x[0] === k); return `<div class="navrow" data-mod="${m}">${m === 'tasks' ? '<input type="checkbox" checked disabled>' : `<input type="checkbox" data-feat="${m}" ${feat(m) ? 'checked' : ''}>`}${ic(i, 's')}<span>${tr(n)}</span><button class="iconbtn" data-nav="-1" title="${tr('move up / left')}">${ic('chev', 's up')}</button><button class="iconbtn" data-nav="1" title="${tr('move down / right')}">${ic('chev', 's')}</button></div>`; }).join('')}</div>
+      <h4>${tr('Views and features')}</h4>
+      <div class="featgrid">${FEATS.filter(([k]) => !MODS.some(m => m[0] === k)).map(([k, n]) => `<label ${FEAT_DESC[k] ? 'class="wide"' : ''}><input type="checkbox" data-feat="${k}" ${feat(k) ? 'checked' : ''}><span>${tr(n)}${FEAT_DESC[k] ? `<small class="muted">${tr(FEAT_DESC[k])}</small>` : ''}</span></label>`).join('')}</div>`,
+    focus: `<h4>${tr('Focus (minutes)')}</h4>
+      <div class="row"><label>${tr('Focus / short / long')}</label><input type="number" id="s-pf" value="${esc(s.pomo_focus)}" min="1" style="max-width:80px"><input type="number" id="s-ps" value="${esc(s.pomo_short)}" min="1" style="max-width:80px"><input type="number" id="s-pl" value="${esc(s.pomo_long)}" min="1" style="max-width:80px"></div>
+      <div class="row"><label>${tr('Long break after')}</label><input type="number" id="s-pe" value="${esc(s.pomo_long_every)}" min="1" style="max-width:80px"><span class="muted">${tr('pomos')}</span></div>`,
+    integr: `${S.paperless?.enabled ? `<h4>Paperless</h4>
+      <div class="row"><label>${tr('After upload')}</label>${chk('s-plkeep', s.paperless_keep === '1', tr('Also keep the attachment in Abhako'))}</div>` : ''}
+      <h4>${tr('Sharing from Android')}</h4>
+      <ul class="slist"><li>${tr('Links and text: “Share” &gt; Abhako.')}</li>
+        <li>${tr('Images and files (also several): the HTTP Shortcuts app sends them to /drop with your upload token (see Account).')}</li>
+        ${S.ntfyInbox?.enabled && S.me?.ntfy_inbox ? `<li>${tr('Single files also via the ntfy app:')} ${tr('In the ntfy app, add server {0} once', `<code class="topic">${esc(S.ntfyInbox.server)}</code>`)}${tr(' and log in with a user that may write to the topic (Settings > Manage users).')} ${tr('Then: share an image or text > ntfy > server as above, topic {0}. A few seconds later it is a task in the inbox, files as attachments.', `<code class="topic">${esc(S.ntfyInbox.topic)}</code>`)}</li>` : ''}</ul>`,
+    data: `<h4>${tr('Import and export')}</h4>
+      <div class="row"><label>${tr('TickTick import')}</label><input type="file" id="s-import" accept=".csv,text/csv"></div>
+      <div class="row"><label>${tr('Export')}</label><a class="btn sm" href="/api/export.json" download>${ic('download', 's')} ${tr('Download JSON')}</a></div>
+      <h4>${tr('Completed tasks')}</h4>
+      <div class="row"><label>${tr('Clean up')}</label><button class="btn sm danger" data-m="purge">${ic('trash', 's')} ${tr('Delete all completed')}</button><span class="muted" style="font-size:12px">${tr('they go to the trash')}</span></div>`,
+    users: S.me?.is_admin ? usersHtml() : '',
+    help: `<h4>${tr('Quick add')}</h4>
+      <div class="shelp">${tr('today, tomorrow, day after tomorrow, friday, next monday, in 3 days, 12.10., 3pm, at 15:00<br>daily, weekdays, weekly, every monday, every 2 weeks, monthly, yearly<br>!high / !medium / !low (or !!!, !!, !) · #tag · ~list<br>German works too: morgen 15 uhr, jeden montag, !hoch<br>Keyboard: n = new task, / = search, Esc = close')}</div>
+      <h4>${tr('Gestures (phone)')}</h4>
+      <div class="shelp">${tr('Swipe right: complete · swipe left: snooze / delete · long-press and drag: reorder, move to another column, quadrant or onto a day; drag to the left edge and hold briefly to open the lists (dropping a subtask there = standalone task in that list).')}</div>`,
+  };
+  const secs = SET_SECS.filter(([k]) => pane[k]);
+  let cur = {tabbar: 'layout'}[focus] || focus;
+  if (!secs.some(([k]) => k === cur)) cur = LS.get('settingsSec', 'general');
+  if (!secs.some(([k]) => k === cur)) cur = 'general';
+  const md = modal(`<div class="shdr"><h3>${tr('Settings')}</h3><button class="iconbtn" data-m="close" aria-label="${tr('Close')}">${ic('x')}</button></div>
+    <div class="sbody"><nav class="snav" role="tablist" aria-label="${tr('Settings')}">${secs.map(([k, i, n]) => `<button role="tab" id="st-${k}" aria-controls="sp-${k}" aria-selected="${k === cur}" data-sec="${k}" class="${k === cur ? 'on' : ''}">${ic(i, 's')}<span>${tr(n)}</span></button>`).join('')}</nav>
+      <div class="spanes">${secs.map(([k]) => `<section class="spane ${k === cur ? '' : 'hidden'}" role="tabpanel" id="sp-${k}" aria-labelledby="st-${k}" data-pane="${k}">${pane[k]}</section>`).join('')}</div></div>
+    <div class="foot sfoot"><span class="sdirty muted">${tr('Unsaved changes')}</span><span class="spacer"></span><button class="btn" data-m="close">${tr('Close')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
+  md.classList.add('smodal');
+  const show = k => {
+    cur = k; LS.set('settingsSec', k);
+    $$('.snav button', md).forEach(b => { b.classList.toggle('on', b.dataset.sec === k); b.setAttribute('aria-selected', b.dataset.sec === k); });
+    $$('.spane', md).forEach(p => p.classList.toggle('hidden', p.dataset.pane !== k));
+    $('.spanes', md).scrollTop = 0;
+    $(`.snav [data-sec="${k}"]`, md)?.scrollIntoView({block: 'nearest', inline: 'nearest'});
+  };
+  const dirty = () => md.classList.add('dirty');
+  md.addEventListener('change', e => { if (e.target.matches?.(SET_SAVE)) dirty(); });
+  md.addEventListener('input', e => { if (e.target.matches?.(SET_SAVE)) dirty(); });
+  $('.snav', md).addEventListener('click', e => { const b = e.target.closest('[data-sec]'); if (b) show(b.dataset.sec); });
+  setTimeout(() => $(`.snav [data-sec="${cur}"]`, md)?.scrollIntoView({block: 'nearest', inline: 'nearest'}), 0);
   const tabDraw = () => {
     const ids = tabIds();
     $('#s-tabbar', md).innerHTML = ids.map(tabItem).map((t, i) => t ? `<div class="navrow" data-tab="${esc(t.id)}">${t.icon}<span>${esc(t.label)}</span>${i === TAB_MAX - 1 && ids.length > TAB_MAX ? `<span class="muted" style="font-size:11px">${tr('from here on “More”')}</span>` : ''}<button class="iconbtn" data-tmove="-1" title="${tr('move forward')}">${ic('chev', 's up')}</button><button class="iconbtn" data-tmove="1" title="${tr('move back')}">${ic('chev', 's')}</button><button class="iconbtn" data-tdel title="${tr('remove')}">${ic('x', 's')}</button></div>` : '').join('') || `<div class="muted" style="font-size:13px">${tr('Empty: only “More”')}</div>`;
@@ -2199,13 +2336,11 @@ function settingsModal(focus) {
       grp(N_('Lists'), S.lists.filter(l => !l.is_inbox && !l.archived).map(l => opt('l:' + l.id, listName(l.name))).join('')) +
       grp(N_('Filters'), S.filters.map(f => opt('f:' + f.id, f.name)).join('')) +
       grp(N_('Tags'), Object.keys(counts().tags).sort((a, b) => a.localeCompare(b, 'de')).map(t => opt('tag:' + t, '#' + t)).join('')) +
-      grp(N_('Other'), opt('search', tr('Search')) + opt('settings', tr('Settings')));
+      grp(N_('Other'), (collab() ? opt('news', tr('News')) : '') + opt('search', tr('Search')) + opt('settings', tr('Settings')));
   };
   const tabSet = ids => { LS.set('tabbar', ids); tabDraw(); renderTabs(); renderRail(); };
   tabDraw();
   $('#s-tabadd', md).addEventListener('change', e => { if (e.target.value) tabSet([...tabIds(), e.target.value]); });
-  if (focus === 'tabbar') setTimeout(() => $('#s-tabbar-h', md)?.scrollIntoView({block: 'start'}), 0);
-  if (focus === 'account') setTimeout(() => $('#s-account-h', md)?.scrollIntoView({block: 'start'}), 0);
   if (S.me) accountWire(md);
   md.addEventListener('click', async e => {
     const b = e.target.closest('button'); if (!b) return;
@@ -2222,13 +2357,13 @@ function settingsModal(focus) {
       await api('PATCH', '/api/settings', {lang: b.dataset.langSet});
       await i18nLoad(b.dataset.langSet);
       S.settings.lang = b.dataset.langSet; LS.set('lang', S.settings.lang); document.documentElement.lang = S.settings.lang;
-      md.remove(); render(); settingsModal(); setTimeout(() => $('#s-lang-h')?.scrollIntoView({block: 'center'}), 0);
+      md.remove(); render(); settingsModal('general');
       return;
     }
     if (b.dataset.themeSet) { LS.set('theme', b.dataset.themeSet); applyTheme(); $$('#s-theme button', md).forEach(x => x.classList.toggle('on', x === b)); return; }
     if (b.dataset.nav) {
       const row = b.closest('.navrow'), sib = +b.dataset.nav < 0 ? row.previousElementSibling : row.nextElementSibling;
-      if (sib) +b.dataset.nav < 0 ? sib.before(row) : sib.after(row);
+      if (sib) { +b.dataset.nav < 0 ? sib.before(row) : sib.after(row); dirty(); }
       return;
     }
     const a = b.dataset.m;
@@ -2264,10 +2399,10 @@ function accountHtml() {
     ${pw ? `<div class="row"><label>${tr('Password')}</label><input type="password" id="a-cur" placeholder="${tr('current password')}" autocomplete="current-password"><input type="password" id="a-new" placeholder="${tr('new password')}" autocomplete="new-password"><button class="btn sm" data-acc="pw">${tr('Change')}</button></div>` : ''}
     <div class="row"><label>${tr('Upload token')}</label><button class="btn sm" data-acc="token">${ic('key', 's')} ${tr('Show')}</button><span class="muted" style="font-size:12px">${tr('for POST /drop (HTTP Shortcuts), header Authorization: Bearer …')}</span></div>
     <div class="row hidden" id="a-tokrow"><label></label><code class="topic" id="a-tok"></code><button class="btn sm danger" data-acc="token-new">${tr('New token')}</button></div>
-    ${m.auth === 'session' ? `<div class="row"><label></label><button class="btn sm" data-acc="logout">${ic('logout', 's')} ${tr('Log out')}</button></div>` : ''}
-    ${m.is_admin ? `<h4>${tr('Users')}</h4><div class="members" id="a-users"><div class="muted mhint">${tr('Loading…')}</div></div>
-      <div class="row" style="margin-top:8px"><button class="btn sm" data-acc="user-new">${ic('plus', 's')} ${tr('New user')}</button></div>` : ''}`;
+    ${m.auth === 'session' ? `<div class="row"><label></label><button class="btn sm" data-acc="logout">${ic('logout', 's')} ${tr('Log out')}</button></div>` : ''}`;
 }
+const usersHtml = () => `<h4>${tr('Users')}</h4><div class="members" id="a-users"><div class="muted mhint">${tr('Loading…')}</div></div>
+  <div class="row" style="margin-top:8px"><button class="btn sm" data-acc="user-new">${ic('plus', 's')} ${tr('New user')}</button></div>`;
 function accountWire(md) {
   let users = [];
   const drawUsers = async () => {
@@ -2514,6 +2649,9 @@ document.addEventListener('click', async e => {
   switch (act) {
     case 'open': if (!swiped) openDetail(id); break;
     case 'open-id': openDetail(id); break;
+    case 'news-open': newsOpen(+a.dataset.i); break;
+    case 'news-readall': S.nf.items?.forEach(x => { x.read = true; }); newsRead({all: true}); break;
+    case 'news-filter': S.nf.filter = a.dataset.f; LS.set('newsFilter', a.dataset.f); S.nf.items = null; renderView(); break;
     case 'toggle': e.stopPropagation(); toggleTask(id); break;
     case 'close-detail': closeDetail(); break;
     case 'collapse': {
@@ -2678,6 +2816,7 @@ document.addEventListener('keydown', async e => {
     if (t.id === 'qinput' || t.id === 'qsheet') { e.preventDefault(); submitQuick(t); return; }
     if (t.id === 'd-title') { e.preventDefault(); t.blur(); return; }
     if (t.id === 'd-url') { e.preventDefault(); t.blur(); return; }
+    if (t.classList?.contains('nitem')) { e.preventDefault(); newsOpen(+t.dataset.i); return; }
     if (t.id === 'd-sub' && t.value.trim()) {
       const p = taskById(S.sel);
       const r = parseQuick(t.value.trim(), new Set());
@@ -2743,7 +2882,7 @@ function renderMultiBar() {
   if (!b) { b = document.createElement('div'); b.id = 'mbar'; document.body.appendChild(b); }
   const n = S.multi.size;
   b.classList.toggle('hidden', !(S.multiMode || n));
-  $('#fab').classList.toggle('gone', ['habits', 'pomo'].includes(S.route.mod) || ['done', 'trash', 'search'].includes(S.route.key) || S.multiMode || n > 0);
+  $('#fab').classList.toggle('gone', ['habits', 'pomo', 'news'].includes(S.route.mod) || ['done', 'trash', 'search'].includes(S.route.key) || S.multiMode || n > 0);
   b.innerHTML = `<span class="mcount">${n ? tr('{0} selected', n) : tr('Tap tasks')}</span>
     <button class="iconbtn" data-act="mb-all" title="${tr('All')}">${ic('all')}</button>
     ${n ? `<button class="iconbtn" data-act="mb-date" title="${tr('Date')}">${ic('cal')}</button><button class="iconbtn" data-act="mb-prio" title="${tr('Priority')}">${ic('flag')}</button><button class="iconbtn" data-act="mb-list" title="${tr('List')}">${ic('folder')}</button><button class="iconbtn" data-act="mb-tag" title="${tr('Add tag')}">${ic('tag')}</button><button class="iconbtn" data-act="mb-pin" title="${tr('Pin')}">${ic('pin')}</button><button class="iconbtn" data-act="mb-done" title="${tr('Completed')}">${ic('done')}</button><button class="iconbtn danger" data-act="mb-del" title="${tr('Delete')}">${ic('trash')}</button>` : ''}
@@ -3147,22 +3286,17 @@ document.addEventListener('touchcancel', endTouchDrag);
     if (!files.length && !meta.text && !meta.url && !meta.title) toast(tr('Please share images and files via the ntfy app (topic inbox)'));
     history.replaceState(null, '', '/#inbox');
     await route();
-    const url = meta.url || (meta.text.match(/https?:\/\/\S+/) || [])[0] || '';
-    if (feat('links')) {  // the link goes into the link field; a bare link gets domain + path as title
-      const [u, rest] = shareLink(meta.text, meta.url);
-      const title = meta.title || rest || (u ? urlTitle(u) : '') || (files[0] ? files[0].name.replace(/\.[^.]+$/, '') : '');
-      openQuickSheet(title, {url: u, list_id: inbox().id, files});
-    } else {
-      const title = meta.title || meta.text.replace(url, '').trim() || (url ? url : '') || (files[0] ? files[0].name.replace(/\.[^.]+$/, '') : '');
-      openQuickSheet(title, {content: url && url !== title ? url : '', list_id: inbox().id, files});
-    }
+    // the link goes into the link field; a bare link gets domain + path as title
+    const [u, rest] = shareLink(meta.text, meta.url);
+    const title = meta.title || rest || (u ? urlTitle(u) : '') || (files[0] ? files[0].name.replace(/\.[^.]+$/, '') : '');
+    openQuickSheet(title, {url: u, list_id: inbox().id, files});
   } else if (location.pathname === '/share') {  // Android share sheet (text only, old manifest) -> new task
     const q = new URLSearchParams(location.search);
-    const text = (q.get('text') || '').trim(), url = (q.get('url') || (text.match(/https?:\/\/\S+/) || [])[0] || '').trim();
+    const text = (q.get('text') || '').trim();
     history.replaceState(null, '', '/#inbox');
     await route();
-    if (feat('links')) { const [u, rest] = shareLink(text, (q.get('url') || '').trim()); openQuickSheet((q.get('title') || '').trim() || rest || (u ? urlTitle(u) : ''), {url: u, list_id: inbox().id}); }
-    else { const title = (q.get('title') || '').trim() || text.replace(url, '').trim() || url; openQuickSheet(title, {content: url && url !== title ? url : '', list_id: inbox().id}); }
+    const [u, rest] = shareLink(text, (q.get('url') || '').trim());
+    openQuickSheet((q.get('title') || '').trim() || rest || (u ? urlTitle(u) : ''), {url: u, list_id: inbox().id});
   } else await route();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 })();
