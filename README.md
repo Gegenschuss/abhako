@@ -2,13 +2,13 @@
 
 <h1 align="center">Abhako</h1>
 
-<p align="center">A self-hosted task manager inspired by TickTick.<br>
-Lists, calendar, Eisenhower matrix, habits and a focus timer in one small web app you run yourself.</p>
+<p align="center">A self-hosted task manager inspired by TickTick and Asana: personal planning meets team collaboration.<br>
+Lists, calendar, Eisenhower matrix, habits, a focus timer, comments and shared lists in one small web app you run yourself.</p>
 
 <p align="center"><img src="docs/today.png" alt="Today view with overdue and today's tasks, subtasks, tags and the list sidebar"></p>
 
 > **Language:** the interface is **English** by default, with **German** included (switch under *Settings > Language*); more languages are welcome, see [TRANSLATING.md](TRANSLATING.md). The name comes from the German *abhaken*, to tick off.
-> Abhako is an independent hobby project and not affiliated with TickTick.
+> Abhako is an independent hobby project and not affiliated with TickTick or Asana.
 
 ## Features
 
@@ -16,10 +16,11 @@ Lists, calendar, Eisenhower matrix, habits and a focus timer in one small web ap
 - Lists with emoji and colour, list folders, sections (Kanban columns), archive
 - Subtasks up to three levels, drag and drop between lists and levels
 - Priorities, tags, pinned tasks, Markdown notes, attachments (images, PDFs, documents)
+- A website link per task, shown as a small domain chip (paste a URL in quick add or share a page from Android)
 - Natural-language quick add in English and German, whatever the interface language: `Dentist tomorrow 3pm !high #private ~Work` or `Zahnarzt morgen 15 Uhr !hoch #privat ~Arbeit`
 - Recurring tasks (daily, weekdays, weekly, monthly, yearly, any RRULE) with end date, count and skip
 - Smart lists (today, tomorrow, next 7 days, inbox, all), combinable filters (list, date, priority, tag)
-- Multi-select with batch actions, snooze, trash with restore, search in titles and notes
+- Multi-select with batch actions, snooze, trash with restore, search in titles, notes and links
 
 **Views**
 - Calendar (month, week, day) and a timeline, drag tasks onto days
@@ -34,6 +35,9 @@ Lists, calendar, Eisenhower matrix, habits and a focus timer in one small web ap
 - Several users, each with their own inbox, habits, filters, tags, settings and notifications
 - Share a list with others (can edit or view only); shared lists show up in their smart lists, calendar and search
 - Assign tasks in shared lists: reminders go to the assignee, plus an *Assigned to me* list
+- Comments on every task with @mentions and files, an activity history (who changed what, when) and unread markers
+- Push notifications for new comments, mentions, assignments and completions, bundled so a busy task does not spam you
+- One switch (*Collaboration*) turns all of this off for a simple personal task list
 - Built-in login or single sign-on through your reverse proxy (Authelia, Authentik, oauth2-proxy)
 
 **Everywhere**
@@ -104,7 +108,40 @@ To remove the test again: `docker compose down` and delete the folder (your test
 - **Assignment:** in shared lists a task can be assigned to the owner or a member (task panel > *Assignee*).
   Reminders go to the assignee, otherwise to whoever created the task. The daily digest contains your own
   lists' tasks plus everything assigned to you.
-- **Export** (*Settings > Export*) contains your data and the lists you own.
+- **Export** (*Settings > Export*) contains your data and the lists you own (tasks with links, comments and history).
+
+### Comments and activity
+
+<p align="center"><img src="docs/comments.png" alt="Task panel with a website link, activity lines and comments with @mentions"></p>
+
+- **Comments:** everyone who can see a task can comment on it, including *View only* members (they still cannot
+  change the task). On a private task, comments work as a personal log. Comments support a little Markdown,
+  links, files (images show as thumbnails inside the comment, not in the task's attachment list) and
+  **@mentions**: type `@` for a list of the people who can see the task. Mentions are stored by user, so a
+  renamed user stays linked. *Ctrl+Enter* sends.
+- **Edit and delete:** you can edit and delete your own comments (edited ones show *edited*, deleted ones and
+  their files disappear). The owner of a list may delete any comment in it (moderation); admins have no extra
+  rights on other people's comments.
+- **Activity:** the task panel shows the history between the comments: created, renamed, dates, priority,
+  assignment, moves, completion, repetition, links, attachments, subtasks, trash. Sort order, pins, reminders
+  and your private tags are not logged. *Show activity* hides it (remembered per device).
+- **Unread:** tasks with comments show a count; a dot marks comments by others you have not seen yet. Opening the
+  task marks them as read.
+- **Notifications** (to each person's own ntfy topic, in their language; tapping opens the task; never for your
+  own actions and only to people who can still see the task):
+  - new comment: to the assignee, the creator and everyone who commented before; *@mentioned* people always,
+    with "mentioned you"
+  - *Sam assigned you: task* to the new assignee (with list and due date), *Sam unassigned you from: task*
+    to the previous one
+  - *Robin completed: task* to the creator and whoever assigned it, for tasks in shared lists
+  - bundling: after a push about a task, anything else on that task within a minute is collected into one
+    summary push ("2 more comments · 1 more change").
+- **Offline:** comments need a connection. Offline, the text stays in the box with a notice (task edits still
+  queue up and sync later as before).
+- **Simple mode:** *Settings > Modules > Collaboration* (per user) hides comments, activity, mentions, unread and
+  assignee chips, the sharing section, the assignee field and *Assigned to me*, and stops these notifications.
+  Shared lists you are in stay visible as normal lists, nothing is deleted. *Website link* is a separate switch
+  for the link field and chips.
 
 ## Login
 
@@ -182,7 +219,8 @@ All settings are environment variables in `.env` (see [.env.example](.env.exampl
 | `NTFY_INBOX_USER` | first admin | Username whose inbox receives the share inbox |
 | `NTFY_INBOX_PUBLIC` | | Public ntfy URL, if attachment links use a different address than `NTFY_INBOX_URL` |
 | `PAPERLESS_API`, `PAPERLESS_PUBLIC_URL`, `PAPERLESS_TOKEN` | | Paperless-ngx integration (internal API URL, URL for your browser, API token) |
-| `TASKS_MAX_FILE_MB` | `50` | Maximum size per attachment |
+| `TASKS_MAX_FILE_MB` | `50` | Maximum size per attachment (task and comment files) |
+| `TASKS_PUSH_GAP` | `60` | Seconds in which further comments / changes on a task are bundled into one summary push |
 
 Everything else (language, reminder defaults, digest time, pomodoro lengths, which modules are shown) is set per user in the app under *Settings*.
 
@@ -214,6 +252,9 @@ Task titles, list names, tags and notes are never translated.
 2. Open Abhako > *Settings*: your topic is shown there (every user has an own one). Subscribe to it in the ntfy app.
 3. Press *Send test*.
 
+Besides reminders, focus end, habit reminders and the daily digest, Abhako pushes new comments, @mentions,
+assignments and completions in shared lists (see *Comments and activity*; off with the *Collaboration* module).
+
 On ntfy.sh anyone who knows the topic name can read it, so keep it random or run your own ntfy server with a token.
 
 ## Sharing from Android
@@ -236,7 +277,7 @@ Chrome currently passes no files to installed web apps via the share sheet (link
 
 ## Tech
 
-Python (Flask, waitress, python-dateutil) and SQLite on the server, plain JavaScript in the browser (`app.js`, translation helpers in `i18n.js`, translations in `static/i18n/*.json`): no build step, no framework, no external requests. Icons from [Lucide](https://lucide.dev).
+Python (Flask, waitress, python-dateutil) and SQLite on the server, plain JavaScript in the browser (`app.js`, translation helpers in `i18n.js`, translations in `static/i18n/*.json`): no build step, no framework, no external requests (website links are never fetched, no favicons). Icons from [Lucide](https://lucide.dev).
 
 ## Limits
 

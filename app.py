@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Abhako — self-hosted task manager (multi-user, shared lists), inspired by TickTick.
+"""Abhako — self-hosted task manager (multi-user, shared lists), inspired by TickTick and Asana.
 
 Login: either a trusted reverse proxy that sends the user name in a header (AUTH_PROXY_HEADER, only
 honoured from AUTH_TRUSTED_PROXIES and, if set, only on AUTH_PROXY_PORT) or the built-in
@@ -9,7 +9,8 @@ tasks.due = 'YYYY-MM-DD', tasks.due_time = 'HH:MM' or NULL (all-day).
 
 Modules: lists (+ sections = kanban columns), tasks with subtasks, tags, priority, reminders,
 recurrence (RRULE via dateutil), habits, pomodoro. Lists have one owner and can be shared with other
-users (role edit / view); tasks in shared lists can be assigned. Habits, focus sessions, filters,
+users (role edit / view); tasks in shared lists can be assigned. Tasks have comments (with @mentions
+and files), an activity history and a website link. Habits, focus sessions, filters,
 folders, tags and settings are per user. A watchdog thread sends ntfy pushes (per user topic) for due
 reminders, finished focus sessions, habit reminders and the optional daily digest.
 TickTick CSV backups can be imported (idempotent via tasks.tt_id per user).
@@ -181,6 +182,26 @@ CREATE INDEX IF NOT EXISTS list_members_user ON list_members(user_id);
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS comments (                 -- task comments; soft delete (deleted_at, body wiped)
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  body TEXT NOT NULL DEFAULT '',                -- mentions as <@user_id> tokens
+  mentions TEXT NOT NULL DEFAULT '',            -- csv of mentioned user ids
+  created_at TEXT NOT NULL, edited_at TEXT, deleted_at TEXT);
+CREATE TABLE IF NOT EXISTS activity (                 -- task history, structured (rendered by the client)
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  user_id INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS task_seen (                -- unread comments: highest comment id a user has seen
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  seen_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, task_id));
+CREATE TABLE IF NOT EXISTS task_push (                -- burst rule for collaboration pushes (per recipient + task)
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  sent_at REAL NOT NULL DEFAULT 0,              -- unix time of the last push
+  pending INTEGER NOT NULL DEFAULT 0,           -- comments / changes counted since then (summary)
+  events INTEGER NOT NULL DEFAULT 0, mentioned INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, task_id));
 """
 # additive migrations: (table, column, ddl)
 MIGRATIONS = [
@@ -196,6 +217,10 @@ MIGRATIONS = [
     ("habits", "user_id", "ALTER TABLE habits ADD COLUMN user_id INTEGER"),
     ("pomos", "user_id", "ALTER TABLE pomos ADD COLUMN user_id INTEGER"),
     ("filters", "user_id", "ALTER TABLE filters ADD COLUMN user_id INTEGER"),
+    # comments, activity, link (2026-09-26)
+    ("tasks", "url", "ALTER TABLE tasks ADD COLUMN url TEXT"),                         # website link (http/https)
+    ("attachments", "comment_id", "ALTER TABLE attachments ADD COLUMN comment_id INTEGER"),  # file of a comment
+    ("tasks", "assigned_by", "ALTER TABLE tasks ADD COLUMN assigned_by INTEGER"),       # who set the assignee (pushes)
 ]
 INDEXES = """
 CREATE INDEX IF NOT EXISTS lists_owner ON lists(owner_id);
@@ -205,6 +230,9 @@ CREATE INDEX IF NOT EXISTS pomos_user ON pomos(user_id);
 CREATE INDEX IF NOT EXISTS filters_user ON filters(user_id);
 CREATE INDEX IF NOT EXISTS task_tags_user ON task_tags(user_id, tag);
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_tt_user ON tasks(created_by, tt_id) WHERE tt_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id);
+CREATE INDEX IF NOT EXISTS activity_task ON activity(task_id, id);
+CREATE INDEX IF NOT EXISTS attachments_comment ON attachments(comment_id) WHERE comment_id IS NOT NULL;
 """
 MAX_DEPTH = 3  # task > subtask > sub-subtask
 # per user (table user_settings)
@@ -217,10 +245,11 @@ USER_DEFAULTS = {
     "ntfy_topic": "",           # set by an admin (a user could otherwise push into someone else's topic)
     "show_completed": "1",      # show the collapsed "Completed" group / done tasks in the calendar
     # modules that can be switched off in the settings (hidden from nav, data stays)
-    "features": "cal,timeline,matrix,habits,pomo,kanban,paperless",
+    # collab = comments, activity, mentions, sharing / assigning UI; links = website link per task
+    "features": "cal,timeline,matrix,habits,pomo,kanban,paperless,collab,links",
     "nav_order": "tasks,cal,matrix,habits,pomo",   # order of the mobile tab bar / desktop rail
     "folders": "[]",            # json list: folder order in the sidebar (also keeps empty folders)
-    "features_rev": "2",        # one-shot migrations of the features list
+    "features_rev": "3",        # one-shot migrations of the features list
     "paperless_keep": "0",      # 1 = keep the local attachment after it was consumed by Paperless
     "lang": "en",               # UI + push language: en or a static/i18n/<code>.json
 }
@@ -315,6 +344,11 @@ def now_utc():
 
 def iso(dt):
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def iso_ms(dt):
+    """Timeline timestamps (comments, activity): milliseconds keep their order within one second."""
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def parse_iso(s):
@@ -444,11 +478,15 @@ def init_db():
             for k, v in USER_DEFAULTS.items():
                 c.execute("INSERT OR IGNORE INTO user_settings(user_id,key,value) VALUES(?,?,?)", (uid, k, v))
             # features_rev 2: paperless module added -> on by default for existing installs
+            # features_rev 3: collab + links added (2026-09-26) -> on by default
             s = usettings(c, uid)
-            if int(s.get("features_rev") or 1) < 2:
-                if "paperless" not in s["features"].split(","):
-                    uset(c, uid, "features", s["features"] + ",paperless")
-                uset(c, uid, "features_rev", "2")
+            rev, fs = int(s.get("features_rev") or 1), [x for x in s["features"].split(",") if x]
+            if rev < 3:
+                for f, since in (("paperless", 2), ("collab", 3), ("links", 3)):
+                    if rev < since and f not in fs:
+                        fs.append(f)
+                uset(c, uid, "features", ",".join(fs))
+                uset(c, uid, "features_rev", "3")
         c.execute("COMMIT")
     except Exception:
         c.execute("ROLLBACK")
@@ -531,7 +569,7 @@ def _is_open(path, method):
 
 @app.before_request
 def authenticate():
-    g.user, g.auth_via, g.auth_error, g.proxy_login = None, None, None, ""
+    g.user, g.auth_via, g.auth_error, g.proxy_login, g.pushes = None, None, None, "", []
     c = db()
     val = proxy_login_value()
     if val:
@@ -780,8 +818,8 @@ def load_tasks(c, where, args=()):
     rows = c.execute(f"SELECT * FROM tasks WHERE {where}", args).fetchall()
     ids = {r["id"] for r in rows}
     tags = tags_for(c, ids)
-    atts = {}
-    for a in c.execute("SELECT id, task_id, name, mime, size, created_at FROM attachments ORDER BY id"):
+    atts = {}  # the task's own files; files of comments are shown inside their comment (timeline)
+    for a in c.execute("SELECT id, task_id, name, mime, size, created_at FROM attachments WHERE comment_id IS NULL ORDER BY id"):
         if a["task_id"] in ids:
             atts.setdefault(a["task_id"], []).append({k: a[k] for k in ("id", "name", "mime", "size", "created_at")})
     pls = {}
@@ -789,11 +827,21 @@ def load_tasks(c, where, args=()):
                        "FROM paperless_links ORDER BY id"):
         if p["task_id"] in ids:
             pls.setdefault(p["task_id"], []).append({k: p[k] for k in p.keys() if k != "task_id"})
+    # comment count + unread (comments of others newer than the last one I have seen)
+    cms, uid = {}, (g.user["id"] if has_request_context() and getattr(g, "user", None) else None)
+    if uid and ids:
+        for r in c.execute("""SELECT k.task_id, COUNT(*) AS n,
+                                     SUM(CASE WHEN k.id > COALESCE(s.seen_id, 0) AND k.user_id IS NOT ? THEN 1 ELSE 0 END) AS u
+                              FROM comments k LEFT JOIN task_seen s ON s.task_id=k.task_id AND s.user_id=?
+                              WHERE k.deleted_at IS NULL GROUP BY k.task_id""", (uid, uid)):
+            if r["task_id"] in ids:
+                cms[r["task_id"]] = (r["n"], r["u"] or 0)
     out = []
     for r in rows:
         d = task_dict(r, tags)
         d["attachments"] = atts.get(r["id"], [])
         d["paperless"] = pls.get(r["id"], [])
+        d["comment_count"], d["unread"] = cms.get(r["id"], (0, 0))
         out.append(d)
     return out
 
@@ -858,12 +906,45 @@ def share():
     return send_from_directory(app.static_folder, "index.html")
 
 
-def new_inbox_task(c, uid, title, content="", tt_id=None):
+def new_inbox_task(c, uid, title, content="", tt_id=None, url=None):
     inbox = my_inbox(c, uid)
     ts = iso(now_utc())
     srt = c.execute("SELECT COALESCE(MIN(sort),0)-1 FROM tasks WHERE list_id=? AND parent_id IS NULL", (inbox,)).fetchone()[0]
-    return c.execute("INSERT INTO tasks(list_id,title,content,sort,created_at,updated_at,tt_id,created_by) VALUES(?,?,?,?,?,?,?,?)",
-                     (inbox, (title or tr("Shared", lg=lang(c, uid)))[:300], content or "", srt, ts, ts, tt_id, uid)).lastrowid
+    tid = c.execute("INSERT INTO tasks(list_id,title,content,sort,created_at,updated_at,tt_id,created_by,url) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (inbox, (title or tr("Shared", lg=lang(c, uid)))[:300], content or "", srt, ts, ts, tt_id, uid,
+                     url if valid_url(url) else None)).lastrowid
+    log_act(c, tid, "created", uid=uid)
+    return tid
+
+
+# ---- website link (tasks.url): http/https only, no server-side fetching
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+
+
+def valid_url(u):
+    return bool(u) and len(u) <= 2000 and bool(re.fullmatch(r"https?://[^\s/?#]+[^\s]*", u, re.I))
+
+
+def url_title(u):
+    """Readable title for a bare link: domain (without www.) + path."""
+    p = urllib.parse.urlsplit(u)
+    host = p.netloc.lower().split("@")[-1]
+    host = host[4:] if host.startswith("www.") else host
+    return (host + p.path.rstrip("/"))[:120] or u[:120]
+
+
+def split_link(title, content=""):
+    """Shared text -> (title, content, url): the first URL goes into the link field. A URL in the title is
+    removed from it (a title that was only the URL becomes domain + path); a URL in the content stays there."""
+    for where, txt in (("title", title or ""), ("content", content or "")):
+        m = URL_RE.search(txt)
+        if not m:
+            continue
+        url = m.group(0).rstrip(".,;:!?")
+        if where == "title":
+            title = re.sub(r"\s+", " ", txt[:m.start()] + txt[m.end():]).strip(" -–—|:·")
+        return title or url_title(url), content, url
+    return title, content, None
 
 
 def save_attachment_bytes(c, tid, name, mime, data):
@@ -901,7 +982,8 @@ def ntfy_inbox_import(c, m):
         else:  # first line becomes the title, the rest the description
             title = first or (os.path.splitext(att["name"])[0] if att else tr("Shared", lg=lang(c, uid)))
             content = msg.split("\n", 1)[1].strip() if "\n" in msg else ""
-        tid = new_inbox_task(c, uid, title, content, "ntfy:" + mid)
+        title, content, url = split_link(title, content)
+        tid = new_inbox_task(c, uid, title, content, "ntfy:" + mid, url)
         if att and att.get("url"):
             url = att["url"]
             if NTFY_IN["public"] and url.startswith(NTFY_IN["public"]):  # fetch via the internal URL
@@ -955,9 +1037,12 @@ def share_post():
           "file keys", list(request.files.keys()), {k: request.form.get(k) for k in ("title", "text", "url")},
           [(f.filename, f.mimetype) for f in files], flush=True)
     text, url = (request.form.get("text") or "").strip(), (request.form.get("url") or "").strip()
-    title = (request.form.get("title") or "").strip() or text.replace(url, "").strip() or url \
-        or (os.path.splitext(safe_name(files[0].filename))[0] if files else tr("Shared"))
-    tid = new_inbox_task(c, me(), title, url if url and url != title else "")
+    m = None if url else URL_RE.search(text)  # most apps put the link into "text"
+    if m:
+        url, text = m.group(0).rstrip(".,;:!?"), text[:m.start()] + text[m.end():]
+    title = (request.form.get("title") or "").strip() or re.sub(r"\s+", " ", text.replace(url, "") if url else text).strip(" -–—|:·") \
+        or (url_title(url) if url else "") or (os.path.splitext(safe_name(files[0].filename))[0] if files else tr("Shared"))
+    tid = new_inbox_task(c, me(), title, "", url=url or None)  # the link goes into the link field
     save_attachments(c, tid, files)
     bump(c)
     c.commit()
@@ -999,9 +1084,10 @@ def drop_post():
     if not files and not text:
         return Response(tr("nothing received", lg=lg) + "\n", 400, mimetype="text/plain")
     first, _, rest = text.partition("\n")
-    title = first.strip() or (os.path.splitext(safe_name(files[0].filename))[0] if len(files) == 1
-                              else tr("{0} files shared", len(files), lg=lg))
-    tid = new_inbox_task(c, u["id"], title, rest.strip())
+    first, rest, url = split_link(first.strip(), rest.strip())
+    title = first or (os.path.splitext(safe_name(files[0].filename))[0] if len(files) == 1
+                      else tr("{0} files shared", len(files), lg=lg))
+    tid = new_inbox_task(c, u["id"], title, rest, url=url)
     e = save_attachments(c, tid, files) if files else None
     bump(c)
     c.commit()
@@ -1130,8 +1216,8 @@ def task_query():
                           (uid, uid, limit))
     elif scope == "search":
         q = f"%{request.args.get('q', '').strip()}%"
-        rows = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND (title LIKE ? OR content LIKE ?) "
-                             "ORDER BY status, updated_at DESC LIMIT ?", (uid, uid, q, q, limit))
+        rows = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND (title LIKE ? OR content LIKE ? OR url LIKE ?) "
+                             "ORDER BY status, updated_at DESC LIMIT ?", (uid, uid, q, q, q, limit))
     else:
         rows = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND status!=0 ORDER BY completed_at DESC LIMIT ?",
                           (uid, uid, limit))
@@ -1390,7 +1476,72 @@ def section_delete(sid):
 
 TASK_FIELDS = ("list_id", "section_id", "parent_id", "title", "content", "priority",
                "due", "due_time", "reminders", "repeat", "repeat_from", "sort",
-               "pinned", "start", "duration", "assignee_id")
+               "pinned", "start", "duration", "assignee_id", "url")
+
+
+# ---------------------------------------------------------------- activity (task history)
+# Structured events, rendered (and translated) by the client: kind + data. Logged by the mutation
+# endpoints, never for noise (sort order, pin, reminders, private tags, view state). Repeated edits of
+# the same kind by the same user within ACT_MERGE_S update the last entry instead of adding lines
+# (typing in the title / description, clicking through dates).
+ACT_MERGE = {"title", "content", "due", "snooze", "priority", "assign", "list", "section", "repeat", "link", "parent"}
+ACT_MERGE_S = 600
+
+
+def log_act(c, tid, kind, data=None, uid=None):
+    if uid is None and has_request_context() and getattr(g, "user", None):
+        uid = g.user["id"]
+    ts, js = iso_ms(now_utc()), json.dumps(data or {}, ensure_ascii=False)
+    if kind in ACT_MERGE:
+        last = c.execute("SELECT id, user_id, kind, created_at FROM activity WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                         (tid,)).fetchone()
+        if last and last["kind"] == kind and last["user_id"] == uid \
+                and (now_utc() - parse_iso(last["created_at"])).total_seconds() < ACT_MERGE_S:
+            c.execute("UPDATE activity SET data=?, created_at=? WHERE id=?", (js, ts, last["id"]))
+            return
+    c.execute("INSERT INTO activity(task_id,user_id,kind,data,created_at) VALUES(?,?,?,?,?)", (tid, uid, kind, js, ts))
+
+
+def log_changes(c, tid, old, act=None):
+    """Compares the task row before a change (old) with the stored row now and logs what a person
+    would care about."""
+    new = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+    if not old or not new:
+        return
+    ch = lambda k: _norm(old[k]) != _norm(new[k])  # noqa: E731
+    if ch("title"):
+        log_act(c, tid, "title", {"to": new["title"][:200]})
+    if ch("content"):
+        log_act(c, tid, "content")
+    if ch("due") or ch("due_time") or ch("start"):
+        log_act(c, tid, "snooze" if act == "snooze" and new["due"] else "due",
+                {"due": new["due"], "time": new["due_time"], "start": new["start"]})
+    if ch("priority"):
+        log_act(c, tid, "priority", {"p": new["priority"]})
+    if ch("assignee_id"):
+        log_act(c, tid, "assign", {"to": new["assignee_id"], "from": old["assignee_id"]})
+    if ch("list_id"):
+        lst = c.execute("SELECT name, is_inbox FROM lists WHERE id=?", (new["list_id"],)).fetchone()
+        log_act(c, tid, "list", {"name": lst["name"] if lst else "", "inbox": bool(lst and lst["is_inbox"])})
+    elif ch("section_id") and not ch("parent_id"):  # indenting follows the parent's section: not a move
+        sec = c.execute("SELECT name FROM sections WHERE id=?", (new["section_id"],)).fetchone() if new["section_id"] else None
+        log_act(c, tid, "section", {"name": sec["name"] if sec else None})
+    if ch("parent_id"):
+        par = c.execute("SELECT title FROM tasks WHERE id=?", (new["parent_id"],)).fetchone() if new["parent_id"] else None
+        log_act(c, tid, "parent", {"title": par["title"][:200] if par else None})
+    if ch("repeat"):
+        log_act(c, tid, "repeat", {"rule": new["repeat"]})
+    if ch("url"):
+        log_act(c, tid, "link", {"url": new["url"]})
+
+
+def check_url(f):
+    """Normalizes f['url'] ('' -> NULL); error message if it is not an http(s) link."""
+    if "url" not in f:
+        return None
+    u = (f["url"] or "").strip() if isinstance(f["url"], (str, type(None))) else ""
+    f["url"] = u or None
+    return tr("The link must start with http:// or https://") if u and not valid_url(u) else None
 
 
 def clean_task(b):
@@ -1502,7 +1653,7 @@ def task_create():
     if f.get("section_id") and not c.execute("SELECT 1 FROM sections WHERE id=? AND list_id=?",
                                               (f["section_id"], f["list_id"])).fetchone():
         f["section_id"] = None
-    e = check_assignee(c, f["list_id"], f.get("assignee_id"))
+    e = check_assignee(c, f["list_id"], f.get("assignee_id")) or check_url(f)
     if e:
         return err(e)
     if "sort" not in f:
@@ -1513,11 +1664,18 @@ def task_create():
                                   (f["parent_id"],)).fetchone()[0]
     ts = iso(now_utc())
     f["created_by"] = me()
+    if f.get("assignee_id"):
+        f["assigned_by"] = me()
     cols = list(f) + ["created_at", "updated_at"]
     cur = c.execute(f"INSERT INTO tasks({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                     [f[k] for k in f] + [ts, ts])
     if b.get("tags"):
         set_tags(c, cur.lastrowid, b["tags"])
+    log_act(c, cur.lastrowid, "created")
+    if f.get("assignee_id"):
+        task_event(c, cur.lastrowid, "assign")
+    if f.get("parent_id"):
+        log_act(c, f["parent_id"], "subtask", {"id": cur.lastrowid, "title": f["title"][:200]})
     bump(c)
     c.commit()
     return jsonify(one_task(c, cur.lastrowid))
@@ -1567,7 +1725,10 @@ def apply_update(c, tid, b, conflicts=None):
     f = clean_task(b)
     if "title" in f and not f["title"]:
         return tr("Title missing")
-    cur = c.execute("SELECT start, due, list_id, section_id, assignee_id FROM tasks WHERE id=?", (tid,)).fetchone()
+    e = check_url(f)
+    if e:
+        return e
+    cur = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()  # also the "before" of the activity log
     if "start" in f or "due" in f:  # keep start <= due against the stored other half
         st, du = f.get("start", cur["start"]), f.get("due", cur["due"])
         if st and (not du or st > du):
@@ -1595,6 +1756,8 @@ def apply_update(c, tid, b, conflicts=None):
             return e
     elif lid != cur["list_id"] and cur["assignee_id"] and cur["assignee_id"] not in list_people(c, lid):
         f["assignee_id"] = None  # the assignee has no access to the new list
+    if "assignee_id" in f and _norm(f["assignee_id"]) != _norm(cur["assignee_id"]):
+        f["assigned_by"] = me() if f["assignee_id"] else None
     if f:
         # a changed date / reminder set re-arms the reminder
         if any(k in f for k in ("due", "due_time", "reminders", "assignee_id")):
@@ -1610,6 +1773,10 @@ def apply_update(c, tid, b, conflicts=None):
                     c.execute("UPDATE tasks SET assignee_id=NULL WHERE id=?", (d,))
             if "section_id" not in f:
                 c.execute("UPDATE tasks SET section_id=NULL WHERE id=?", (tid,))
+    if f:
+        log_changes(c, tid, cur, b.get("_act"))
+        new_a = c.execute("SELECT assignee_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        assignment_events(c, tid, cur["assignee_id"], new_a)
     if "tags" in b:
         set_tags(c, tid, b["tags"])
     elif "add_tags" in b:
@@ -1652,7 +1819,11 @@ def task_complete(tid):
     # the same recurring task ticked on two devices (one offline): only the first tick advances it
     if t["repeat"] and b.get("expect_due") and t["status"] == 0 and b["expect_due"] != t["due"]:
         return jsonify({**one_task(c, tid), "next_due": None, "skipped": True})
-    nxt = do_complete(c, tid, int(b.get("status", 2)))
+    st = int(b.get("status", 2))
+    nxt = do_complete(c, tid, st)
+    log_act(c, tid, "wont" if st == -1 else "reopen" if st == 0 else "complete", {"next": nxt} if nxt else None)
+    if st == 2:
+        task_event(c, tid, "complete")
     bump(c)
     c.commit()
     return jsonify({**one_task(c, tid), "next_due": nxt})
@@ -1711,6 +1882,7 @@ def task_skip(tid):
     rep_new = rr_with_count(t["repeat"], cnt - 1) if cnt else t["repeat"]
     c.execute("UPDATE tasks SET due=?, start=?, repeat=?, reminded='[]', updated_at=? WHERE id=?",
               (nxt, start, rep_new, iso(now_utc()), tid))
+    log_act(c, tid, "skip", {"next": nxt})
     bump(c)
     c.commit()
     return jsonify({**one_task(c, tid), "next_due": nxt})
@@ -1720,6 +1892,8 @@ def task_skip(tid):
 def task_reopen(tid):
     c = db()
     need_task(c, tid)
+    if c.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] != 0:
+        log_act(c, tid, "reopen")
     c.execute("UPDATE tasks SET status=0, completed_at=NULL, updated_at=? WHERE id=?", (iso(now_utc()), tid))
     bump(c)
     c.commit()
@@ -1736,6 +1910,7 @@ def task_delete(tid):
         c.execute("DELETE FROM tasks WHERE id=?", (tid,))
     else:
         do_delete(c, tid)
+        log_act(c, tid, "delete")
     bump(c)
     c.commit()
     unlink_files(files)
@@ -1760,6 +1935,8 @@ def task_restore(tid):
         # restoring a subtask whose parent is gone makes it top-level
         c.execute("""UPDATE tasks SET parent_id=NULL WHERE id=? AND parent_id IN
                      (SELECT id FROM tasks WHERE deleted_at IS NOT NULL)""", (tid,))
+        if r["deleted_at"]:
+            log_act(c, tid, "restore")
     bump(c)
     c.commit()
     return jsonify(ok=True)
@@ -1807,16 +1984,21 @@ def attachment_upload(tid):
     files = request.files.getlist("file")
     if not files:
         return err(tr("File missing"))
-    e = save_attachments(c, tid, files)
+    saved = []
+    e = save_attachments(c, tid, files, saved=saved)
     if e:
+        c.rollback()
+        unlink_files(saved)
         return err(e)
+    log_act(c, tid, "attach", {"names": [safe_name(f.filename) for f in files][:20], "n": len(files)})
     bump(c)
     c.commit()
     return jsonify(one_task(c, tid))
 
 
-def save_attachments(c, tid, files):
-    """Store uploaded werkzeug files for a task. Returns an error message or None (caller commits)."""
+def save_attachments(c, tid, files, comment_id=None, saved=None):
+    """Store uploaded werkzeug files for a task (or one of its comments). Returns an error message or
+    None (caller commits; on an error the caller rolls back and unlinks `saved`)."""
     os.makedirs(os.path.join(ATT_DIR, str(tid)), exist_ok=True)
     ts = iso(now_utc())
     for f in files:
@@ -1828,19 +2010,32 @@ def save_attachments(c, tid, files):
         if size > MAX_FILE_MB * 1024 * 1024:
             os.remove(full)
             return tr("{0}: larger than {1} MB", name, MAX_FILE_MB)
+        if saved is not None:
+            saved.append(rel)
         mime = (f.mimetype if f.mimetype and f.mimetype != "application/octet-stream" else None) \
             or mimetypes.guess_type(name)[0] or "application/octet-stream"
-        c.execute("INSERT INTO attachments(task_id,name,mime,size,path,created_at) VALUES(?,?,?,?,?,?)",
-                  (tid, name, mime, size, rel, ts))
-    c.execute("UPDATE tasks SET updated_at=? WHERE id=?", (ts, tid))
+        c.execute("INSERT INTO attachments(task_id,name,mime,size,path,created_at,comment_id) VALUES(?,?,?,?,?,?,?)",
+                  (tid, name, mime, size, rel, ts, comment_id))
+    if comment_id is None:
+        c.execute("UPDATE tasks SET updated_at=? WHERE id=?", (ts, tid))
     return None
 
 
 def need_attachment(c, aid, write):
+    """Task files: read = sees the task, write = may change it. Comment files: read = sees the task
+    (and the comment is not deleted), write = the comment's author (or the list owner, moderation)."""
     a = c.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
     if not a:
         raise Denied(404)
-    need_task(c, a["task_id"], write)
+    if a["comment_id"] is None:
+        need_task(c, a["task_id"], write)
+        return a
+    role = need_task(c, a["task_id"], write=False)
+    cm = c.execute("SELECT user_id, deleted_at FROM comments WHERE id=?", (a["comment_id"],)).fetchone()
+    if not cm or cm["deleted_at"]:
+        raise Denied(404)
+    if write and cm["user_id"] != me() and role != "owner":
+        raise Denied(403)
     return a
 
 
@@ -1949,6 +2144,7 @@ def paperless_link(tid):
         c.execute("""INSERT INTO paperless_links(task_id,doc_id,title,correspondent,created,status,added_at)
                      VALUES(?,?,?,?,?,'ok',?)""", (tid, d["doc_id"], d["title"], d["correspondent"], d["created"],
                                                   iso(now_utc())))
+        log_act(c, tid, "paperless", {"title": d["title"]})
         bump(c)
         c.commit()
     return jsonify(one_task(c, tid))
@@ -1957,11 +2153,12 @@ def paperless_link(tid):
 @app.delete("/api/paperless-links/<int:lid>")
 def paperless_unlink(lid):
     c = db()
-    r = c.execute("SELECT task_id FROM paperless_links WHERE id=?", (lid,)).fetchone()
+    r = c.execute("SELECT task_id, title FROM paperless_links WHERE id=?", (lid,)).fetchone()
     if not r:
         return err(tr("unknown"), 404)
     need_task(c, r["task_id"])
     c.execute("DELETE FROM paperless_links WHERE id=?", (lid,))
+    log_act(c, r["task_id"], "paperless_rm", {"title": r["title"]})
     bump(c)
     c.commit()
     return jsonify(one_task(c, r["task_id"]))
@@ -1989,6 +2186,8 @@ def attachment_to_paperless(aid):
     the watchdog then swaps it for the real document and removes the local copy."""
     c = db()
     a = need_attachment(c, aid, True)
+    if a["comment_id"] is not None:
+        return err(tr("Files in comments cannot be sent to Paperless"))
     if c.execute("SELECT 1 FROM paperless_links WHERE att_id=? AND status='pending'", (aid,)).fetchone():
         return err(tr("Already being sent to Paperless"))
     with open(os.path.join(ATT_DIR, a["path"]), "rb") as f:
@@ -2001,6 +2200,7 @@ def attachment_to_paperless(aid):
     c.execute("""INSERT INTO paperless_links(task_id,title,status,message,ptask,att_id,added_at)
                  VALUES(?,?,'pending','Paperless verarbeitet das Dokument…',?,?,?)""",
               (a["task_id"], title, str(ptask), aid, iso(now_utc())))
+    log_act(c, a["task_id"], "paperless_send", {"name": a["name"]})
     bump(c)
     c.commit()
     return jsonify(one_task(c, a["task_id"]))
@@ -2085,10 +2285,14 @@ def attachment_delete(aid):
     c = db()
     a = need_attachment(c, aid, True)
     c.execute("DELETE FROM attachments WHERE id=?", (aid,))
+    if a["comment_id"] is None:
+        log_act(c, a["task_id"], "attach_rm", {"name": a["name"]})
+    else:
+        c.execute("UPDATE comments SET edited_at=? WHERE id=?", (iso(now_utc()), a["comment_id"]))
     bump(c)
     c.commit()
     unlink_files([a["path"]])
-    return jsonify(one_task(c, a["task_id"]))
+    return jsonify(one_task(c, a["task_id"]) if a["comment_id"] is None else {"ok": True})
 
 
 @app.post("/api/tasks/reorder")
@@ -2122,7 +2326,9 @@ def task_reorder():
             if lid != cur["list_id"] and cur["assignee_id"] and cur["assignee_id"] not in list_people(c, lid):
                 f["assignee_id"] = None
             f["updated_at"] = ts
+            before = c.execute("SELECT * FROM tasks WHERE id=?", (it["id"],)).fetchone()
             c.execute(f"UPDATE tasks SET {','.join(k + '=?' for k in f)} WHERE id=?", [*f.values(), it["id"]])
+            log_changes(c, it["id"], before)
             if "list_id" in f:
                 for d in descendants(c, it["id"]):
                     c.execute("UPDATE tasks SET list_id=? WHERE id=?", (f["list_id"], d))
@@ -2152,11 +2358,17 @@ def task_batch():
                     errors.append(e)
                     continue
             elif action == "complete":
-                do_complete(c, tid, int(data.get("status", 2)))
+                st = int(data.get("status", 2))
+                nxt = do_complete(c, tid, st)
+                log_act(c, tid, "wont" if st == -1 else "reopen" if st == 0 else "complete", {"next": nxt} if nxt else None)
+                if st == 2:
+                    task_event(c, tid, "complete")
             elif action == "reopen":
                 c.execute("UPDATE tasks SET status=0, completed_at=NULL, updated_at=? WHERE id=?", (ts, tid))
+                log_act(c, tid, "reopen")
             elif action == "delete":
                 do_delete(c, tid)
+                log_act(c, tid, "delete")
             done += 1
         except Denied as e:
             errors.append(tr("No permission (view only)") if e.code == 403 else tr("unknown"))
@@ -2189,6 +2401,343 @@ def occurrences():
         except (ValueError, TypeError):
             continue
     return jsonify(items=out)
+
+
+# ---------------------------------------------------------------- comments + activity timeline
+# Everyone who sees a task may comment on it (view-only members too; they still cannot change the
+# task). A private task's comments are a personal log. Authors edit / delete their own comments; the
+# list owner may delete any comment in the list (moderation). Admins have no extra rights here.
+# Deleted comments disappear (soft delete: body, mentions and files are wiped).
+# Mentions are stored as <@user_id> tokens (+ comments.mentions); only people who see the task count.
+MAX_COMMENT = 10000
+MENTION_RE = re.compile(r"<@(\d+)>")
+
+
+def user_names(c, ids):
+    ids = [i for i in set(ids) if i]
+    if not ids:
+        return {}
+    q = ",".join("?" * len(ids))
+    return {r["id"]: r["display_name"] or r["username"]
+            for r in c.execute(f"SELECT id, username, display_name FROM users WHERE id IN ({q})", ids)}
+
+
+def task_people(c, lid):
+    """Enabled users who can see the tasks of a list (owner + members): the mention picker."""
+    ids = list_people(c, lid)
+    q = ",".join("?" * len(ids)) or "NULL"
+    return [{"id": r["id"], "name": r["display_name"] or r["username"]}
+            for r in c.execute(f"SELECT id, username, display_name FROM users WHERE id IN ({q}) AND disabled=0 ORDER BY id",
+                               list(ids))]
+
+
+def clean_mentions(c, lid, text):
+    """Keeps <@id> tokens of people who see the list; any other token becomes plain '@name'."""
+    allowed = {p["id"] for p in task_people(c, lid)}
+    names = user_names(c, [int(x) for x in MENTION_RE.findall(text)])
+    found = []
+
+    def sub(m):
+        uid = int(m.group(1))
+        if uid in allowed:
+            found.append(uid)
+            return m.group(0)
+        return "@" + names.get(uid, "?")
+    text = MENTION_RE.sub(sub, text)
+    return text, list(dict.fromkeys(found))
+
+
+def comment_plain(c, text, names=None):
+    """Comment text for a push: tokens -> @name, whitespace collapsed."""
+    names = names or user_names(c, [int(x) for x in MENTION_RE.findall(text)])
+    return re.sub(r"\s+", " ", MENTION_RE.sub(lambda m: "@" + names.get(int(m.group(1)), "?"), text)).strip()
+
+
+def att_dicts(c, where, args):
+    out = {}
+    for a in c.execute(f"SELECT id, comment_id, name, mime, size, created_at FROM attachments WHERE {where} ORDER BY id", args):
+        out.setdefault(a["comment_id"], []).append({k: a[k] for k in ("id", "name", "mime", "size", "created_at")})
+    return out
+
+
+def comment_dict(r, atts):
+    return {"id": r["id"], "user_id": r["user_id"], "body": r["body"], "created_at": r["created_at"],
+            "edited_at": r["edited_at"], "mentions": [int(x) for x in (r["mentions"] or "").split(",") if x],
+            "attachments": atts.get(r["id"], [])}
+
+
+def need_live_comment(c, cid):
+    """(comment row, my role in its list): 404 if the comment is gone or its task is not visible."""
+    r = c.execute("SELECT * FROM comments WHERE id=? AND deleted_at IS NULL", (cid,)).fetchone()
+    if not r:
+        raise Denied(404)
+    return r, need_task(c, r["task_id"], write=False)
+
+
+@app.get("/api/tasks/<int:tid>/timeline")
+def timeline(tid):
+    """Comments + activity of a task (loaded when the detail panel opens) and the mention picker."""
+    c = db()
+    role = need_task(c, tid, write=False)
+    t = c.execute("SELECT list_id FROM tasks WHERE id=?", (tid,)).fetchone()
+    rows = c.execute("SELECT * FROM comments WHERE task_id=? AND deleted_at IS NULL ORDER BY id", (tid,)).fetchall()
+    atts = att_dicts(c, "task_id=? AND comment_id IS NOT NULL", (tid,))
+    acts = [{"id": a["id"], "user_id": a["user_id"], "kind": a["kind"], "data": json.loads(a["data"] or "{}"),
+             "created_at": a["created_at"]}
+            for a in c.execute("SELECT * FROM activity WHERE task_id=? ORDER BY id", (tid,))]
+    comments = [comment_dict(r, atts) for r in rows]
+    ids = {x["user_id"] for x in comments + acts} | {m for x in comments for m in x["mentions"]} \
+        | {a["data"].get("to") for a in acts if a["kind"] == "assign"}
+    seen = c.execute("SELECT seen_id FROM task_seen WHERE user_id=? AND task_id=?", (me(), tid)).fetchone()
+    return jsonify(comments=comments, activity=acts, users={str(k): v for k, v in user_names(c, ids).items()},
+                   people=task_people(c, t["list_id"]), seen=seen[0] if seen else 0, moderator=role == "owner")
+
+
+@app.post("/api/tasks/<int:tid>/seen")
+def timeline_seen(tid):
+    """Marks every comment of the task as seen by me (no version bump: only my unread dot changes)."""
+    c = db()
+    need_task(c, tid, write=False)
+    top = c.execute("SELECT COALESCE(MAX(id),0) FROM comments WHERE task_id=?", (tid,)).fetchone()[0]
+    c.execute("INSERT INTO task_seen(user_id,task_id,seen_id) VALUES(?,?,?) "
+              "ON CONFLICT(user_id,task_id) DO UPDATE SET seen_id=MAX(seen_id, excluded.seen_id)", (me(), tid, top))
+    c.commit()
+    return jsonify(ok=True, seen=top)
+
+
+def comment_input():
+    """(text, files) from a JSON body or a multipart form (comment with files)."""
+    if request.files or request.form:
+        return (request.form.get("body") or "").strip(), [f for f in request.files.getlist("file") if f and f.filename]
+    return (body().get("body") or "").strip(), []
+
+
+@app.post("/api/tasks/<int:tid>/comments")
+def comment_create(tid):
+    c = db()
+    need_task(c, tid, write=False)  # view-only members may comment
+    t = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+    if t["deleted_at"]:
+        return err(tr("The task is in the trash"), 409)
+    text, files = comment_input()
+    if len(text) > MAX_COMMENT:
+        return err(tr("The comment is too long (max. {0} characters)", MAX_COMMENT))
+    if not text and not files:
+        return err(tr("The comment is empty"))
+    text, mentions = clean_mentions(c, t["list_id"], text)
+    cid = c.execute("INSERT INTO comments(task_id,user_id,body,mentions,created_at) VALUES(?,?,?,?,?)",
+                    (tid, me(), text, ",".join(map(str, mentions)), iso_ms(now_utc()))).lastrowid
+    saved = []
+    e = save_attachments(c, tid, files, comment_id=cid, saved=saved) if files else None
+    if e:
+        c.rollback()
+        unlink_files(saved)
+        return err(e)
+    c.execute("INSERT INTO task_seen(user_id,task_id,seen_id) VALUES(?,?,?) "
+              "ON CONFLICT(user_id,task_id) DO UPDATE SET seen_id=MAX(seen_id, excluded.seen_id)", (me(), tid, cid))
+    pushes = comment_pushes(c, t, cid, text, mentions, mentions, len(files))
+    bump(c)
+    c.commit()
+    send_pushes(pushes)
+    r = c.execute("SELECT * FROM comments WHERE id=?", (cid,)).fetchone()
+    return jsonify(comment_dict(r, att_dicts(c, "comment_id=?", (cid,))))
+
+
+@app.patch("/api/comments/<int:cid>")
+def comment_update(cid):
+    """Only the author edits a comment; people mentioned for the first time are notified."""
+    c = db()
+    r, _ = need_live_comment(c, cid)
+    if r["user_id"] != me():
+        return err(tr("Only the author can edit this comment"), 403)
+    t = c.execute("SELECT * FROM tasks WHERE id=?", (r["task_id"],)).fetchone()
+    text = (body().get("body") or "").strip()
+    if len(text) > MAX_COMMENT:
+        return err(tr("The comment is too long (max. {0} characters)", MAX_COMMENT))
+    nfiles = c.execute("SELECT COUNT(*) FROM attachments WHERE comment_id=?", (cid,)).fetchone()[0]
+    if not text and not nfiles:
+        return err(tr("The comment is empty"))
+    text, mentions = clean_mentions(c, t["list_id"], text)
+    old = {int(x) for x in (r["mentions"] or "").split(",") if x}
+    c.execute("UPDATE comments SET body=?, mentions=?, edited_at=? WHERE id=?",
+              (text, ",".join(map(str, mentions)), iso(now_utc()), cid))
+    new_m = [m for m in mentions if m not in old]
+    pushes = comment_pushes(c, t, cid, text, mentions, new_m, 0, only=new_m) if new_m and not t["deleted_at"] else []
+    bump(c)
+    c.commit()
+    send_pushes(pushes)
+    return jsonify(comment_dict(c.execute("SELECT * FROM comments WHERE id=?", (cid,)).fetchone(),
+                                att_dicts(c, "comment_id=?", (cid,))))
+
+
+@app.delete("/api/comments/<int:cid>")
+def comment_delete(cid):
+    """Author, or the owner of the list (moderation). The comment disappears with its files."""
+    c = db()
+    r, role = need_live_comment(c, cid)
+    if r["user_id"] != me() and role != "owner":
+        return err(tr("Only the author or the list owner can delete this comment"), 403)
+    files = [a[0] for a in c.execute("SELECT path FROM attachments WHERE comment_id=?", (cid,))]
+    c.execute("DELETE FROM attachments WHERE comment_id=?", (cid,))
+    c.execute("UPDATE comments SET body='', mentions='', deleted_at=? WHERE id=?", (iso(now_utc()), cid))
+    bump(c)
+    c.commit()
+    unlink_files(files)
+    return jsonify(ok=True)
+
+
+# ---- collaboration pushes (module "collab" of the recipient must be on; never to the person who acted;
+# only users who still see the task; each via their own ntfy topic, in their own language; click opens it)
+#  - comment: assignee, creator, everyone who commented before + mentioned people (even non-participants)
+#  - assign / unassign: the new assignee / the previous one when someone else (re)assigns the task
+#  - complete: creator + whoever assigned it, when someone else completes a task in a shared list
+# Burst rule, shared by all of them (per recipient and task): the first push goes out right away; anything
+# else on that task in the next TASK_PUSH_GAP seconds is only counted, and once that minute is over the
+# watchdog sends ONE summary ("2 more comments · 1 more change", "you were mentioned").
+TASK_PUSH_GAP = int(os.environ.get("TASKS_PUSH_GAP", "60"))  # seconds
+
+
+def collab_on(s):
+    return "collab" in (s.get("features") or "").split(",")
+
+
+def push_target(c, uid, lid):
+    """Settings of a user who may get a collaboration push about a task in list lid, else None."""
+    u = c.execute("SELECT disabled FROM users WHERE id=?", (uid,)).fetchone()
+    if not u or u["disabled"] or not list_role(c, lid, uid):
+        return None
+    s = usettings(c, uid)
+    return s if collab_on(s) and s.get("ntfy_topic") else None
+
+
+def burst_gate(c, uid, tid, mentioned=False, event=False):
+    """True = push now (time remembered); False = counted for the watchdog's summary."""
+    now = time.time()
+    st = c.execute("SELECT sent_at FROM task_push WHERE user_id=? AND task_id=?", (uid, tid)).fetchone()
+    if st and now - st["sent_at"] < TASK_PUSH_GAP:
+        c.execute("""UPDATE task_push SET pending=pending+?, events=events+?, mentioned=MAX(mentioned,?)
+                     WHERE user_id=? AND task_id=?""", (0 if event else 1, 1 if event else 0, 1 if mentioned else 0, uid, tid))
+        return False
+    c.execute("INSERT INTO task_push(user_id,task_id,sent_at) VALUES(?,?,?) ON CONFLICT(user_id,task_id) "
+              "DO UPDATE SET sent_at=excluded.sent_at, pending=0, events=0, mentioned=0", (uid, tid, now))
+    return True
+
+
+def lang_of(s):
+    return s.get("lang") if s.get("lang") in LANGS else "en"
+
+
+def comment_pushes(c, t, cid, text, mentions, notify_mentions, nfiles, only=None):
+    """Decides who gets a push for this comment (burst state updated in c, caller commits).
+    Returns [(topic, title, message, click)] to send after the commit."""
+    author = me()
+    ids = {t["assignee_id"], t["created_by"]} | set(notify_mentions)
+    ids |= {r[0] for r in c.execute("SELECT DISTINCT user_id FROM comments WHERE task_id=? AND deleted_at IS NULL", (t["id"],))}
+    if only is not None:
+        ids = set(only)
+    ids.discard(None)
+    ids.discard(author)
+    if not ids:
+        return []
+    names = user_names(c, [author] + [int(x) for x in MENTION_RE.findall(text)])
+    snippet = comment_plain(c, text, names)
+    snippet = snippet[:280] + ("…" if len(snippet) > 280 else "")
+    out = []
+    for uid in sorted(ids):
+        s = push_target(c, uid, t["list_id"])
+        mentioned = uid in notify_mentions
+        if not s or not burst_gate(c, uid, t["id"], mentioned=mentioned):
+            continue
+        lg = lang_of(s)
+        what = snippet or trn("{0} file", "{0} files", nfiles, lg=lg)
+        who = names.get(author, "?")
+        msg = tr("{0} mentioned you: {1}", who, what, lg=lg) if mentioned else tr("{0} commented: {1}", who, what, lg=lg)
+        out.append((s["ntfy_topic"], t["title"], msg, f"{PUBLIC_URL}/#t/{t['id']}"))
+    return out
+
+
+def push_day(due, due_time, lg):
+    day = tr("today", lg=lg) if due == local_now().date().isoformat() else \
+        date.fromisoformat(due).strftime("%d.%m." if lg == "de" else "%d %b")
+    return day + (" " + due_time if due_time else "")
+
+
+def task_event(c, tid, kind, prev_assignee=None):
+    """assign / unassign / complete pushes; queued in g.pushes and sent once the request succeeded."""
+    actor = me()
+    t = c.execute("""SELECT t.*, l.name AS list_name, l.is_inbox AS list_inbox FROM tasks t JOIN lists l ON l.id=t.list_id
+                     WHERE t.id=?""", (tid,)).fetchone()
+    if not t or t["deleted_at"]:
+        return
+    if kind == "assign":
+        rcpt = {t["assignee_id"]}
+    elif kind == "unassign":
+        rcpt = {prev_assignee}
+    else:  # complete: only in shared lists (in a private list the creator is the one completing)
+        if not c.execute("SELECT 1 FROM list_members WHERE list_id=?", (t["list_id"],)).fetchone():
+            return
+        rcpt = {t["created_by"], t["assigned_by"]}
+    rcpt.discard(None)
+    rcpt.discard(actor)
+    who = user_names(c, [actor]).get(actor, "?")
+    for uid in sorted(rcpt):
+        s = push_target(c, uid, t["list_id"])
+        if not s or not burst_gate(c, uid, tid, event=True):
+            continue
+        lg = lang_of(s)
+        lname = tr("Inbox", lg=lg) if t["list_inbox"] and t["list_name"] == "Eingang" else t["list_name"]
+        if kind == "assign":
+            title = tr("{0} assigned you: {1}", who, t["title"], lg=lg)
+            msg = lname + (" · " + tr("due {0}", push_day(t["due"], t["due_time"], lg), lg=lg) if t["due"] else "")
+        elif kind == "unassign":
+            title, msg = tr("{0} unassigned you from: {1}", who, t["title"], lg=lg), lname
+        else:
+            title, msg = tr("{0} completed: {1}", who, t["title"], lg=lg), lname
+        g.pushes.append((s["ntfy_topic"], title, msg, f"{PUBLIC_URL}/#t/{tid}"))
+
+
+def assignment_events(c, tid, old_assignee, new_assignee):
+    if old_assignee == new_assignee:
+        return
+    if new_assignee:
+        task_event(c, tid, "assign")
+    if old_assignee:
+        task_event(c, tid, "unassign", prev_assignee=old_assignee)
+
+
+def send_pushes(pushes):
+    if pushes:
+        threading.Thread(target=lambda: [ntfy(ti, m, "default", cl, topic=tp) for tp, ti, m, cl in pushes],
+                         daemon=True).start()
+
+
+@app.after_request
+def send_queued_pushes(resp):
+    p = g.pop("pushes", None) if has_request_context() else None
+    if p and resp.status_code < 400:
+        send_pushes(p)
+    return resp
+
+
+def task_push_tick(c, users, S, LG):
+    """Watchdog: one summary push for everything collected during the burst window."""
+    now = time.time()
+    rows = c.execute("""SELECT p.*, t.title, t.list_id, t.deleted_at FROM task_push p JOIN tasks t ON t.id=p.task_id
+                        WHERE (p.pending>0 OR p.events>0) AND p.sent_at<=?""", (now - TASK_PUSH_GAP,)).fetchall()
+    for p in rows:
+        c.execute("UPDATE task_push SET sent_at=?, pending=0, events=0, mentioned=0 WHERE user_id=? AND task_id=?",
+                  (now, p["user_id"], p["task_id"]))
+        c.commit()
+        uid = p["user_id"]
+        if uid not in users or p["deleted_at"] or not collab_on(S[uid]) or not list_role(c, p["list_id"], uid):
+            continue
+        lg = LG[uid]
+        parts = ([trn("{0} more comment", "{0} more comments", p["pending"], lg=lg)] if p["pending"] else []) + \
+            ([trn("{0} more change", "{0} more changes", p["events"], lg=lg)] if p["events"] else []) + \
+            ([tr("you were mentioned", lg=lg)] if p["mentioned"] else [])
+        ntfy(p["title"], " · ".join(parts), "default", f"{PUBLIC_URL}/#t/{p['task_id']}", topic=S[uid]["ntfy_topic"])
+    c.execute("DELETE FROM task_push WHERE pending=0 AND events=0 AND sent_at<?", (now - 86400,))
+    c.commit()
 
 
 # ---------------------------------------------------------------- habits (private per user)
@@ -2369,8 +2918,8 @@ def ntfy_test():
 
 @app.get("/api/export.json")
 def export_json():
-    """My data: lists I own (also shared ones, with their tasks / sections / files), my tags,
-    habits, focus sessions, filters and settings. Attachment files stay in data/attachments/."""
+    """My data: lists I own (also shared ones, with their tasks incl. link / sections / files / comments /
+    activity), my tags, habits, focus sessions, filters and settings. Attachment files stay in data/attachments/."""
     c = db()
     uid = me()
     own = "(SELECT id FROM lists WHERE owner_id=?)"
@@ -2387,6 +2936,8 @@ def export_json():
         "filters": ("SELECT * FROM filters WHERE user_id=?", (uid,)),
         "attachments": (f"SELECT * FROM attachments WHERE task_id IN {task_ids}", (uid,)),
         "paperless_links": (f"SELECT * FROM paperless_links WHERE task_id IN {task_ids}", (uid,)),
+        "comments": (f"SELECT * FROM comments WHERE task_id IN {task_ids} AND deleted_at IS NULL", (uid,)),
+        "activity": (f"SELECT * FROM activity WHERE task_id IN {task_ids}", (uid,)),
         "settings": ("SELECT key, value FROM user_settings WHERE user_id=?", (uid,)),
     }
     data = {t: [dict(r) for r in c.execute(sql, args)] for t, (sql, args) in q.items()}
@@ -2744,6 +3295,7 @@ def watchdog_tick(c):
     users = {r["id"]: r for r in c.execute("SELECT * FROM users WHERE disabled=0")}
     S = {uid: usettings(c, uid) for uid in users}
     LG = {uid: s.get("lang") if s.get("lang") in LANGS else "en" for uid, s in S.items()}
+    task_push_tick(c, users, S, LG)
     now = local_now()
     # task reminders -- fire once per (due, offset); skip if missed by > 6 h. Goes to the assignee,
     # unassigned tasks to their creator.

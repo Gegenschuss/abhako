@@ -1,4 +1,4 @@
-/* Abhako — self-hosted task manager inspired by TickTick. Vanilla JS, no build step.
+/* Abhako — self-hosted task manager inspired by TickTick and Asana. Vanilla JS, no build step.
    State lives on the server (SQLite); the client keeps a copy, renders views
    from it and polls /api/version to pick up changes from other devices. */
 'use strict';
@@ -65,6 +65,9 @@ const P = {
   user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
   key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  comment: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
 };
 const ic = (n, c = '') => `<svg class="i ${c}" viewBox="0 0 24 24">${P[n] || ''}</svg>`;
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
@@ -126,9 +129,13 @@ const S = {
   calMonth: null, calSel: today(), quick: {ignore: new Set()},
   filters: [], multi: new Set(), multiMode: false, occ: {key: '', items: []},
   calMode: LS.get('calMode', 'month'), tlStart: null, quickPreset: {}, editContent: false,
+  tl: {id: null}, drafts: {}, cfiles: {}, cedit: null, editLink: false,  // comments timeline of the open task
 };
-const FEATS = [['cal', N_('Calendar')], ['timeline', N_('Timeline')], ['matrix', N_('Eisenhower matrix')], ['habits', N_('Habits')], ['pomo', N_('Focus (Pomodoro)')], ['kanban', N_('Kanban')], ['paperless', N_('Paperless link')]];
+const FEATS = [['cal', N_('Calendar')], ['timeline', N_('Timeline')], ['matrix', N_('Eisenhower matrix')], ['habits', N_('Habits')], ['pomo', N_('Focus (Pomodoro)')], ['kanban', N_('Kanban')], ['paperless', N_('Paperless link')], ['collab', N_('Collaboration')], ['links', N_('Website link')]];
+const FEAT_DESC = {collab: N_('Comments, activity history, @mentions, sharing lists and assigning tasks'), links: N_('One website link per task, shown as a small chip')};
 const feat = f => (S.settings.features ?? FEATS.map(x => x[0]).join(',')).split(',').includes(f);
+// collaboration module off: no comments / activity / mentions / sharing / assigning in the UI (data stays, API works)
+const collab = () => feat('collab');
 const inbox = () => S.lists.find(l => l.is_inbox);
 const listById = id => S.lists.find(l => l.id === id);
 // sharing: role of the logged-in user in a list (owner | edit | view); view = read only
@@ -136,7 +143,7 @@ const listRole = id => listById(id)?.role || 'owner';
 const canEditList = id => listRole(id) !== 'view';
 const canEdit = t => !!t && canEditList(t.list_id);
 const isOwner = l => !l || !l.role || l.role === 'owner';
-const hasSharing = () => S.lists.some(l => l.shared);
+const hasSharing = () => collab() && S.lists.some(l => l.shared);
 const listPeople = l => !l ? [] : [{user_id: l.owner_id, name: l.owner_name || S.me?.display_name || '', role: 'owner'}, ...(l.members || [])];
 const personName = (lid, uid) => listPeople(listById(lid)).find(p => p.user_id === uid)?.name || '';
 const initials = n => String(n || '?').trim().split(/\s+/).slice(0, 2).map(w => w[0] || '').join('').toUpperCase() || '?';
@@ -170,7 +177,7 @@ async function rawFetch(method, url, body) {
   if (!r.ok) { const e = new Error(j.error || tr('Error {0}', r.status)); e.status = r.status; throw e; }
   return j;
 }
-const queueable = (method, url) => method !== 'GET' && /^\/api\/(tasks|habits\/\d+\/log)/.test(url);
+const queueable = (method, url) => method !== 'GET' && /^\/api\/(tasks|habits\/\d+\/log)/.test(url) && !/\/(comments|seen|timeline)$/.test(url);
 async function api(method, url, body) {
   if (queueable(method, url) && !(body instanceof FormData) && OUT.q.length) return enqueue(method, url, body);
   try { return await rawFetch(method, url, body); }
@@ -204,7 +211,7 @@ function applyLocal(e) {
     const par = body.parent_id && S.tasks.get(body.parent_id);
     const t = {id: e.tmp, list_id: body.list_id || (par ? par.list_id : inbox().id), section_id: body.section_id ?? null, parent_id: body.parent_id ?? null,
       title: body.title, content: body.content || '', priority: body.priority || 0, status: 0, due: body.due || null, due_time: body.due_time || null,
-      reminders: body.reminders || '', repeat: body.repeat || '', repeat_from: body.repeat_from || 'due',
+      reminders: body.reminders || '', repeat: body.repeat || '', repeat_from: body.repeat_from || 'due', url: body.url || null,
       sort: par ? 1e9 : Math.min(0, ...[...S.tasks.values()].map(x => x.sort)) - 1,
       created_at: nowIso, updated_at: nowIso, completed_at: null, deleted_at: null, tags: body.tags || []};
     S.tasks.set(t.id, t); return t;
@@ -270,7 +277,7 @@ window.addEventListener('online', () => flush());
 
 // ------------------------------------------------------------------ conflicts (edited here and elsewhere)
 S.conflicts = LS.get('conflicts', []);
-const FIELD_NAMES = {title: N_('Title'), content: N_('Description'), due: N_('Date'), due_time: N_('Time'), priority: N_('Priority'), list_id: N_('List'), tags: N_('Tags'), reminders: N_('Reminder'), repeat: N_('Repeat'), repeat_from: N_('Repeat from'), start: N_('Start|date'), section_id: N_('Section'), parent_id: N_('Parent task'), pinned: N_('Pinned'), duration: N_('Duration')};
+const FIELD_NAMES = {title: N_('Title'), content: N_('Description'), due: N_('Date'), due_time: N_('Time'), priority: N_('Priority'), list_id: N_('List'), tags: N_('Tags'), reminders: N_('Reminder'), repeat: N_('Repeat'), repeat_from: N_('Repeat from'), start: N_('Start|date'), section_id: N_('Section'), parent_id: N_('Parent task'), pinned: N_('Pinned'), duration: N_('Duration'), url: N_('Link')};
 function addConflicts(tid, list, title) {
   for (const c of list) {
     S.conflicts = S.conflicts.filter(x => !(x.tid === tid && x.field === c.field));
@@ -353,6 +360,7 @@ async function load() {
   applyState(j);
   LS.set('cache', j);
   if (S.extra) await loadExtra().catch(() => {});
+  if (S.sel && collab() && S.tl.id === S.sel && S.tl.v !== S.v) loadTimeline(S.sel);
 }
 async function loadExtra() {
   const k = S.route.key;
@@ -447,6 +455,8 @@ function parseQuick(text, ignore = new Set()) {
     const m = s.match(re);
     if (m) { const label = fn(m); if (label !== false) { out.chips.push({type, label}); s = s.replace(m[0], ' '); } }
   };
+  // website link (module "links"): the first http(s) URL goes into the link field, not the title
+  if (feat('links')) take(/\s(https?:\/\/[^\s]+)(?=\s)/i, 'link', m => { out.url = m[1].replace(/[.,;:!?]+$/, ''); return urlHost(out.url); });
   // repeat (before dates, "jeden montag" contains a weekday)
   take(new RegExp(`\\s(täglich|jeden tag|daily|every day|werktags|jeden werktag|weekdays|every weekday|wöchentlich|jede woche|weekly|every week|monatlich|jeden monat|monthly|every month|jährlich|jedes jahr|yearly|annually|every year|(?:jeden|every) (${WDAY_RE})|(?:alle|every) (\\d+) (tage|wochen|monate|days?|weeks?|months?))(?=\\s)`, 'i'), 'repeat', m => {
     const w = m[1].toLowerCase();
@@ -511,6 +521,20 @@ const listName = n => String(n ?? '').replace(/^((?:\p{Extended_Pictographic}|\p
 // display name of a list object: the inbox is stored as "Eingang" and shown in the UI language
 const lname = l => !l ? '' : l.is_inbox && l.name === 'Eingang' ? tr('Inbox') : listName(l.name);
 const norm = s => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+// website link display: domain without www. (chip), domain + path (title of a bare shared link)
+const urlParse = u => { try { return new URL(u); } catch { return null; } };
+const urlHost = u => { const x = urlParse(u); return x ? x.hostname.replace(/^www\./, '') : String(u || ''); };
+const urlTitle = u => { const x = urlParse(u); return x ? (x.hostname.replace(/^www\./, '') + x.pathname.replace(/\/+$/, '')).slice(0, 120) : String(u || '').slice(0, 120); };
+// shared text -> [link, text without it]: the first http(s) URL, trailing punctuation is not part of it
+function shareLink(text, url) {
+  text = String(text || '');
+  const clean = s => s.replace(/\s+/g, ' ').trim().replace(/^[-–—|:·\s]+|[-–—|:·\s]+$/g, '');
+  if (url) return [url, clean(text.replace(url, ''))];
+  const m = text.match(/https?:\/\/\S+/);
+  if (!m) return ['', clean(text)];
+  return [m[0].replace(/[.,;:!?]+$/, ''), clean(text.slice(0, m.index) + text.slice(m.index + m[0].length))];
+}
+const validUrl = u => /^https?:\/\/[^\s/?#]+\S*$/i.test(u || '') && u.length <= 2000;
 const nowHM = () => { const d = new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 function nextOrToday(wd) { const t = pd(today()); return addDays(today(), (wd - t.getDay() + 7) % 7); }
 
@@ -715,6 +739,7 @@ function tabItem(id) {
     if (!md || (v !== 'tasks' && !feat(v))) return null;
     return {id, go: modHash(v), icon: ic(md[1], 'l'), label: tr(md[2]), mod: v};
   }
+  if (kind === 's' && v === 'assigned' && !collab()) return null;
   if (kind === 's' && SMART[v]) return {id, go: v, icon: ic(SMART[v].icon, 'l'), label: v === 'week' ? tr('7 days') : tr(SMART[v].name), key: v};
   if (kind === 'l') {
     const l = listById(+v); if (!l || l.is_inbox) return null;
@@ -793,7 +818,7 @@ function renderSide() {
   const lists = S.lists.filter(l => !l.is_inbox && !l.archived);
   const listRow = l => {
     const sw = l.color || /^\p{L}/u.test(l.name) ? `<span class="sw" style="${l.color ? 'background:' + l.color : ''}"></span>` : '';
-    const shr = l.shared ? `<span class="shr" title="${esc(isOwner(l) ? tr('Shared by you') : tr('Shared by {0}', l.owner_name))}">${ic('users', 's')}</span>` : '';
+    const shr = l.shared && collab() ? `<span class="shr" title="${esc(isOwner(l) ? tr('Shared by you') : tr('Shared by {0}', l.owner_name))}">${ic('users', 's')}</span>` : '';
     if (S.listReorder) return `<div class="srow reorder" data-list="${l.id}">${sw}<span class="n">${esc(listName(l.name))}</span>${shr}<button class="iconbtn" data-lfolder="${l.id}" title="${tr('Move to folder')}">${ic('folder', 's')}</button><button class="iconbtn" data-lmove="-1" data-id="${l.id}" title="${tr('move up')}">${ic('chev', 's up')}</button><button class="iconbtn" data-lmove="1" data-id="${l.id}" title="${tr('move down')}">${ic('chev', 's')}</button></div>`;
     return row('l:' + l.id, sw, listName(l.name), c.lists[l.id], `data-list="${l.id}" ${isMobile() ? '' : 'draggable="true"'}`, shr);
   };
@@ -814,7 +839,7 @@ function renderSide() {
     ${row('tomorrow', ic('sunrise'), tr('Tomorrow'), c.tomorrow)}
     ${row('week', ic('week'), tr('Next 7 days'), c.week)}
     ${row('inbox', ic('inbox'), tr('Inbox'), c.lists[inbox()?.id])}
-    ${hasSharing() || c.assigned ? row('assigned', ic('user'), tr('Assigned to me'), c.assigned) : ''}
+    ${collab() && (hasSharing() || c.assigned) ? row('assigned', ic('user'), tr('Assigned to me'), c.assigned) : ''}
     <div class="sgroup"><div class="shead lroot"><span class="spacer">${tr('Lists')}</span><button data-act="lists-reorder" class="${S.listReorder ? 'on' : ''}" title="${tr('Sort lists')}">${ic('sort', 's')}</button><button data-act="list-new" title="${tr('New list')}">${ic('plus', 's')}</button></div>${lh || `<div class="folder">${tr('No lists yet')}</div>`}</div>
     <div class="sgroup"><div class="shead"><span class="spacer">${tr('Filters')}</span><button data-act="filter-new" title="${tr('New filter')}">${ic('plus', 's')}</button></div>${S.filters.map(f => row('f:' + f.id, ic('filter'), f.name, c.filters[f.id])).join('') || `<div class="folder">${tr('Combine lists, dates, priorities, tags')}</div>`}</div>
     ${tags.length ? `<div class="sgroup"><div class="shead">${tr('Tags')}</div>${tags.map(t => row('tag:' + t, ic('tag'), t, c.tags[t])).join('')}</div>` : ''}
@@ -891,7 +916,9 @@ function taskRow(t, opts = {}) {
   if (t.content && !opts.compact) meta.push(`<span>${ic('edit', 's')}</span>`);
   if (t.attachments?.length) meta.push(`<span>${ic('clip', 's')}${t.attachments.length}</span>`);
   if (t.paperless?.length && plOn()) meta.push(`<span>${ic('archive', 's')}${t.paperless.length}</span>`);
-  if (t.assignee_id) { const who = personName(t.list_id, t.assignee_id); meta.push(`<span class="who ${S.me && t.assignee_id === S.me.id ? 'me' : ''}" title="${esc(tr('Assigned to {0}', who || '?'))}">${esc(initials(who))}</span>`); }
+  if (t.url && feat('links')) meta.push(`<a class="lnk" href="${esc(t.url)}" target="_blank" rel="noopener noreferrer" title="${esc(t.url)}">${ic('link', 's')}${esc(urlHost(t.url))}</a>`);
+  if (t.comment_count && collab()) meta.push(`<span class="cmc ${t.unread ? 'unread' : ''}" title="${esc(t.unread ? trn('{0} new comment', '{0} new comments', t.unread) : trn('{0} comment', '{0} comments', t.comment_count))}">${ic('comment', 's')}${t.comment_count}</span>`);
+  if (t.assignee_id && collab()) { const who = personName(t.list_id, t.assignee_id); meta.push(`<span class="who ${S.me && t.assignee_id === S.me.id ? 'me' : ''}" title="${esc(tr('Assigned to {0}', who || '?'))}">${esc(initials(who))}</span>`); }
   for (const g of t.tags) meta.push(`<span class="tag">#${esc(g)}</span>`);
   if (opts.trash) meta.push(`<span>${tr('deleted {0}', dayLabel(t.deleted_at.slice(0, 10)))}</span>`);
   const chk = t.status === 2 ? 'on' : t.status === -1 ? 'wont' : 'p' + t.priority;
@@ -1430,6 +1457,7 @@ async function pomoStart(taskId) {
 // ------------------------------------------------------------------ detail panel
 let saveTimers = {};
 function openDetail(id) {
+  if (S.sel !== id) { S.editLink = false; S.cedit = null; S.mp = null; }
   S.sel = id; S.editContent = false;
   const d = $('#detail');
   d.classList.remove('hidden');
@@ -1439,10 +1467,12 @@ function openDetail(id) {
   $$('.trow.sel').forEach(r => r.classList.remove('sel'));
   $$(`.trow[data-id="${id}"]`).forEach(r => r.classList.add('sel'));
   if (isMobile()) history.pushState({detail: id}, '', location.hash);
+  if (collab() && id > 0 && S.tl.id !== id) S.tl = {id};
+  loadTimeline(id);
 }
 function closeDetail(fromPop) {
   flushSaves();
-  S.sel = null;
+  S.sel = null; S.tl = {id: null}; S.cedit = null; S.editLink = false; mentionClose();
   const d = $('#detail');
   d.classList.remove('open');
   $('#app').classList.remove('detail-open');
@@ -1484,19 +1514,226 @@ function renderDetail() {
         ${t.id > 0 && !ro ? `<button class="attadd" data-act="pl-search">${ic('archive', 's')}<span>${tr('Link document')}</span></button>` : ''}</div>` : ''}
       <div class="dsec"><h5>${tr('Subtasks')}</h5><div class="subs">${kids.map(k => taskRow(k, {compact: true, subRow: true})).join('')}
         ${ro ? '' : depthOf(t) < 2 ? `<div class="subadd">${ic('plus', 's')}<input id="d-sub" placeholder="${tr('Add subtask')}" enterkeyhint="done"></div>` : `<div class="muted" style="font-size:12px;padding:4px">${tr('At most 3 levels')}</div>`}</div></div>
-      <div class="dsec"><h5>${tr('Tags')}${shared ? ` <span class="muted h5note">${tr('only visible to you')}</span>` : ''}</h5><div class="tagedit">${t.tags.map(g => `<span class="tagpill">#${esc(g)}${ro ? '' : `<button data-act="tag-rm" data-tag="${esc(g)}">${ic('x', 's')}</button>`}</span>`).join('')}${ro ? '' : `<input id="d-tag" placeholder="${tr('+ Tag')}" list="taglist" enterkeyhint="done">`}<datalist id="taglist">${[...new Set([...S.tasks.values()].flatMap(x => x.tags))].map(g => `<option value="${esc(g)}">`).join('')}</datalist></div></div>
+      <div class="dsec"><h5>${tr('Tags')}${shared && collab() ? ` <span class="muted h5note">${tr('only visible to you')}</span>` : ''}</h5><div class="tagedit">${t.tags.map(g => `<span class="tagpill">#${esc(g)}${ro ? '' : `<button data-act="tag-rm" data-tag="${esc(g)}">${ic('x', 's')}</button>`}</span>`).join('')}${ro ? '' : `<input id="d-tag" placeholder="${tr('+ Tag')}" list="taglist" enterkeyhint="done">`}<datalist id="taglist">${[...new Set([...S.tasks.values()].flatMap(x => x.tags))].map(g => `<option value="${esc(g)}">`).join('')}</datalist></div></div>
       <div class="dsec fields">
         <label>${tr('List')}</label><select id="d-list" ${ro ? 'disabled' : ''}>${S.lists.filter(x => (!x.archived && x.role !== 'view') || x.id === t.list_id).map(x => `<option value="${x.id}" ${x.id === t.list_id ? 'selected' : ''}>${esc(lname(x))}</option>`).join('')}</select>
         ${secs.length ? `<label>${tr('Section')}</label><select id="d-sec" ${ro ? 'disabled' : ''}><option value="">${tr('Unassigned')}</option>${secs.map(s => `<option value="${s.id}" ${s.id === t.section_id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>` : ''}
-        ${shared || t.assignee_id ? `<label>${tr('Assignee')}</label><select id="d-assignee" ${ro ? 'disabled' : ''}><option value="">${tr('Nobody')}</option>${listPeople(l).map(p => `<option value="${p.user_id}" ${p.user_id === t.assignee_id ? 'selected' : ''}>${esc(p.name)}${S.me && p.user_id === S.me.id ? ' ' + tr('(me)') : ''}</option>`).join('')}</select>` : ''}
+        ${feat('links') ? `<label>${tr('Link')}</label>${linkField(t, ro)}` : ''}
+        ${collab() && (shared || t.assignee_id) ? `<label>${tr('Assignee')}</label><select id="d-assignee" ${ro ? 'disabled' : ''}><option value="">${tr('Nobody')}</option>${listPeople(l).map(p => `<option value="${p.user_id}" ${p.user_id === t.assignee_id ? 'selected' : ''}>${esc(p.name)}${S.me && p.user_id === S.me.id ? ' ' + tr('(me)') : ''}</option>`).join('')}</select>` : ''}
       </div>
+      ${collab() && t.id > 0 ? `<div class="dsec cmsec" id="d-tl">${timelineHtml(t)}</div>` : ''}
     </div>
     <div class="dfoot">${t.status === 2 && t.completed_at ? tr('Completed {0}', new Date(t.completed_at).toLocaleString(LOCALE(), {dateStyle: 'medium', timeStyle: 'short'})) : tr('Created {0}', new Date(t.created_at).toLocaleString(LOCALE(), {dateStyle: 'medium', timeStyle: 'short'}))}
       <span class="spacer"></span>
       ${t.status === 0 ? `<button class="iconbtn" data-act="pomo-task" data-id="${t.id}" title="${tr('Start focus')}">${ic('timer', 's')}</button>` : ''}
       ${ro ? '' : `<button class="iconbtn danger" data-act="delete" data-id="${t.id}" title="${tr('Delete')}">${ic('trash', 's')}</button>`}</div>`;
-  autosize($('#d-title')); autosize($('#d-content'));
+  autosize($('#d-title')); autosize($('#d-content')); autosize($('#c-input'));
 }
+function linkField(t, ro) {
+  if (t.url && !S.editLink) return `<div class="linkf"><a class="linkchip" href="${esc(t.url)}" target="_blank" rel="noopener noreferrer" title="${esc(t.url)}">${ic('link', 's')}<span>${esc(urlHost(t.url))}</span></a>${ro ? '' : `<button class="iconbtn" data-act="link-edit" title="${tr('Edit link')}">${ic('edit', 's')}</button><button class="iconbtn" data-act="link-rm" title="${tr('Remove website link')}">${ic('x', 's')}</button>`}</div>`;
+  return ro ? '<span class="muted">–</span>' : `<input id="d-url" type="url" inputmode="url" autocomplete="off" placeholder="https://…" value="${esc(t.url || '')}" enterkeyhint="done">`;
+}
+async function saveLink(v) {
+  const t = taskById(S.sel); if (!t) return;
+  v = (v || '').trim();
+  if (v && !/^https?:\/\//i.test(v) && /^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(v)) v = 'https://' + v;  // "github.com/x" -> https://
+  if (v && !validUrl(v)) { toast(tr('The link must start with http:// or https://')); return; }
+  S.editLink = false;
+  if ((t.url || '') === v) { renderDetail(); return; }
+  await patchTask(t.id, {url: v || null});
+}
+
+// ------------------------------------------------------------------ comments + activity (module "collab")
+// Loaded per task when the detail panel opens (GET /timeline), refreshed when the version changes.
+// Comments are sent directly (never queued offline): offline, the text stays in the box with a notice.
+const showAct = () => LS.get('showActivity', true);
+const uname = (id, U) => (U || {})[id] || (id ? tr('Deleted user') : tr('Someone'));
+function fmtWhen(iso) {
+  const d = new Date(iso), hmTxt = d.toLocaleTimeString(LOCALE(), {hour: '2-digit', minute: '2-digit'});
+  if (ds(d) === today()) return hmTxt;
+  if (ds(d) === addDays(today(), -1)) return tr('Yesterday') + ' ' + hmTxt;
+  return fmtDay(d.getFullYear() !== new Date().getFullYear() ? 'year' : 'short', d) + ' ' + hmTxt;
+}
+const fmtDayAbs = s => fmtDay(pd(s).getFullYear() !== new Date().getFullYear() ? 'year' : 'short', pd(s));
+function actText(a, U) {
+  const who = `<b>${esc(uname(a.user_id, U))}</b>`, d = a.data || {}, q = x => `<b>${esc(x)}</b>`;
+  const due = () => q((d.start && d.start < d.due ? fmtDayAbs(d.start) + ' – ' : '') + fmtDayAbs(d.due) + (d.time ? ', ' + d.time : ''));
+  switch (a.kind) {
+    case 'created': return tr('{0} created the task', who);
+    case 'title': return tr('{0} renamed the task to “{1}”', who, esc(d.to || ''));
+    case 'content': return tr('{0} edited the description', who);
+    case 'due': return d.due ? tr('{0} set the due date to {1}', who, due()) : tr('{0} removed the due date', who);
+    case 'snooze': return tr('{0} snoozed the task to {1}', who, due());
+    case 'priority': return tr('{0} changed the priority to {1}', who, q(tr([N_('None'), N_('Low'), '', N_('Medium'), '', N_('High')][+d.p] || N_('None'))));
+    case 'assign': return d.to ? tr('{0} assigned the task to {1}', who, q(uname(d.to, U))) : tr('{0} removed the assignee', who);
+    case 'list': return tr('{0} moved the task to the list {1}', who, q(d.inbox && d.name === 'Eingang' ? tr('Inbox') : listName(d.name)));
+    case 'section': return d.name ? tr('{0} moved the task to the section {1}', who, q(d.name)) : tr('{0} removed the task from its section', who);
+    case 'parent': return d.title ? tr('{0} made the task a subtask of {1}', who, q(d.title)) : tr('{0} made the task a main task', who);
+    case 'repeat': return d.rule ? tr('{0} set the repetition to {1}', who, q(repeatLabel(d.rule))) : tr('{0} stopped the repetition', who);
+    case 'link': return d.url ? tr('{0} set the link to {1}', who, q(urlHost(d.url))) : tr('{0} removed the link', who);
+    case 'complete': return d.next ? tr('{0} completed the task, next occurrence {1}', who, q(fmtDayAbs(d.next))) : tr('{0} completed the task', who);
+    case 'wont': return tr("{0} marked the task as won't do", who);
+    case 'reopen': return tr('{0} reopened the task', who);
+    case 'skip': return tr('{0} skipped an occurrence, next one {1}', who, q(fmtDayAbs(d.next)));
+    case 'attach': return (d.n || 1) === 1 ? tr('{0} added the attachment {1}', who, q((d.names || [])[0] || '')) : trn('{1} added {0} attachment', '{1} added {0} attachments', d.n, who);
+    case 'attach_rm': return tr('{0} removed the attachment {1}', who, q(d.name || ''));
+    case 'paperless': return tr('{0} linked the Paperless document {1}', who, q(d.title || ''));
+    case 'paperless_rm': return tr('{0} removed the Paperless document {1}', who, q(d.title || ''));
+    case 'paperless_send': return tr('{0} sent {1} to Paperless', who, q(d.name || ''));
+    case 'subtask': return tr('{0} added the subtask {1}', who, q(d.title || ''));
+    case 'delete': return tr('{0} moved the task to the trash', who);
+    case 'restore': return tr('{0} restored the task', who);
+  }
+  return tr('{0} changed the task', who);
+}
+// comment text: small markdown (bold, italic, code, links), line breaks, <@id> -> highlighted @name
+function commentBody(body, U) {
+  return String(body || '').split('\n').map(mdInline).join('<br>')
+    .replace(/&lt;@(\d+)&gt;/g, (_, id) => `<span class="mention ${S.me && +id === S.me.id ? 'me' : ''}">@${esc(uname(+id, U))}</span>`);
+}
+const decodeMentions = (body, U) => String(body || '').replace(/<@(\d+)>/g, (_, id) => '@' + uname(+id, U));
+function encodeMentions(text, people) {
+  for (const p of [...(people || [])].sort((a, b) => b.name.length - a.name.length))
+    text = text.replace(new RegExp('@' + p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\p{L}\\p{N}_])', 'gu'), `<@${p.id}>`);
+  return text;
+}
+function cattHtml(a, cid, editing) {
+  const del = editing ? `<button class="attdel" data-act="catt-del" data-att="${a.id}" title="${tr('Remove')}">${ic('x', 's')}</button>` : '';
+  if (isImg(a)) return `<div class="att img"><a href="${attUrl(a)}" data-act="catt-view" data-att="${a.id}" data-cid="${cid}" title="${esc(a.name)}"><img src="${attUrl(a)}" loading="lazy" alt="${esc(a.name)}"></a>${del}</div>`;
+  const pdf = a.mime === 'application/pdf';
+  return `<div class="att file"><a href="${attUrl(a, !pdf)}" ${pdf ? 'target="_blank" rel="noopener"' : 'download'} title="${esc(a.name)}">${ic(pdf ? 'pdf' : 'file')}<span class="an">${esc(a.name)}</span><span class="as">${fmtSize(a.size)}</span></a>${del}</div>`;
+}
+function commentHtml(c, U) {
+  const mine = S.me && c.user_id === S.me.id, editing = S.cedit === c.id;
+  const isNew = !mine && c.id > (S.tl.seen || 0);
+  const acts = mine || S.tl.moderator ? `<span class="cacts">${mine ? `<button class="iconbtn" data-act="c-edit" data-cid="${c.id}" title="${tr('Edit')}">${ic('edit', 's')}</button>` : ''}<button class="iconbtn" data-act="c-del" data-cid="${c.id}" title="${tr('Delete')}">${ic('trash', 's')}</button></span>` : '';
+  const files = c.attachments?.length ? `<div class="atts catts">${c.attachments.map(a => cattHtml(a, c.id, editing)).join('')}</div>` : '';
+  const main = editing ? `<div class="cedit"><textarea class="c-edit-input" data-cid="${c.id}" rows="2">${esc(decodeMentions(c.body, U))}</textarea><div class="mpick hidden"></div>${files}<div class="cbar"><span class="spacer"></span><button class="btn sm" data-act="c-edit-cancel">${tr('Cancel')}</button><button class="btn sm pri" data-act="c-edit-save" data-cid="${c.id}">${tr('Save')}</button></div></div>`
+    : `${c.body ? `<div class="cbody">${commentBody(c.body, U)}</div>` : ''}${files}`;
+  return `<div class="cm ${isNew ? 'new' : ''}" data-cid="${c.id}"><span class="avatar">${esc(initials(uname(c.user_id, U)))}</span><div class="cmain"><div class="chead"><b>${esc(uname(c.user_id, U))}</b><span class="muted">${fmtWhen(c.created_at)}${c.edited_at ? ' · ' + tr('edited') : ''}</span>${acts}</div>${main}</div></div>`;
+}
+function timelineItems() {
+  const T = S.tl;
+  if (T.err) return `<div class="muted cmempty">${T.err === 'offline' ? tr('Comments and activity are only available online.') : esc(T.err)}</div>`;
+  if (!T.comments) return `<div class="muted cmempty">${tr('Loading…')}</div>`;
+  const U = T.users || {};
+  const items = [...T.comments.map(c => ({at: c.created_at, c})), ...(showAct() ? T.activity.map(a => ({at: a.created_at, a})) : [])]
+    .sort((x, y) => new Date(x.at) - new Date(y.at) || (x.c ? 1 : 0) - (y.c ? 1 : 0));
+  if (!items.length) return `<div class="muted cmempty">${tr('No comments yet.')}</div>`;
+  return items.map(it => it.c ? commentHtml(it.c, U) : `<div class="actl"><span>${actText(it.a, U)}</span><time>${fmtWhen(it.a.created_at)}</time></div>`).join('');
+}
+function composerFiles(tid) {
+  return (S.cfiles[tid] || []).map((f, i) => `<span class="cfile">${ic(/^image\//.test(f.type) ? 'clip' : 'file', 's')}<span>${esc(f.name || tr('Image'))}</span><button data-act="c-file-rm" data-i="${i}" title="${tr('Remove')}">${ic('x', 's')}</button></span>`).join('');
+}
+function timelineHtml(t) {
+  const n = S.tl.id === t.id && S.tl.comments ? S.tl.comments.length : t.comment_count || 0;
+  return `<h5 class="cmhead"><span>${tr('Comments')}</span><span class="c" id="d-tl-count">${n || ''}</span><span class="spacer"></span><button class="cmtoggle ${showAct() ? 'on' : ''}" data-act="tl-act" title="${tr('Show the history of changes between the comments')}">${ic('clock', 's')}${tr('Show activity')}</button></h5>
+    <div class="cms" id="d-tl-items">${S.tl.id === t.id ? timelineItems() : `<div class="muted cmempty">${tr('Loading…')}</div>`}</div>
+    <div class="ccomp"><textarea id="c-input" rows="1" placeholder="${tr('Write a comment… (@ mentions someone)')}">${esc(S.drafts[t.id] || '')}</textarea>
+      <div class="mpick hidden"></div>
+      <div class="cfiles" id="c-files">${composerFiles(t.id)}</div>
+      <div class="cbar"><label class="iconbtn" title="${tr('Attach files')}">${ic('clip', 's')}<input type="file" id="c-file" multiple hidden></label><span class="muted chint">${isMobile() ? '' : tr('Ctrl+Enter sends')}</span><span class="spacer"></span><button class="btn sm pri" data-act="c-send">${ic('send', 's')} ${tr('Send')}</button></div></div>`;
+}
+function drawTimeline() {
+  if (S.tl.id !== S.sel) return;
+  const box = $('#d-tl-items'); if (box) box.innerHTML = timelineItems();
+  const n = $('#d-tl-count'); if (n) n.textContent = S.tl.comments?.length || '';
+}
+async function loadTimeline(id) {
+  if (!(id > 0) || !collab()) return;
+  const my = S.tlSeq = (S.tlSeq || 0) + 1, v = S.v;
+  let j;
+  try { j = await rawFetch('GET', `/api/tasks/${id}/timeline`); }
+  catch (e) {
+    if (e.message === 'auth' || my !== S.tlSeq || S.sel !== id) return;
+    if (S.tl.id !== id || !S.tl.comments) S.tl = {id, v, err: e instanceof Offline ? 'offline' : e.message};
+    drawTimeline(); return;
+  }
+  if (my !== S.tlSeq || S.sel !== id) return;
+  const seen = S.tl.id === id ? S.tl.seen : j.seen;  // "new" marks stay while the panel is open
+  S.tl = {...j, id, v, seen};
+  if (S.cedit && !j.comments.some(c => c.id === S.cedit)) S.cedit = null;
+  drawTimeline();
+  const t = S.tasks.get(id), top = Math.max(0, ...j.comments.map(c => c.id));
+  if (t && (t.unread || t.comment_count !== j.comments.length)) { t.unread = 0; t.comment_count = j.comments.length; renderView(); }
+  if (top > (j.seen || 0)) rawFetch('POST', `/api/tasks/${id}/seen`).catch(() => {});
+}
+async function capi(method, url, body) {  // comments: never queued, clear message when offline
+  try { return await rawFetch(method, url, body); }
+  catch (e) {
+    if (e instanceof Offline) toast(tr('You are offline: the comment was not sent and stays in the box'));
+    else if (e.message !== 'auth') toast(e.message);
+    throw e;
+  }
+}
+async function sendComment() {
+  const tid = S.sel, ta = $('#c-input'); if (!ta || !tid) return;
+  if (tid < 0) { toast(tr('Task is still syncing, try again in a moment')); return; }
+  const raw = ta.value.trim(), files = S.cfiles[tid] || [];
+  if (!raw && !files.length) { ta.focus(); return; }
+  const big = files.find(f => f.size > 50 * 1024 * 1024);
+  if (big) { toast(tr('{0} is larger than 50 MB', big.name)); return; }
+  const text = encodeMentions(raw, S.tl.id === tid ? S.tl.people : []);
+  let payload = {body: text};
+  if (files.length) { payload = new FormData(); payload.append('body', text); files.forEach((f, i) => payload.append('file', f, f.name || `bild-${Date.now()}-${i}.png`)); }
+  const btn = $('[data-act="c-send"]'); if (btn) btn.disabled = true;
+  try { await capi('POST', `/api/tasks/${tid}/comments`, payload); }
+  catch { return; }
+  finally { if (btn) btn.disabled = false; }
+  delete S.drafts[tid]; delete S.cfiles[tid];
+  if (S.sel === tid) { const i = $('#c-input'); if (i) { i.value = ''; autosize(i); } const f = $('#c-files'); if (f) f.innerHTML = ''; }
+  await loadTimeline(tid);
+  const box = $('#d-tl-items'); if (box) box.lastElementChild?.scrollIntoView({block: 'nearest'});
+}
+function addCommentFiles(files) {
+  files = [...files].filter(Boolean); if (!files.length || !S.sel) return;
+  (S.cfiles[S.sel] ||= []).push(...files);
+  const f = $('#c-files'); if (f) f.innerHTML = composerFiles(S.sel);
+}
+// @mention picker: people who can see the task (from the timeline), without me
+function mentionState(ta) {
+  const pick = ta.parentElement.querySelector('.mpick'); if (!pick) return null;
+  const pre = ta.value.slice(0, ta.selectionStart), m = pre.match(/(?:^|\s)@([^\s@<>]{0,30}(?: [^\s@<>]{0,30})?)$/u);
+  const people = (S.tl.people || []).filter(p => !S.me || p.id !== S.me.id);
+  if (!m || !people.length) return {pick, items: []};
+  const q = m[1].toLowerCase();
+  const items = people.filter(p => { const n = p.name.toLowerCase(); return n.startsWith(q) || n.split(/\s+/).some(w => w.startsWith(q)); }).slice(0, 6);
+  return {pick, items, start: pre.length - m[1].length - 1};
+}
+function mentionUpdate(ta) {
+  const st = mentionState(ta); if (!st) return;
+  S.mp = st.items.length ? {ta, ...st, i: 0} : null;
+  st.pick.classList.toggle('hidden', !st.items.length);
+  st.pick.innerHTML = st.items.map((p, i) => `<button class="${i === 0 ? 'on' : ''}" data-act="mention-pick" data-i="${i}"><span class="avatar">${esc(initials(p.name))}</span>${esc(p.name)}</button>`).join('');
+}
+function mentionPick(i) {
+  const mp = S.mp; if (!mp) return;
+  const p = mp.items[i], ta = mp.ta, caret = ta.selectionStart;
+  ta.value = ta.value.slice(0, mp.start) + '@' + p.name + ' ' + ta.value.slice(caret);
+  const pos = mp.start + p.name.length + 2;
+  ta.focus(); ta.setSelectionRange(pos, pos);
+  mp.pick.classList.add('hidden'); S.mp = null;
+  if (ta.id === 'c-input') S.drafts[S.sel] = ta.value;
+  autosize(ta);
+}
+function mentionClose() { if (S.mp) { S.mp.pick.classList.add('hidden'); S.mp = null; } }
+document.addEventListener('keydown', e => {
+  const t = e.target;
+  if (!(t.id === 'c-input' || t.classList?.contains('c-edit-input'))) return;
+  if (S.mp && S.mp.ta === t) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault(); S.mp.i = (S.mp.i + (e.key === 'ArrowDown' ? 1 : -1) + S.mp.items.length) % S.mp.items.length;
+      $$('button', S.mp.pick).forEach((b, i) => b.classList.toggle('on', i === S.mp.i)); return;
+    }
+    if ((e.key === 'Enter' || e.key === 'Tab') && !e.isComposing) { e.preventDefault(); e.stopImmediatePropagation(); mentionPick(S.mp.i); return; }
+    if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); mentionClose(); return; }
+  }
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (t.id === 'c-input') sendComment(); else $(`[data-act="c-edit-save"][data-cid="${t.dataset.cid}"]`)?.click();
+  }
+}, true);
+document.addEventListener('mousedown', e => { if (e.target.closest('.mpick')) e.preventDefault(); });  // keep the caret in the box
 // ------------------------------------------------------------------ attachments
 const attUrl = (a, dl) => `/api/attachments/${a.id}${dl ? '?dl=1' : ''}`;
 const fmtSize = b => b < 1024 ? b + ' B' : b < 1048576 ? Math.round(b / 1024) + ' KB' : (b / 1048576).toFixed(1).replace('.', ',') + ' MB';
@@ -1561,8 +1798,8 @@ async function uploadFiles(taskId, files) {
     toast(files.length === 1 ? tr('Attached') : tr('{0} files attached', files.length));
   } catch (e) { /* api() already showed the error / offline notice */ }
 }
-function attLightbox(id) {
-  const t = taskById(S.sel), imgs = (t?.attachments || []).filter(isImg);
+function attLightbox(id, list) {
+  const t = taskById(S.sel), imgs = list || (t?.attachments || []).filter(isImg);
   let i = Math.max(0, imgs.findIndex(a => a.id === id));
   const m = document.createElement('div');
   m.className = 'lightbox';
@@ -1773,7 +2010,7 @@ function taskMenu(anchor, id) {
     ...(t.parent_id ? [{label: tr('Outdent'), icon: 'outdent', fn: () => patchTask(id, {parent_id: S.tasks.get(t.parent_id)?.parent_id || null})}] : []),
     ...(feat('pomo') ? [{label: tr('Start focus'), icon: 'timer', fn: () => { pomoStart(id); go('pomo'); }}] : []),
     {label: t.status === -1 ? tr('Reopen') : tr("Won't do (discard)"), icon: 'ban', fn: async () => { if (t.status === -1) await api('POST', `/api/tasks/${id}/reopen`); else await api('POST', `/api/tasks/${id}/complete`, {status: -1}); await load(); render(); }},
-    {label: tr('Duplicate'), icon: 'sub', fn: () => createTask({title: t.title, content: t.content, list_id: t.list_id, section_id: t.section_id, priority: t.priority, due: t.due, due_time: t.due_time, reminders: t.reminders, repeat: t.repeat, repeat_from: t.repeat_from, tags: t.tags, parent_id: t.parent_id})},
+    {label: tr('Duplicate'), icon: 'sub', fn: () => createTask({title: t.title, content: t.content, list_id: t.list_id, section_id: t.section_id, priority: t.priority, due: t.due, due_time: t.due_time, reminders: t.reminders, repeat: t.repeat, repeat_from: t.repeat_from, tags: t.tags, parent_id: t.parent_id, url: t.url || null})},
     ...(t.parent_id && S.tasks.get(t.parent_id)?.parent_id ? [{label: tr('Make it a main task'), icon: 'arrow', fn: () => patchTask(id, {parent_id: null})}] : []),
     '-',
     {label: tr('Delete'), icon: 'trash', cls: 'flag-5', fn: () => deleteTask(id)},
@@ -1830,7 +2067,7 @@ function listModal(id, folder = '') {
     <div class="row"><label>${tr('Folder')}</label><input id="l-folder" value="${esc(l.folder)}" list="l-folders" placeholder="${tr('optional')}"><datalist id="l-folders">${folderNames().map(f => `<option value="${esc(f)}">`).join('')}</datalist></div>
     <div class="row"><label>${tr('View')}</label><select id="l-view"><option value="list">${tr('List')}</option>${feat('kanban') ? `<option value="kanban" ${l.view === 'kanban' ? 'selected' : ''}>${tr('Kanban')}</option>` : ''}${feat('timeline') ? `<option value="timeline" ${l.view === 'timeline' ? 'selected' : ''}>${tr('Timeline')}</option>` : ''}</select></div>
     <div class="row"><label>${tr('Color')}</label><div class="colors" id="l-col">${LCOLORS.map(c => `<button style="background:${c || 'var(--bg4)'}" class="${(l.color || '') === c ? 'on' : ''}" data-c="${c}" ${dis}></button>`).join('')}</div></div>
-    ${id && !l.is_inbox ? `<h4>${tr('Sharing')}</h4><div class="members" id="l-members"></div>` : ''}
+    ${id && !l.is_inbox && collab() ? `<h4>${tr('Sharing')}</h4><div class="members" id="l-members"></div>` : ''}
     <div class="foot">${id && !l.is_inbox && own ? `<button class="btn danger" data-m="del">${tr('Delete')}</button><button class="btn" data-m="arch">${l.archived ? tr('Reactivate') : tr('Archive')}</button>` : ''}${id && !own ? `<button class="btn danger" data-m="leave">${ic('logout', 's')} ${tr('Leave list')}</button>` : ''}<span class="spacer"></span><button class="btn" data-m="close">${tr('Cancel')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
   let users = null;
   const drawMembers = () => {
@@ -1846,7 +2083,7 @@ function listModal(id, folder = '') {
           : `<div class="muted mhint">${users.length > 1 ? tr('Shared with everyone') : tr('No other users yet. An admin can add them in the settings.')}</div>`;
       })()) : `<div class="muted mhint">${tr('Owner: {0}. Only the owner can rename, archive or share this list.', cur.owner_name)}</div>`);
   };
-  if (id && !l.is_inbox) {
+  if (id && !l.is_inbox && collab()) {
     drawMembers();
     if (own) api('GET', '/api/users').then(j => { users = j.users.filter(u => !u.disabled).map(u => ({id: u.id, display_name: u.display_name})); drawMembers(); }).catch(() => { users = []; drawMembers(); });
   }
@@ -1929,7 +2166,7 @@ function settingsModal(focus) {
     <h4>${tr('Modules')}</h4>
     <div class="muted" style="font-size:12px;margin:-2px 0 8px">${tr('Checkbox = feature on/off. Order = default bar for devices without their own tab bar.')}</div>
     <div class="navlist" id="s-nav">${navOrder().map(k => { const [m, i, n] = MODS.find(x => x[0] === k); return `<div class="navrow" data-mod="${m}">${m === 'tasks' ? '<input type="checkbox" checked disabled>' : `<input type="checkbox" data-feat="${m}" ${feat(m) ? 'checked' : ''}>`}${ic(i, 's')}<span>${tr(n)}</span><button class="iconbtn" data-nav="-1" title="${tr('move up / left')}">${ic('chev', 's up')}</button><button class="iconbtn" data-nav="1" title="${tr('move down / right')}">${ic('chev', 's')}</button></div>`; }).join('')}</div>
-    <div class="featgrid" style="margin-top:10px">${FEATS.filter(([k]) => !MODS.some(m => m[0] === k)).map(([k, n]) => `<label><input type="checkbox" data-feat="${k}" ${feat(k) ? 'checked' : ''}> ${tr(n)}</label>`).join('')}</div>
+    <div class="featgrid" style="margin-top:10px">${FEATS.filter(([k]) => !MODS.some(m => m[0] === k)).map(([k, n]) => `<label ${FEAT_DESC[k] ? 'class="wide"' : ''}><input type="checkbox" data-feat="${k}" ${feat(k) ? 'checked' : ''}><span>${tr(n)}${FEAT_DESC[k] ? `<small class="muted">${tr(FEAT_DESC[k])}</small>` : ''}</span></label>`).join('')}</div>
     ${S.paperless?.enabled ? `<h4>Paperless</h4>
     <div class="row"><label>${tr('After upload')}</label><label style="display:flex;gap:8px;align-items:center;min-width:0;color:var(--text)"><input type="checkbox" id="s-plkeep" ${s.paperless_keep === '1' ? 'checked' : ''} style="flex:none"> ${tr('Also keep the attachment in Abhako')}</label></div>` : ''}
     ${S.ntfyInbox?.enabled && S.me?.ntfy_inbox ? `<h4>${tr('Share via ntfy (Android)')}</h4>
@@ -1958,7 +2195,7 @@ function settingsModal(focus) {
     const grp = (n, o) => o ? `<optgroup label="${tr(n)}">${o}</optgroup>` : '';
     $('#s-tabadd', md).innerHTML = `<option value="">${tr('+ Add tab …')}</option>` +
       grp(N_('Sections'), MODS.filter(([m]) => m === 'tasks' || feat(m)).map(([m, , n]) => opt('m:' + m, tr(n))).join('')) +
-      grp(N_('Smart lists'), SMART_TABS.map(k => opt('s:' + k, tr(SMART[k].name))).join('')) +
+      grp(N_('Smart lists'), SMART_TABS.filter(k => k !== 'assigned' || collab()).map(k => opt('s:' + k, tr(SMART[k].name))).join('')) +
       grp(N_('Lists'), S.lists.filter(l => !l.is_inbox && !l.archived).map(l => opt('l:' + l.id, listName(l.name))).join('')) +
       grp(N_('Filters'), S.filters.map(f => opt('f:' + f.id, f.name)).join('')) +
       grp(N_('Tags'), Object.keys(counts().tags).sort((a, b) => a.localeCompare(b, 'de')).map(t => opt('tag:' + t, '#' + t)).join('')) +
@@ -2181,14 +2418,17 @@ async function submitQuick(input, extra = {}) {
   const d = {...quickDefaults(), ...(input.id === 'qsheet' ? S.quickPreset : {}), ...extra};
   const txt = input.value.trim(); if (!txt && !d.files?.length) return;
   const r = parseQuick(txt, S.quick.ignore);
+  const url = r.url || d.url || null;
+  if (!r.title && url) r.title = urlTitle(url);  // only a link typed / shared: domain + path as title
   if (!r.title && d.files?.length) r.title = d.files[0].name.replace(/\.[^.]+$/, '');  // shared file without a title
   if (!r.title) return;
   const body = {title: r.title, list_id: r.list_id || d.list_id, due: r.due || d.due, due_time: r.due_time || d.due_time, priority: r.priority ?? d.priority ?? 0,
     tags: [...(d.tags || []), ...(r.tags || [])], repeat: r.repeat || '', section_id: d.section_id, content: d.content || ''};
+  if (url) body.url = url;
   if (d.assignee_id && !r.list_id) body.assignee_id = d.assignee_id;
   if (body.due_time && S.settings.default_reminder !== '') body.reminders = S.settings.default_reminder;
   input.value = ''; S.quick.ignore = new Set(); updateChips(input);
-  if (input.id === 'qsheet' && (S.quickPreset.content || S.quickPreset.due_time || S.quickPreset.files?.length)) { S.quickPreset = {}; closePop(); }
+  if (input.id === 'qsheet' && (S.quickPreset.content || S.quickPreset.url || S.quickPreset.due_time || S.quickPreset.files?.length)) { S.quickPreset = {}; closePop(); }
   const created = await createTask(body);
   if (d.files?.length && created?.id) { await uploadFiles(created.id, d.files); openDetail(created.id); }
   if (document.body.contains(input)) input.focus();
@@ -2205,7 +2445,7 @@ function openQuickSheet(prefill = '', preset = {}) {
   $('#scrim').classList.remove('hidden');
   popOnClose = () => { q.remove(); S.quickPreset = {}; };
   const nf = preset.files?.length || 0;
-  const hint = [preset.due ? dayLabel(preset.due) + (preset.due_time ? ' ' + preset.due_time : '') : '', preset.content ? tr('Link as description') : '',
+  const hint = [preset.due ? dayLabel(preset.due) + (preset.due_time ? ' ' + preset.due_time : '') : '', preset.content ? tr('Link as description') : '', preset.url ? tr('Link: {0}', urlHost(preset.url)) : '',
     nf ? (nf === 1 ? tr('Attachment: {0}', preset.files[0].name) : tr('{0} attachments', nf)) : ''].filter(Boolean).join(' · ');
   $('.qhint', q).textContent = hint || tr('tomorrow 3pm · !high · #tag · ~list · every monday');
   const inp = $('#qsheet'); inp.value = prefill; updateChips(inp);
@@ -2214,6 +2454,7 @@ function openQuickSheet(prefill = '', preset = {}) {
 
 // ------------------------------------------------------------------ events
 document.addEventListener('click', async e => {
+  if (e.target.closest('a.lnk, a.linkchip')) return;  // website link: the browser opens it (new tab)
   const lm = e.target.closest('[data-lmove]');
   if (lm) { e.preventDefault(); moveList(+lm.dataset.id, +lm.dataset.lmove); return; }
   const fm = e.target.closest('[data-fmove]');
@@ -2296,6 +2537,38 @@ document.addEventListener('click', async e => {
     case 'pin': { const t = taskById(id); patchTask(id, {pinned: t.pinned ? 0 : 1}); break; }
     case 'conflicts': conflictModal(); break;
     case 'att-view': e.preventDefault(); attLightbox(+a.dataset.att); break;
+    case 'catt-view': {
+      e.preventDefault();
+      const c = (S.tl.comments || []).find(x => x.id === +a.dataset.cid);
+      attLightbox(+a.dataset.att, (c?.attachments || []).filter(isImg)); break;
+    }
+    case 'catt-del': {
+      e.preventDefault(); e.stopPropagation();
+      const c = (S.tl.comments || []).find(x => (x.attachments || []).some(f => f.id === +a.dataset.att)), f = c?.attachments.find(x => x.id === +a.dataset.att);
+      if (!f || !confirm(tr('Remove “{0}”?', f.name))) break;
+      try { await capi('DELETE', `/api/attachments/${f.id}`); } catch { break; }
+      c.attachments = c.attachments.filter(x => x.id !== f.id); drawTimeline(); break;
+    }
+    case 'link-edit': S.editLink = true; renderDetail(); setTimeout(() => { const i = $('#d-url'); if (i) { i.focus(); i.select(); } }, 0); break;
+    case 'link-rm': { const t = taskById(S.sel); if (t && confirm(tr('Remove the link?'))) patchTask(t.id, {url: null}); break; }
+    case 'tl-act': LS.set('showActivity', !showAct()); a.classList.toggle('on', showAct()); drawTimeline(); break;
+    case 'c-send': sendComment(); break;
+    case 'c-file-rm': { const arr = S.cfiles[S.sel] || []; arr.splice(+a.dataset.i, 1); $('#c-files').innerHTML = composerFiles(S.sel); break; }
+    case 'mention-pick': mentionPick(+a.dataset.i); break;
+    case 'c-edit': S.cedit = +a.dataset.cid; drawTimeline(); setTimeout(() => { const i = $(`.c-edit-input[data-cid="${a.dataset.cid}"]`); if (i) { autosize(i); i.focus(); i.setSelectionRange(i.value.length, i.value.length); } }, 0); break;
+    case 'c-edit-cancel': S.cedit = null; mentionClose(); drawTimeline(); break;
+    case 'c-edit-save': {
+      const cid = +a.dataset.cid, ta = $(`.c-edit-input[data-cid="${cid}"]`); if (!ta) break;
+      try { await capi('PATCH', `/api/comments/${cid}`, {body: encodeMentions(ta.value.trim(), S.tl.people)}); } catch { break; }
+      S.cedit = null; mentionClose(); await loadTimeline(S.sel); break;
+    }
+    case 'c-del': {
+      const cid = +a.dataset.cid;
+      if (!confirm(tr('Delete this comment?'))) break;
+      try { await capi('DELETE', `/api/comments/${cid}`); } catch { break; }
+      if (S.cedit === cid) S.cedit = null;
+      await loadTimeline(S.sel); break;
+    }
     case 'pl-search': plSearchModal(S.sel); break;
     case 'pl-del': {
       const t = taskById(S.sel), p = t?.paperless?.find(x => x.id === +a.dataset.pl);
@@ -2384,12 +2657,16 @@ document.addEventListener('input', e => {
   const t = e.target;
   if (t.id === 'qinput' || t.id === 'qsheet') updateChips(t);
   if (t.id === 'd-title') { autosize(t); queueSave(S.sel, 'title', t.value.replace(/\n/g, ' ')); }
+  if (t.id === 'c-input') { autosize(t); S.drafts[S.sel] = t.value; mentionUpdate(t); }
+  if (t.classList?.contains('c-edit-input')) { autosize(t); mentionUpdate(t); }
   if (t.id === 'd-content') { autosize(t); queueSave(S.sel, 'content', t.value); }
   if (t.id === 'searchq') doSearch(t.value);
 });
 document.addEventListener('change', async e => {
   const t = e.target;
   if (t.id === 'd-file') { uploadFiles(S.sel, t.files); t.value = ''; return; }
+  if (t.id === 'c-file') { addCommentFiles(t.files); t.value = ''; return; }
+  if (t.id === 'd-url') { saveLink(t.value); return; }
   if (t.id === 'd-list') patchTask(S.sel, {list_id: +t.value});
   if (t.id === 'd-sec') patchTask(S.sel, {section_id: t.value ? +t.value : null});
   if (t.id === 'd-assignee') patchTask(S.sel, {assignee_id: t.value ? +t.value : null});
@@ -2400,6 +2677,7 @@ document.addEventListener('keydown', async e => {
   if (e.key === 'Enter' && !e.isComposing) {
     if (t.id === 'qinput' || t.id === 'qsheet') { e.preventDefault(); submitQuick(t); return; }
     if (t.id === 'd-title') { e.preventDefault(); t.blur(); return; }
+    if (t.id === 'd-url') { e.preventDefault(); t.blur(); return; }
     if (t.id === 'd-sub' && t.value.trim()) {
       const p = taskById(S.sel);
       const r = parseQuick(t.value.trim(), new Set());
@@ -2437,6 +2715,7 @@ document.addEventListener('keydown', async e => {
   if (e.key === '/') { e.preventDefault(); go('search'); }
 });
 document.addEventListener('focusout', e => {
+  if (e.target.id === 'c-input' || e.target.classList?.contains('c-edit-input')) setTimeout(() => { if (S.mp && document.activeElement !== S.mp.ta) mentionClose(); }, 150);
   if (e.target.id === 'd-title' || e.target.id === 'd-content') flushSaves();
   if (e.target.id === 'd-content' && e.target.value.trim()) {  // back to the rendered markdown
     const t = taskById(S.sel); if (t) t.content = e.target.value;
@@ -2548,6 +2827,7 @@ document.addEventListener('drop', e => {
   const tgt = e.target.closest('#detail, #view .trow');
   if (!tgt) return;
   e.preventDefault(); e.stopImmediatePropagation();
+  if (e.target.closest('.ccomp')) { addCommentFiles(e.dataTransfer.files); return; }
   const id = tgt.id === 'detail' ? S.sel : +tgt.dataset.id;
   if (id) uploadFiles(id, e.dataTransfer.files);
 }, true);
@@ -2556,6 +2836,7 @@ document.addEventListener('paste', e => {
   const files = [...(e.clipboardData?.files || [])];
   if (!files.length) return;  // plain text paste stays normal
   e.preventDefault();
+  if (document.activeElement?.id === 'c-input') { addCommentFiles(files); return; }  // image into the comment
   uploadFiles(S.sel, files);
 });
 
@@ -2867,15 +3148,21 @@ document.addEventListener('touchcancel', endTouchDrag);
     history.replaceState(null, '', '/#inbox');
     await route();
     const url = meta.url || (meta.text.match(/https?:\/\/\S+/) || [])[0] || '';
-    const title = meta.title || meta.text.replace(url, '').trim() || (url ? url : '') || (files[0] ? files[0].name.replace(/\.[^.]+$/, '') : '');
-    openQuickSheet(title, {content: url && url !== title ? url : '', list_id: inbox().id, files});
+    if (feat('links')) {  // the link goes into the link field; a bare link gets domain + path as title
+      const [u, rest] = shareLink(meta.text, meta.url);
+      const title = meta.title || rest || (u ? urlTitle(u) : '') || (files[0] ? files[0].name.replace(/\.[^.]+$/, '') : '');
+      openQuickSheet(title, {url: u, list_id: inbox().id, files});
+    } else {
+      const title = meta.title || meta.text.replace(url, '').trim() || (url ? url : '') || (files[0] ? files[0].name.replace(/\.[^.]+$/, '') : '');
+      openQuickSheet(title, {content: url && url !== title ? url : '', list_id: inbox().id, files});
+    }
   } else if (location.pathname === '/share') {  // Android share sheet (text only, old manifest) -> new task
     const q = new URLSearchParams(location.search);
     const text = (q.get('text') || '').trim(), url = (q.get('url') || (text.match(/https?:\/\/\S+/) || [])[0] || '').trim();
-    const title = (q.get('title') || '').trim() || text.replace(url, '').trim() || url;
     history.replaceState(null, '', '/#inbox');
     await route();
-    openQuickSheet(title, {content: url && url !== title ? url : '', list_id: inbox().id});
+    if (feat('links')) { const [u, rest] = shareLink(text, (q.get('url') || '').trim()); openQuickSheet((q.get('title') || '').trim() || rest || (u ? urlTitle(u) : ''), {url: u, list_id: inbox().id}); }
+    else { const title = (q.get('title') || '').trim() || text.replace(url, '').trim() || url; openQuickSheet(title, {content: url && url !== title ? url : '', list_id: inbox().id}); }
   } else await route();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 })();
