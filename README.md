@@ -89,6 +89,8 @@ To remove the test again: `docker compose down` and delete the folder (your test
 
 ## Users and sharing
 
+<p align="center"><img src="docs/share.png" width="760" alt="Edit list dialog with the Sharing section: owner and a member who can edit"></p>
+
 - **Accounts:** admins manage users under *Settings > Users* (username, display name, optional password,
   optional SSO login, admin flag, ntfy topic, disable / delete). Everyone can change their own display name and
   password under *Settings > Account*. A user who still owns lists cannot be deleted (delete the lists or
