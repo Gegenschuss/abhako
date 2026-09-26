@@ -25,6 +25,7 @@ import hmac
 import io
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import re
@@ -237,6 +238,28 @@ CREATE INDEX IF NOT EXISTS time_list ON time_entries(list_id, start);
 CREATE UNIQUE INDEX IF NOT EXISTS time_running ON time_entries(user_id) WHERE end IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS time_pomo ON time_entries(pomo_id) WHERE pomo_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS time_client ON time_entries(user_id, client_id) WHERE client_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS task_deps (                -- dependencies: task_id waits on ("is blocked by") blocker_id
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  blocker_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  created_by INTEGER, created_at TEXT NOT NULL, PRIMARY KEY (task_id, blocker_id));
+CREATE INDEX IF NOT EXISTS task_deps_blocker ON task_deps(blocker_id);
+CREATE TABLE IF NOT EXISTS list_fields (              -- custom fields of a list (defined by the owner)
+  id INTEGER PRIMARY KEY, list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, type TEXT NOT NULL,       -- text | number | select | date | checkbox | person | url
+  options TEXT NOT NULL DEFAULT '{}',           -- json: number {unit}, select {options: [{id, name, color}]}
+  pinned INTEGER NOT NULL DEFAULT 0,            -- 1 = shown as a chip on the task rows (at most 2 per list)
+  sort REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS list_fields_list ON list_fields(list_id);
+CREATE TABLE IF NOT EXISTS task_field_values (        -- one value per task and field, shared by all list members
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  field_id INTEGER NOT NULL REFERENCES list_fields(id) ON DELETE CASCADE,
+  value TEXT NOT NULL, PRIMARY KEY (task_id, field_id));
+CREATE INDEX IF NOT EXISTS task_field_values_field ON task_field_values(field_id);
+CREATE TABLE IF NOT EXISTS list_status (              -- project status updates of a list (history; current one on lists)
+  id INTEGER PRIMARY KEY, list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS list_status_list ON list_status(list_id, id);
 CREATE TRIGGER IF NOT EXISTS time_task_list AFTER UPDATE OF list_id ON tasks WHEN NEW.list_id IS NOT OLD.list_id
 BEGIN UPDATE time_entries SET list_id=NEW.list_id WHERE task_id=NEW.id; END;
 CREATE TRIGGER IF NOT EXISTS time_task_title AFTER UPDATE OF title ON tasks WHEN NEW.title IS NOT OLD.title
@@ -265,6 +288,11 @@ MIGRATIONS = [
     ("users", "ical_token", "ALTER TABLE users ADD COLUMN ical_token TEXT"),           # secret of GET /ical/<uid>.<token>.ics
     # time tracking (2026-09-27): hourly rate of a list (reports / CSV amount), set by the owner
     ("lists", "rate", "ALTER TABLE lists ADD COLUMN rate REAL"),
+    # package 3 (2026-09-27): project status of a list ('' = none; history in list_status)
+    ("lists", "status", "ALTER TABLE lists ADD COLUMN status TEXT NOT NULL DEFAULT ''"),
+    ("lists", "status_note", "ALTER TABLE lists ADD COLUMN status_note TEXT NOT NULL DEFAULT ''"),
+    ("lists", "status_by", "ALTER TABLE lists ADD COLUMN status_by INTEGER"),
+    ("lists", "status_at", "ALTER TABLE lists ADD COLUMN status_at TEXT"),
 ]
 INDEXES = """
 CREATE INDEX IF NOT EXISTS lists_owner ON lists(owner_id);
@@ -294,10 +322,11 @@ USER_DEFAULTS = {
     "show_completed": "1",      # show the collapsed "Completed" group / done tasks in the calendar
     # modules that can be switched off in the settings (hidden from nav, data stays)
     # collab = comments, activity, mentions, News feed, sharing / assigning UI
-    "features": "cal,timeline,matrix,habits,pomo,kanban,paperless,collab,stats,time",
+    # progress = progress bar in the list header + the "Where is it stuck?" overview
+    "features": "cal,timeline,matrix,habits,pomo,kanban,paperless,collab,stats,time,progress",
     "nav_order": "tasks,cal,matrix,habits,pomo",   # order of the mobile tab bar / desktop rail
     "folders": "[]",            # json list: folder order in the sidebar (also keeps empty folders)
-    "features_rev": "6",        # one-shot migrations of the features list
+    "features_rev": "7",        # one-shot migrations of the features list
     "paperless_keep": "0",      # 1 = keep the local attachment after it was consumed by Paperless
     "lang": "en",               # UI + push language: en or a static/i18n/<code>.json
     "ical_scope": "all",        # calendar feed: all = every visible open task with a date, mine = mine / assigned to me
@@ -309,6 +338,9 @@ USER_DEFAULTS = {
     "time_focus": "1",          # finished focus / stopwatch sessions on a task become time entries
     "time_currency": "€",       # amounts (hourly rate of a list)
     "time_target": "0",         # daily target in hours (0 = none)
+    # package 3
+    "hide_blocked_today": "0",  # 1 = tasks waiting on an open blocker are left out of "Today"
+    "progress_subtasks": "0",   # 1 = the list progress counts subtasks too (else only main tasks)
 }
 # global, server-internal (table settings); the legacy single-user rows stay there untouched
 GLOBAL_DEFAULTS = {
@@ -539,15 +571,16 @@ def init_db():
             # features_rev 4: the "links" switch is gone (website link always on) -> dropped from the list
             # features_rev 5: statistics module added (2026-09-26) -> on by default
             # features_rev 6: time tracking module added (2026-09-27) -> on by default
+            # features_rev 7: project progress / overview added (2026-09-27) -> on by default
             s = usettings(c, uid)
             rev, fs = int(s.get("features_rev") or 1), [x for x in s["features"].split(",") if x]
-            if rev < 6:
-                for f, since in (("paperless", 2), ("collab", 3), ("stats", 5), ("time", 6)):
+            if rev < 7:
+                for f, since in (("paperless", 2), ("collab", 3), ("stats", 5), ("time", 6), ("progress", 7)):
                     if rev < since and f not in fs:
                         fs.append(f)
                 fs = [f for f in fs if f != "links"]
                 uset(c, uid, "features", ",".join(fs))
-                uset(c, uid, "features_rev", "6")
+                uset(c, uid, "features_rev", "7")
         if not gsetting(c, "undo_key"):  # signs the undo payloads handed to the client
             gset(c, "undo_key", secrets.token_hex(32))
         # one-shot: completions from before completed_by existed belong to the task's creator (else the list owner)
@@ -905,12 +938,33 @@ def load_tasks(c, where, args=()):
                               WHERE k.deleted_at IS NULL GROUP BY k.task_id""", (uid, uid)):
             if r["task_id"] in ids:
                 cms[r["task_id"]] = (r["n"], r["u"] or 0)
+    # custom field values (fields of the task's current list) and dependencies: blocked = open blockers
+    # (also ones I cannot see), blockers = the open ones I can see, blocking = open tasks waiting on it
+    fvs, blk, bing = {}, {}, {}
+    if ids:
+        for r in c.execute("""SELECT v.task_id, v.field_id, v.value FROM task_field_values v JOIN list_fields f ON f.id=v.field_id
+                              JOIN tasks t ON t.id=v.task_id WHERE f.list_id=t.list_id"""):
+            if r["task_id"] in ids:
+                fvs.setdefault(r["task_id"], {})[str(r["field_id"])] = r["value"]
+        for r in c.execute("""SELECT d.task_id, d.blocker_id, b.list_id FROM task_deps d JOIN tasks b ON b.id=d.blocker_id
+                              WHERE b.status=0 AND b.deleted_at IS NULL"""):
+            if r["task_id"] in ids:
+                blk.setdefault(r["task_id"], []).append((r["blocker_id"], r["list_id"]))
+        for r in c.execute("""SELECT d.blocker_id, COUNT(*) AS n FROM task_deps d JOIN tasks t ON t.id=d.task_id
+                              WHERE t.status=0 AND t.deleted_at IS NULL GROUP BY d.blocker_id"""):
+            if r["blocker_id"] in ids:
+                bing[r["blocker_id"]] = r["n"]
+    vis = vis_ids(c, uid) if blk and uid else set()
     out = []
     for r in rows:
         d = task_dict(r, tags)
         d["attachments"] = atts.get(r["id"], [])
         d["paperless"] = pls.get(r["id"], [])
         d["comment_count"], d["unread"] = cms.get(r["id"], (0, 0))
+        d["fields"] = fvs.get(r["id"], {})
+        d["blocked"] = len(blk.get(r["id"], []))
+        d["blockers"] = [b for b, lid in blk.get(r["id"], []) if lid in vis]
+        d["blocking"] = bing.get(r["id"], 0)
         out.append(d)
     return out
 
@@ -1218,9 +1272,14 @@ def visible_lists(c, uid):
         q2 = ",".join("?" * len(owners))
         names = {u["id"]: u["display_name"] or u["username"]
                  for u in c.execute(f"SELECT id, username, display_name FROM users WHERE id IN ({q2})", list(owners))}
+    subs = usettings(c, uid).get("progress_subtasks") == "1"
+    prog = list_progress(c, ids, subs)
+    snames = user_names(c, [r["status_by"] for r in rows])
     out = []
     for r in rows:
         d = {k: r[k] for k in r.keys() if not k.startswith("m_")}
+        d["progress"] = prog.get(r["id"], {"done": 0, "total": 0, "overdue": 0, "next_due": None})
+        d["status_by_name"] = snames.get(r["status_by"], "")
         if r["owner_id"] != uid:
             d.update(folder=r["m_folder"], sort=r["m_sort"], view=r["m_view"] or r["view"], role=r["m_role"])
         else:
@@ -1263,6 +1322,8 @@ def state():
                  for r in c.execute("SELECT * FROM filters WHERE user_id=? ORDER BY sort, id", (uid,))],
         sections=[dict(r) for r in c.execute(f"SELECT * FROM sections WHERE list_id IN {vis_sql()} ORDER BY sort, id",
                                              (uid, uid))],
+        fields=[field_dict(r) for r in c.execute(f"SELECT * FROM list_fields WHERE list_id IN {vis_sql()} ORDER BY sort, id",
+                                                 (uid, uid))],
         tasks=tasks,
         habits=habits,
         pomo=running_pomo(c),
@@ -1295,9 +1356,12 @@ def task_query():
         rows = load_tasks(c, f"list_id IN {wr_sql()} AND deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?",
                           (uid, uid, limit))
     elif scope == "search":
-        q = f"%{request.args.get('q', '').strip()}%"
-        rows = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND (title LIKE ? OR content LIKE ? OR url LIKE ?) "
-                             "ORDER BY status, updated_at DESC LIMIT ?", (uid, uid, q, q, q, limit))
+        raw = request.args.get('q', '').strip()
+        q = f"%{raw}%"
+        fids = sorted(search_field_ids(c, uid, raw))[:2000] if raw else []
+        rows = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND (title LIKE ? OR content LIKE ? OR url LIKE ? "
+                             f"OR id IN ({','.join('?' * len(fids)) or 'NULL'})) "
+                             "ORDER BY status, updated_at DESC LIMIT ?", (uid, uid, q, q, q, *fids, limit))
     else:
         rows = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND status!=0 ORDER BY completed_at DESC LIMIT ?",
                           (uid, uid, limit))
@@ -1444,6 +1508,8 @@ def member_remove(lid, uid):
         return err(tr("unknown"), 404)
     c.execute("DELETE FROM list_members WHERE list_id=? AND user_id=?", (lid, uid))
     c.execute("UPDATE tasks SET assignee_id=NULL WHERE list_id=? AND assignee_id=?", (lid, uid))
+    c.execute("DELETE FROM task_field_values WHERE value=? AND field_id IN (SELECT id FROM list_fields WHERE list_id=? AND type='person')",
+              (str(uid), lid))
     if uid != me():  # removed by the owner (leaving on your own is no news for you)
         news_add(c, uid, "unshare", list_id=lid,
                  data={"name": c.execute("SELECT name FROM lists WHERE id=?", (lid,)).fetchone()[0]})
@@ -1591,7 +1657,7 @@ TASK_FIELDS = ("list_id", "section_id", "parent_id", "title", "content", "priori
 # endpoints, never for noise (sort order, pin, reminders, private tags, view state). Repeated edits of
 # the same kind by the same user within ACT_MERGE_S update the last entry instead of adding lines
 # (typing in the title / description, clicking through dates).
-ACT_MERGE = {"title", "content", "due", "snooze", "priority", "assign", "list", "section", "repeat", "link", "parent"}
+ACT_MERGE = {"title", "content", "due", "snooze", "priority", "assign", "list", "section", "repeat", "link", "parent", "field"}
 ACT_MERGE_S = 600
 
 
@@ -1600,9 +1666,10 @@ def log_act(c, tid, kind, data=None, uid=None):
         uid = g.user["id"]
     ts, js = iso_ms(now_utc()), json.dumps(data or {}, ensure_ascii=False)
     if kind in ACT_MERGE:
-        last = c.execute("SELECT id, user_id, kind, created_at FROM activity WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        last = c.execute("SELECT id, user_id, kind, data, created_at FROM activity WHERE task_id=? ORDER BY id DESC LIMIT 1",
                          (tid,)).fetchone()
         if last and last["kind"] == kind and last["user_id"] == uid \
+                and (kind != "field" or json.loads(last["data"] or "{}").get("id") == (data or {}).get("id")) \
                 and (now_utc() - parse_iso(last["created_at"])).total_seconds() < ACT_MERGE_S:
             c.execute("UPDATE activity SET data=?, created_at=? WHERE id=?", (js, ts, last["id"]))
             return
@@ -1778,6 +1845,8 @@ def task_create():
                     [f[k] for k in f] + [ts, ts])
     if b.get("tags"):
         set_tags(c, cur.lastrowid, b["tags"])
+    if b.get("fields"):
+        set_field_values(c, cur.lastrowid, f["list_id"], b["fields"], log=False)  # BadInput: 400, nothing stored
     log_act(c, cur.lastrowid, "created")
     if f.get("assignee_id"):
         task_event(c, cur.lastrowid, "assign")
@@ -1865,6 +1934,15 @@ def apply_update(c, tid, b, conflicts=None):
         f["assignee_id"] = None  # the assignee has no access to the new list
     if "assignee_id" in f and _norm(f["assignee_id"]) != _norm(cur["assignee_id"]):
         f["assigned_by"] = me() if f["assignee_id"] else None
+    if "fields" in b:  # custom field values: validated before anything is written
+        try:
+            fl = {r["id"]: r for r in c.execute("SELECT * FROM list_fields WHERE list_id=?", (lid,))}
+            if not isinstance(b["fields"], dict) or any(not str(k).isdigit() or int(k) not in fl for k in b["fields"]):
+                raise BadInput(tr("Unknown field"))
+            for k, v in b["fields"].items():
+                field_value(c, fl[int(k)], v, lid)
+        except BadInput as e:
+            return str(e)
     if f:
         # a changed date / reminder set re-arms the reminder
         if any(k in f for k in ("due", "due_time", "reminders", "assignee_id")):
@@ -1888,6 +1966,8 @@ def apply_update(c, tid, b, conflicts=None):
         set_tags(c, tid, b["tags"])
     elif "add_tags" in b:
         set_tags(c, tid, my_tags(c, tid) + list(b["add_tags"]))
+    if "fields" in b and set_field_values(c, tid, lid, b["fields"]):
+        c.execute("UPDATE tasks SET updated_at=? WHERE id=?", (iso(now_utc()), tid))
     return None
 
 
@@ -1932,6 +2012,8 @@ def task_complete(tid):
     log_act(c, tid, "wont" if st == -1 else "reopen" if st == 0 else "complete", {"next": nxt} if nxt else None)
     if st == 2:
         task_event(c, tid, "complete")
+    if st != 0:
+        unblock_events(c, completed_ids(c, tid))
     bump(c)
     c.commit()
     return jsonify({**one_task(c, tid), "next_due": nxt, "undo": signed(tid, undo)})
@@ -1958,6 +2040,8 @@ def do_complete(c, tid, status=2, undo=None):
                         [vals[k] for k in cols])
         for r in c.execute("SELECT user_id, tag FROM task_tags WHERE task_id=?", (tid,)).fetchall():
             c.execute("INSERT INTO task_tags(task_id,user_id,tag) VALUES(?,?,?)", (cur.lastrowid, r["user_id"], r["tag"]))
+        c.execute("INSERT INTO task_field_values(task_id,field_id,value) SELECT ?, field_id, value FROM task_field_values WHERE task_id=?",
+                  (cur.lastrowid, tid))
         start = t["start"]
         if start:  # timeline range moves along with the due date
             start = (date.fromisoformat(start) + (date.fromisoformat(nxt) - date.fromisoformat(t["due"]))).isoformat()
@@ -2067,6 +2151,12 @@ def undo_status(c, tid, u):
     # the "completed" News items this completion created for others
     c.execute("DELETE FROM notifications WHERE task_id=? AND kind='complete' AND actor_id=? AND created_at>=?",
               (tid, me(), at))
+    fam = [tid, *descendants(c, tid)]  # ... and the "unblock" items / lines it caused (the tasks wait again)
+    q = ",".join("?" * len(fam))
+    c.execute(f"DELETE FROM notifications WHERE kind='unblock' AND actor_id=? AND created_at>=? AND json_extract(data,'$.blocker') IN ({q})",
+              (me(), at, *fam))
+    c.execute(f"DELETE FROM activity WHERE kind='unblocked' AND user_id=? AND created_at>=? AND json_extract(data,'$.id') IN ({q})",
+              (me(), at, *fam))
     log_act(c, tid, "reopen")
     return None
 
@@ -2575,7 +2665,7 @@ def task_batch():
     ids = [int(i) for i in b.get("ids", [])]
     action, data = b.get("action"), b.get("data") or {}
     ts = iso(now_utc())
-    errors, done, undo = [], 0, {}
+    errors, done, undo, finished = [], 0, {}, []
     per = data.get("items") if isinstance(data.get("items"), dict) else {}  # patch_each / undo: per task id
     for tid in ids:
         deleted = c.execute("SELECT deleted_at FROM tasks WHERE id=?", (tid,)).fetchone()
@@ -2605,6 +2695,8 @@ def task_batch():
                 log_act(c, tid, "wont" if st == -1 else "reopen" if st == 0 else "complete", {"next": nxt} if nxt else None)
                 if st == 2:
                     task_event(c, tid, "complete")
+                if st != 0:
+                    finished += completed_ids(c, tid)
             elif action == "undo":
                 e = undo_status(c, tid, per.get(str(tid)))
                 if e:
@@ -2621,6 +2713,7 @@ def task_batch():
             done += 1
         except Denied as e:
             errors.append(tr("No permission (view only)") if e.code == 403 else tr("unknown"))
+    unblock_events(c, finished)
     bump(c)
     c.commit()
     return jsonify(ok=True, count=done, errors=list(dict.fromkeys(errors)), undo=undo)
@@ -2734,6 +2827,13 @@ def timeline(tid):
     acts = [{"id": a["id"], "user_id": a["user_id"], "kind": a["kind"], "data": json.loads(a["data"] or "{}"),
              "created_at": a["created_at"]}
             for a in c.execute("SELECT * FROM activity WHERE task_id=? ORDER BY id", (tid,))]
+    vis = None
+    for a in acts:
+        if a["kind"] in DEP_ACTS and a["data"].get("id"):
+            vis = vis if vis is not None else vis_ids(c, me())
+            o = c.execute("SELECT list_id FROM tasks WHERE id=?", (a["data"]["id"],)).fetchone()
+            if not o or o["list_id"] not in vis:
+                a["data"] = {"hidden": True}
     comments = [comment_dict(r, atts) for r in rows]
     ids = {x["user_id"] for x in comments + acts} | {m for x in comments for m in x["mentions"]} \
         | {a["data"].get("to") for a in acts if a["kind"] == "assign"}
@@ -3009,7 +3109,8 @@ def task_push_tick(c, users, S, LG):
 # (watchdog, hourly).
 NEWS_KEEP_DAYS = int(os.environ.get("TASKS_NEWS_DAYS", "90"))
 NEWS_KEEP_MAX = int(os.environ.get("TASKS_NEWS_MAX", "500"))
-NEWS_KINDS = ("mention", "comment", "assign", "unassign", "complete", "share", "role", "unshare")
+NEWS_KINDS = ("mention", "comment", "assign", "unassign", "complete", "share", "role", "unshare", "unblock", "status")
+NEWS_LIST_KINDS = ("share", "role", "unshare", "status")  # about a list, not a task
 NEWS_EXCERPT = 300
 
 
@@ -3049,7 +3150,7 @@ def news_items(c, uid, s=None, mentions_only=False):
         kind = r["kind"]
         if mentions_only and kind != "mention":
             continue
-        if kind in ("share", "role"):
+        if kind in ("share", "role", "status"):
             if not sees(r["list_id"]):
                 continue
         elif kind != "unshare":
@@ -3074,11 +3175,17 @@ def news_items(c, uid, s=None, mentions_only=False):
                 body = re.sub(r"<@?\d*$", "", body[:NEWS_EXCERPT]).rstrip() + "…"
             uids.update(int(x) for x in MENTION_RE.findall(body))
         data = json.loads(r["data"] or "{}")
+        if kind == "status":
+            body = data.get("note") or ""
+        if kind == "unblock":  # the blocker's title only if I (still) see it
+            bl = c.execute("SELECT title, list_id FROM tasks WHERE id=?", (data.get("blocker"),)).fetchone()
+            data = {"title": bl["title"], "hidden": False} if bl and sees(bl["list_id"]) else {"title": None, "hidden": True}
         uids.add(r["actor_id"])
+        lk = kind in NEWS_LIST_KINDS
         out.append({"id": r["id"], "ids": [r["id"]], "kind": kind, "count": 1, "actor_id": r["actor_id"],
-                    "actors": [r["actor_id"]], "task_id": r["task_id"] if kind not in ("share", "role", "unshare") else None,
-                    "task_title": r["t_title"] if kind not in ("share", "role", "unshare") else None,
-                    "list_id": r["t_list"] if r["task_id"] and kind not in ("share", "role", "unshare") else r["list_id"],
+                    "actors": [r["actor_id"]], "task_id": r["task_id"] if not lk else None,
+                    "task_title": r["t_title"] if not lk else None,
+                    "list_id": r["t_list"] if r["task_id"] and not lk else r["list_id"],
                     "comment_id": r["comment_id"], "excerpt": body, "data": data, "created_at": r["created_at"],
                     "read": read})
     return out, user_names(c, uids)
@@ -3866,7 +3973,7 @@ def ntfy_test():
 @app.get("/api/export.json")
 def export_json():
     """My data: lists I own (also shared ones, with their tasks incl. link / sections / files / comments /
-    activity), my tags, habits, focus sessions, my time entries, filters and settings. Attachment files stay in data/attachments/."""
+    activity / custom fields + values / dependencies / status updates), my tags, habits, focus sessions, my time entries, filters and settings. Attachment files stay in data/attachments/."""
     c = db()
     uid = me()
     own = "(SELECT id FROM lists WHERE owner_id=?)"
@@ -3888,6 +3995,10 @@ def export_json():
         "settings": ("SELECT key, value FROM user_settings WHERE user_id=?", (uid,)),
         "templates": ("SELECT id, kind, name, data, created_at, updated_at FROM templates WHERE user_id=?", (uid,)),
         "time_entries": ("SELECT * FROM time_entries WHERE user_id=? ORDER BY start", (uid,)),
+        "list_fields": (f"SELECT * FROM list_fields WHERE list_id IN {own}", (uid,)),
+        "task_field_values": (f"SELECT * FROM task_field_values WHERE task_id IN {task_ids}", (uid,)),
+        "task_deps": (f"SELECT * FROM task_deps WHERE task_id IN {task_ids} OR blocker_id IN {task_ids}", (uid, uid)),
+        "list_status": (f"SELECT * FROM list_status WHERE list_id IN {own}", (uid,)),
     }
     data = {t: [dict(r) for r in c.execute(sql, args)] for t, (sql, args) in q.items()}
     data["user"] = user_public(g.user)
@@ -4019,6 +4130,7 @@ def user_delete(uid):
     c.execute("DELETE FROM task_tags WHERE user_id=?", (uid,))
     c.execute("UPDATE tasks SET assignee_id=NULL WHERE assignee_id=?", (uid,))
     c.execute("UPDATE tasks SET created_by=NULL WHERE created_by=?", (uid,))
+    c.execute("DELETE FROM task_field_values WHERE value=? AND field_id IN (SELECT id FROM list_fields WHERE type='person')", (str(uid),))
     c.execute("DELETE FROM users WHERE id=?", (uid,))  # cascades: settings, memberships, sessions
     bump(c)
     c.commit()
@@ -4081,17 +4193,32 @@ TPL_MAX_PER_USER = 200
 HHMM_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 
 
-def tpl_node_from_task(c, t, base, uid, depth=0):
+def tpl_node_from_task(c, t, base, uid, depth=0, fidx=None):
+    """fidx (list templates): ({field id: index}, {field id: type}) -> the node keeps its custom field values
+    as fv {index: value} (dates as days after use, people are not kept)."""
     def off(d):
         return max(0, (date.fromisoformat(d) - base).days) if d else None
     tags = [r[0] for r in c.execute("SELECT tag FROM task_tags WHERE task_id=? AND user_id=? ORDER BY tag", (t["id"], uid))]
     kids = c.execute("SELECT * FROM tasks WHERE parent_id=? AND deleted_at IS NULL ORDER BY sort, id",
                      (t["id"],)).fetchall() if depth < MAX_DEPTH - 1 else []
-    return {"title": t["title"], "content": t["content"] or "", "priority": t["priority"] or 0, "tags": tags,
-            "url": t["url"], "due_offset": off(t["due"]), "start_offset": off(t["start"]) if t["due"] else None,
-            "due_time": t["due_time"] if t["due"] else None, "duration": t["duration"] if t["due_time"] else None,
-            "reminders": t["reminders"] or "", "repeat": t["repeat"] or "", "repeat_from": t["repeat_from"] or "due",
-            "children": [tpl_node_from_task(c, k, base, uid, depth + 1) for k in kids]}
+    n = {"title": t["title"], "content": t["content"] or "", "priority": t["priority"] or 0, "tags": tags,
+         "url": t["url"], "due_offset": off(t["due"]), "start_offset": off(t["start"]) if t["due"] else None,
+         "due_time": t["due_time"] if t["due"] else None, "duration": t["duration"] if t["due_time"] else None,
+         "reminders": t["reminders"] or "", "repeat": t["repeat"] or "", "repeat_from": t["repeat_from"] or "due",
+         "children": [tpl_node_from_task(c, k, base, uid, depth + 1, fidx) for k in kids]}
+    if fidx:
+        fv = {}
+        for r in c.execute("SELECT field_id, value FROM task_field_values WHERE task_id=?", (t["id"],)):
+            i, ty = fidx[0].get(r["field_id"]), fidx[1].get(r["field_id"])
+            if i is None or ty == "person":
+                continue
+            try:
+                fv[str(i)] = (date.fromisoformat(r["value"]) - base).days if ty == "date" else r["value"]
+            except ValueError:
+                continue
+        if fv:
+            n["fv"] = fv
+    return n
 
 
 def tpl_clean_node(n, depth, count):
@@ -4125,7 +4252,10 @@ def tpl_clean_node(n, depth, count):
     rems = ",".join(dict.fromkeys(x.strip() for x in str(n.get("reminders") or "").split(",") if x.strip().isdigit()))
     url = str(n.get("url") or "").strip() or None
     kids = n.get("children") or []
+    fv = n.get("fv") if isinstance(n.get("fv"), dict) else {}
     return {"title": title, "content": str(n.get("content") or "")[:20000],
+            **({"fv": {k: v for k, v in list(fv.items())[:FIELD_MAX] if re.fullmatch(r"\d{1,2}", str(k))
+                       and isinstance(v, (str, int, float)) and not isinstance(v, bool) and len(str(v)) <= 2000}} if fv else {}),
             "priority": num("priority", 0, 5) if num("priority", 0, 5) in (0, 1, 3, 5) else 0,
             "tags": [str(x).strip().lstrip("#")[:60] for x in (n.get("tags") or []) if str(x).strip().lstrip("#")][:30]
             if isinstance(n.get("tags"), list) else [],
@@ -4154,7 +4284,7 @@ def tpl_clean(kind, d):
     color = str(d.get("color") or "")
     return {"name": str(d.get("name") or "").strip()[:200], "color": color if re.fullmatch(r"#[0-9a-fA-F]{3,8}", color) else "",
             "view": d.get("view") if d.get("view") in ("list", "kanban", "timeline") else "list",
-            "sections": secs, "tasks": tasks}
+            "sections": secs, "tasks": tasks, "fields": tpl_clean_fields(d.get("fields"))}
 
 
 def tpl_count(d):
@@ -4206,10 +4336,11 @@ def template_create():
             lst = c.execute("SELECT * FROM lists WHERE id=?", (lid,)).fetchone()
             secs = c.execute("SELECT id, name FROM sections WHERE list_id=? ORDER BY sort, id", (lid,)).fetchall()
             sidx = {s["id"]: i for i, s in enumerate(secs)}
+            fdefs, fidx, ftypes = tpl_fields_of(c, lid)
             tasks = []
             for t in c.execute("""SELECT * FROM tasks WHERE list_id=? AND parent_id IS NULL AND status=0 AND deleted_at IS NULL
                                   ORDER BY sort, id""", (lid,)).fetchall():
-                n = tpl_node_from_task(c, t, base, uid)
+                n = tpl_node_from_task(c, t, base, uid, fidx=(fidx, ftypes))
                 n["section"] = sidx.get(t["section_id"])
                 tasks.append(n)
             role = list_role(c, lid)
@@ -4218,7 +4349,7 @@ def template_create():
                                   "view": lst["view"] if role == "owner" else (c.execute(
                                       "SELECT COALESCE(view, ?) FROM list_members WHERE list_id=? AND user_id=?",
                                       (lst["view"], lid, uid)).fetchone() or ["list"])[0],
-                                  "sections": [s["name"] for s in secs], "tasks": tasks}
+                                  "sections": [s["name"] for s in secs], "tasks": tasks, "fields": fdefs}
         else:
             kind = b.get("kind") if b.get("kind") in ("task", "list") else None
             if not kind:
@@ -4271,8 +4402,9 @@ def template_delete(tid):
     return jsonify(ok=True)
 
 
-def tpl_insert(c, n, lid, sec, parent, base, sort, uid):
-    """Creates the task of one template node (and its subtasks); returns the new id."""
+def tpl_insert(c, n, lid, sec, parent, base, sort, uid, fmap=None):
+    """Creates the task of one template node (and its subtasks); returns the new id. fmap (list templates):
+    [new field rows by template index] for the node's custom field values (invalid ones are skipped)."""
     due = (base + timedelta(days=n["due_offset"])).isoformat() if n.get("due_offset") is not None else None
     start = (base + timedelta(days=n["start_offset"])).isoformat() if due and n.get("start_offset") is not None else None
     if start and start >= due:
@@ -4289,9 +4421,21 @@ def tpl_insert(c, n, lid, sec, parent, base, sort, uid):
                     [f[k] for k in f] + [ts, ts]).lastrowid
     if n.get("tags"):
         set_tags(c, tid, n["tags"], uid)
+    for k, v in (n.get("fv") or {}).items() if fmap else ():
+        f = fmap[int(k)] if int(k) < len(fmap) else None
+        if not f:
+            continue
+        try:
+            if f["type"] == "date":
+                v = (base + timedelta(days=max(-3650, min(3650, int(v))))).isoformat()
+            val = field_value(c, f, v, lid)
+        except (BadInput, ValueError, TypeError):
+            continue
+        if val is not None:
+            c.execute("INSERT OR REPLACE INTO task_field_values(task_id,field_id,value) VALUES(?,?,?)", (tid, f["id"], val))
     log_act(c, tid, "created")
     for i, k in enumerate(n.get("children") or []):
-        tpl_insert(c, k, lid, sec, tid, base, i + 1, uid)
+        tpl_insert(c, k, lid, sec, tid, base, i + 1, uid, fmap)
     return tid
 
 
@@ -4321,12 +4465,499 @@ def template_apply(tid):
                     (name, d.get("color") or "", "", my_max_sort(c, uid) + 1, d.get("view") or "list", iso(now_utc()), uid)).lastrowid
     secs = [c.execute("INSERT INTO sections(list_id,name,sort) VALUES(?,?,?)", (lid, s, i)).lastrowid
             for i, s in enumerate(d.get("sections") or [])]
+    fmap = []
+    for i, fd in enumerate(d.get("fields") or []):
+        fid = c.execute("INSERT INTO list_fields(list_id,name,type,options,pinned,sort,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (lid, fd["name"], fd["type"], json.dumps(fd.get("options") or {}, ensure_ascii=False), fd.get("pinned") or 0,
+                         i + 1, iso(now_utc()))).lastrowid
+        fmap.append(c.execute("SELECT * FROM list_fields WHERE id=?", (fid,)).fetchone())
     for i, n in enumerate(d.get("tasks") or []):
         si = n.get("section")
-        tpl_insert(c, n, lid, secs[si] if isinstance(si, int) and 0 <= si < len(secs) else None, None, base, i, uid)
+        tpl_insert(c, n, lid, secs[si] if isinstance(si, int) and 0 <= si < len(secs) else None, None, base, i, uid, fmap)
     bump(c)
     c.commit()
     return jsonify(list_id=lid)
+
+
+# ---------------------------------------------------------------- dependencies ("waiting on"), package 3
+# task_deps(task_id, blocker_id): task_id waits on blocker_id. A blocker is open while status=0 and it is
+# not in the trash (a trashed blocker is ignored until it is restored; done / won't do resolves it; a
+# recurring blocker stays open, its done copies do not unblock). Adding or removing a dependency changes
+# the waiting task: it needs write access to that task, and both tasks must be visible to the user. No
+# self-dependency, no cycles (checked on the whole graph, also through tasks the user cannot see).
+# Titles of tasks the user cannot see are never sent ("a task you cannot see").
+# When the LAST open blocker of a task is completed (done or won't do), the waiting task gets an activity
+# line and its assignee (else its creator) a News item "unblock" + push (module collab of the recipient,
+# burst rule, never the person who completed it).
+DEP_MAX = 50
+
+
+def dep_reaches(c, start, target):
+    """True if target is reachable from start along "waits on" edges (start waits on ... on target)."""
+    seen, todo = set(), [start]
+    while todo:
+        x = todo.pop()
+        if x == target:
+            return True
+        if x in seen or len(seen) > 10000:
+            continue
+        seen.add(x)
+        todo.extend(r[0] for r in c.execute("SELECT blocker_id FROM task_deps WHERE task_id=?", (x,)))
+    return False
+
+
+def open_blockers(c, tid):
+    return c.execute("""SELECT COUNT(*) FROM task_deps d JOIN tasks b ON b.id=d.blocker_id
+                        WHERE d.task_id=? AND b.status=0 AND b.deleted_at IS NULL""", (tid,)).fetchone()[0]
+
+
+def dep_rows(c, sql, tid, vis):
+    out = []
+    for r in c.execute(sql, (tid,)):
+        if r["deleted_at"]:
+            continue  # in the trash: ignored while it is there
+        if r["list_id"] in vis:
+            out.append({"id": r["id"], "title": r["title"], "status": r["status"], "list_id": r["list_id"],
+                        "due": r["due"], "assignee_id": r["assignee_id"], "hidden": False})
+        else:
+            out.append({"id": None, "title": None, "status": r["status"], "hidden": True})
+    return out
+
+
+@app.get("/api/tasks/<int:tid>/deps")
+def deps_get(tid):
+    """What the task waits on (blocked_by) and what waits on it (blocking), for the detail panel."""
+    c = db()
+    need_task(c, tid, write=False)
+    vis = vis_ids(c, me())
+    return jsonify(
+        blocked_by=dep_rows(c, "SELECT t.* FROM task_deps d JOIN tasks t ON t.id=d.blocker_id WHERE d.task_id=? ORDER BY d.created_at, t.id", tid, vis),
+        blocking=dep_rows(c, "SELECT t.* FROM task_deps d JOIN tasks t ON t.id=d.task_id WHERE d.blocker_id=? ORDER BY d.created_at, t.id", tid, vis))
+
+
+def dep_ids(b):
+    try:
+        return int(b.get("task_id")), int(b.get("blocker_id"))
+    except (TypeError, ValueError):
+        raise BadInput(tr("Invalid data")) from None
+
+
+@app.post("/api/deps")
+def dep_add():
+    """{task_id, blocker_id}: task_id waits on blocker_id."""
+    c = db()
+    t, bl = dep_ids(body())
+    need_task(c, t)                 # the waiting task changes: write access
+    need_task(c, bl, write=False)   # the blocker must be visible
+    if t == bl:
+        return err(tr("A task cannot wait on itself"))
+    rows = {r["id"]: r for r in c.execute("SELECT id, title, deleted_at FROM tasks WHERE id IN (?,?)", (t, bl))}
+    if rows[t]["deleted_at"] or rows[bl]["deleted_at"]:
+        return err(tr("The task is in the trash"), 409)
+    if not c.execute("SELECT 1 FROM task_deps WHERE task_id=? AND blocker_id=?", (t, bl)).fetchone():
+        if dep_reaches(c, bl, t):
+            return err(tr("That would create a circular dependency"))
+        if c.execute("SELECT COUNT(*) FROM task_deps WHERE task_id=?", (t,)).fetchone()[0] >= DEP_MAX:
+            return err(tr("At most {0} dependencies per task", DEP_MAX))
+        c.execute("INSERT INTO task_deps(task_id,blocker_id,created_by,created_at) VALUES(?,?,?,?)",
+                  (t, bl, me(), iso_ms(now_utc())))
+        log_act(c, t, "dep_add", {"id": bl, "title": rows[bl]["title"][:200]})
+        log_act(c, bl, "blocks_add", {"id": t, "title": rows[t]["title"][:200]})
+        bump(c)
+        c.commit()
+    return jsonify(ok=True, task=one_task(c, t))
+
+
+@app.delete("/api/deps/<int:t>/<int:bl>")
+def dep_remove(t, bl):
+    """Removes "t waits on bl". bl = 0: every blocker of t the user cannot see (lost access)."""
+    c = db()
+    need_task(c, t)
+    if bl == 0:
+        vis = vis_ids(c, me())
+        gone = [r[0] for r in c.execute("SELECT d.blocker_id, b.list_id FROM task_deps d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=?", (t,))
+                if r[1] not in vis]
+        for x in gone:
+            c.execute("DELETE FROM task_deps WHERE task_id=? AND blocker_id=?", (t, x))
+        if gone:
+            log_act(c, t, "dep_rm", {"hidden": True, "n": len(gone)})
+    else:
+        r = c.execute("SELECT b.title, b.list_id FROM task_deps d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND d.blocker_id=?",
+                      (t, bl)).fetchone()
+        if not r or not list_role(c, r["list_id"]):
+            raise Denied(404)
+        c.execute("DELETE FROM task_deps WHERE task_id=? AND blocker_id=?", (t, bl))
+        title = c.execute("SELECT title FROM tasks WHERE id=?", (t,)).fetchone()[0]
+        log_act(c, t, "dep_rm", {"id": bl, "title": r["title"][:200]})
+        log_act(c, bl, "blocks_rm", {"id": t, "title": title[:200]})
+    bump(c)
+    c.commit()
+    return jsonify(ok=True, task=one_task(c, t))
+
+
+def unblock_events(c, done_ids):
+    """done_ids: tasks just completed (done / won't do, incl. subtasks completed with them). Each open task
+    that waited on one of them and has no open blocker left: activity line + News / push (see above)."""
+    done_ids = list(dict.fromkeys(done_ids))
+    if not done_ids:
+        return
+    q = ",".join("?" * len(done_ids))
+    waiting = {}
+    for r in c.execute(f"""SELECT d.task_id, d.blocker_id FROM task_deps d JOIN tasks t ON t.id=d.task_id JOIN tasks b ON b.id=d.blocker_id
+                           WHERE d.blocker_id IN ({q}) AND b.status!=0 AND t.status=0 AND t.deleted_at IS NULL
+                           ORDER BY d.created_at""", done_ids):
+        waiting.setdefault(r["task_id"], r["blocker_id"])
+    actor = me()
+    for w, bl in waiting.items():
+        if open_blockers(c, w):
+            continue
+        b = c.execute("SELECT title, list_id FROM tasks WHERE id=?", (bl,)).fetchone()
+        log_act(c, w, "unblocked", {"id": bl, "title": b["title"][:200]})
+        t = c.execute("""SELECT t.*, l.name AS list_name, l.is_inbox AS list_inbox FROM tasks t JOIN lists l ON l.id=t.list_id
+                         WHERE t.id=?""", (w,)).fetchone()
+        uid = t["assignee_id"] or t["created_by"]
+        if not uid or uid == actor:
+            continue
+        s = collab_user(c, uid, t["list_id"])
+        if not s:
+            continue
+        news_add(c, uid, "unblock", task_id=w, data={"blocker": bl}, actor=actor)
+        if not s.get("ntfy_topic") or not burst_gate(c, uid, w, event=True):
+            continue
+        lg = lang_of(s)
+        who = user_names(c, [actor]).get(actor, "?")
+        bt = b["title"] if list_role(c, b["list_id"], uid) else tr("a task you cannot see", lg=lg)
+        lname = tr("Inbox", lg=lg) if t["list_inbox"] and t["list_name"] == "Eingang" else t["list_name"]
+        g.pushes.append((s["ntfy_topic"], tr("Unblocked: {0}", t["title"], lg=lg),
+                         tr("{0} completed {1}", who, bt, lg=lg) + " · " + lname, f"{PUBLIC_URL}/#t/{w}"))
+
+
+def completed_ids(c, tid):
+    """The task + its subtasks that are completed now (after do_complete)."""
+    return [x for x in [tid, *descendants(c, tid)]
+            if (c.execute("SELECT status FROM tasks WHERE id=?", (x,)).fetchone() or [0])[0] != 0]
+
+
+DEP_ACTS = ("dep_add", "dep_rm", "blocks_add", "blocks_rm", "unblocked")
+
+
+# ---------------------------------------------------------------- project status + progress, package 3
+# Status of a list (owner or edit members set it, with a short note; history in list_status) and a
+# News item "status" for the other list members (collab). Progress (in /api/state per list): main tasks
+# (subtasks too with the user setting progress_subtasks), all time, done vs. open, won't do and the trash
+# left out; done copies of recurring tasks are not counted (a recurring task counts once, as open).
+LIST_STATUSES = ("on_track", "at_risk", "off_track", "on_hold", "complete")
+STATUS_NOTE_MAX = 500
+
+
+def list_progress(c, ids, subtasks):
+    if not ids:
+        return {}
+    t0 = local_now().date().isoformat()
+    q = ",".join("?" * len(ids))
+    sub = "" if subtasks else "AND t.parent_id IS NULL"
+    out = {}
+    for r in c.execute(f"""SELECT t.list_id, SUM(t.status=0) AS open, SUM(t.status=2) AS done,
+                                  SUM(t.status=0 AND t.due IS NOT NULL AND t.due<?) AS overdue,
+                                  MIN(CASE WHEN t.status=0 AND t.due>=? THEN t.due END) AS next_due
+                           FROM tasks t WHERE t.list_id IN ({q}) AND t.deleted_at IS NULL AND t.status IN (0, 2) {sub}
+                             AND NOT (t.status=2 AND EXISTS (SELECT 1 FROM tasks o WHERE o.list_id=t.list_id AND o.id<t.id
+                                      AND o.created_at=t.created_at AND o.title=t.title))
+                           GROUP BY t.list_id""", (t0, t0, *ids)):
+        out[r["list_id"]] = {"done": r["done"] or 0, "total": (r["open"] or 0) + (r["done"] or 0),
+                             "overdue": r["overdue"] or 0, "next_due": r["next_due"]}
+    return out
+
+
+@app.post("/api/lists/<int:lid>/status")
+def list_status_set(lid):
+    """{status: on_track|at_risk|off_track|on_hold|complete|'' (none), note}: owner or edit member."""
+    b = body()
+    c = db()
+    need_list(c, lid)
+    lst = c.execute("SELECT * FROM lists WHERE id=?", (lid,)).fetchone()
+    if lst["is_inbox"]:
+        return err(tr("The inbox has no project status"))
+    st = b.get("status") or ""
+    if st not in LIST_STATUSES + ("",):
+        return err(tr("Unknown status"))
+    note = str(b.get("note") or "").strip()[:STATUS_NOTE_MAX] if st else ""
+    ts = iso_ms(now_utc())
+    c.execute("UPDATE lists SET status=?, status_note=?, status_by=?, status_at=? WHERE id=?", (st, note, me(), ts, lid))
+    c.execute("INSERT INTO list_status(list_id,user_id,status,note,created_at) VALUES(?,?,?,?,?)", (lid, me(), st, note, ts))
+    for uid in sorted(list_people(c, lid)):
+        if uid != me() and collab_user(c, uid, lid):
+            news_add(c, uid, "status", list_id=lid, data={"status": st, "note": note, "name": lst["name"]})
+    bump(c)
+    c.commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/lists/<int:lid>/status")
+def list_status_history(lid):
+    """The last status updates of a list (newest first)."""
+    c = db()
+    need_list(c, lid, write=False)
+    rows = c.execute("SELECT * FROM list_status WHERE list_id=? ORDER BY id DESC LIMIT 30", (lid,)).fetchall()
+    names = user_names(c, [r["user_id"] for r in rows])
+    return jsonify(items=[{"id": r["id"], "user_id": r["user_id"], "name": names.get(r["user_id"], ""), "status": r["status"],
+                           "note": r["note"], "created_at": r["created_at"]} for r in rows])
+
+
+# ---------------------------------------------------------------- custom fields, package 3
+# Defined per list by its owner; values are shared by everyone who sees the list (one value per task and
+# field), changed by whoever may change the task (not view-only). A task moved to another list keeps its
+# values, but only the fields of its current list are shown / filtered (moving it back brings them back).
+# Deleting a field deletes its values. Values are stored as text: number canonical ("12.5"), select =
+# option id, date = YYYY-MM-DD, checkbox = "1" (unchecked = no row), person = user id (a member of the list).
+FIELD_TYPES = ("text", "number", "select", "date", "checkbox", "person", "url")
+FIELD_MAX = 20          # per list
+FIELD_PINNED_MAX = 2    # chips on the task rows
+COLOR_RE = re.compile(r"#[0-9a-fA-F]{3,8}")
+
+
+def field_dict(r):
+    return {"id": r["id"], "list_id": r["list_id"], "name": r["name"], "type": r["type"],
+            "options": json.loads(r["options"] or "{}"), "pinned": int(r["pinned"] or 0), "sort": r["sort"]}
+
+
+def field_clean_def(b, old=None):
+    """(name, type, options) of a field definition from the client; raises BadInput."""
+    name = str(b.get("name", old["name"] if old else "") or "").strip()[:60]
+    if not name:
+        raise BadInput(tr("Name missing"))
+    ftype = old["type"] if old else b.get("type")
+    if ftype not in FIELD_TYPES:
+        raise BadInput(tr("Unknown field type"))
+    raw = b.get("options") if "options" in b else (json.loads(old["options"] or "{}") if old else {})
+    raw = raw if isinstance(raw, dict) else {}
+    opts = {}
+    if ftype == "number":
+        unit = str(raw.get("unit") or "").strip()[:12]
+        if unit:
+            opts["unit"] = unit
+    if ftype == "select":
+        items, seen = [], set()
+        for o in (raw.get("options") if isinstance(raw.get("options"), list) else [])[:50]:
+            if not isinstance(o, dict):
+                continue
+            nm = str(o.get("name") or "").strip()[:60]
+            if not nm:
+                continue
+            oid = str(o.get("id") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,16}", oid) or oid in seen:
+                oid = secrets.token_hex(4)
+            seen.add(oid)
+            col = str(o.get("color") or "")
+            items.append({"id": oid, "name": nm, "color": col if COLOR_RE.fullmatch(col) else ""})
+        if not items:
+            raise BadInput(tr("A selection field needs at least one option"))
+        opts["options"] = items
+    return name, ftype, opts
+
+
+def fmt_num(x):
+    s = ("%.6f" % x).rstrip("0").rstrip(".")
+    return "0" if s in ("-0", "") else s
+
+
+def field_value(c, f, v, lid):
+    """Validated stored value of field f (row) for a task in list lid; None = no value. Raises BadInput."""
+    t, name = f["type"], f["name"]
+    if v is None or v == "" or v is False:
+        return None
+    if isinstance(v, (dict, list)):
+        raise BadInput(tr("{0}: invalid value", name))
+    if t == "text":
+        return str(v).strip()[:1000] or None
+    if t == "url":
+        s = str(v).strip()
+        if not valid_url(s):
+            raise BadInput(tr("The link must start with http:// or https://"))
+        return s
+    if t == "number":
+        try:
+            x = float(str(v).strip().replace(",", "."))
+        except ValueError:
+            raise BadInput(tr("{0}: number expected", name)) from None
+        if not math.isfinite(x) or abs(x) >= 1e12:
+            raise BadInput(tr("{0}: number expected", name))
+        return fmt_num(x)
+    if t == "date":
+        try:
+            return date.fromisoformat(str(v)[:10]).isoformat()
+        except ValueError:
+            raise BadInput(tr("{0}: date expected", name)) from None
+    if t == "checkbox":
+        return "1" if v in (True, 1, "1", "true") else None
+    if t == "select":
+        if str(v) not in {o["id"] for o in json.loads(f["options"] or "{}").get("options", [])}:
+            raise BadInput(tr("{0}: unknown option", name))
+        return str(v)
+    if t == "person":
+        try:
+            uid = int(v)
+        except (TypeError, ValueError):
+            raise BadInput(tr("unknown user")) from None
+        if uid not in list_people(c, lid):
+            raise BadInput(tr("Only the owner or a member of the list can be assigned"))
+        return str(uid)
+    raise BadInput(tr("Unknown field type"))
+
+
+def field_act(c, f, v):
+    """Activity data of a changed value (display snapshot: option name, person name)."""
+    d = {"id": f["id"], "name": f["name"], "type": f["type"], "v": v}
+    if v is not None and f["type"] == "select":
+        o = next((o for o in json.loads(f["options"] or "{}").get("options", []) if o["id"] == v), None)
+        d["v"] = o["name"] if o else None
+    if v is not None and f["type"] == "person":
+        d["v"] = user_names(c, [int(v)]).get(int(v), "?")
+    if f["type"] == "number":
+        d["unit"] = json.loads(f["options"] or "{}").get("unit", "")
+    return d
+
+
+def set_field_values(c, tid, lid, vals, log=True):
+    """{field_id: value|null} for task tid in list lid. Validates everything first (BadInput), then writes."""
+    if not isinstance(vals, dict):
+        raise BadInput(tr("Invalid data"))
+    fields = {r["id"]: r for r in c.execute("SELECT * FROM list_fields WHERE list_id=?", (lid,))}
+    new = {}
+    for k, v in list(vals.items())[:FIELD_MAX * 2]:
+        try:
+            fid = int(k)
+        except (TypeError, ValueError):
+            raise BadInput(tr("Invalid data")) from None
+        if fid not in fields:
+            raise BadInput(tr("Unknown field"))
+        new[fid] = field_value(c, fields[fid], v, lid)
+    for fid, v in new.items():
+        old = c.execute("SELECT value FROM task_field_values WHERE task_id=? AND field_id=?", (tid, fid)).fetchone()
+        if (old[0] if old else None) == v:
+            continue
+        if v is None:
+            c.execute("DELETE FROM task_field_values WHERE task_id=? AND field_id=?", (tid, fid))
+        else:
+            c.execute("INSERT INTO task_field_values(task_id,field_id,value) VALUES(?,?,?) "
+                      "ON CONFLICT(task_id,field_id) DO UPDATE SET value=excluded.value", (tid, fid, v))
+        if log:
+            log_act(c, tid, "field", field_act(c, fields[fid], v))
+    return bool(new)
+
+
+def need_field(c, fid, owner=True):
+    r = c.execute("SELECT * FROM list_fields WHERE id=?", (fid,)).fetchone()
+    if not r:
+        raise Denied(404)
+    need_list(c, r["list_id"], write=owner, owner=owner)
+    return r
+
+
+def fields_pinned_ok(c, lid, fid=None):
+    n = c.execute("SELECT COUNT(*) FROM list_fields WHERE list_id=? AND pinned=1 AND id IS NOT ?", (lid, fid)).fetchone()[0]
+    return n < FIELD_PINNED_MAX
+
+
+@app.post("/api/lists/<int:lid>/fields")
+def field_create(lid):
+    """{name, type, options?, pinned?}: owner only."""
+    b = body()
+    c = db()
+    need_list(c, lid, owner=True)
+    if c.execute("SELECT COUNT(*) FROM list_fields WHERE list_id=?", (lid,)).fetchone()[0] >= FIELD_MAX:
+        return err(tr("At most {0} fields per list", FIELD_MAX))
+    name, ftype, opts = field_clean_def(b)
+    pinned = 1 if b.get("pinned") else 0
+    if pinned and not fields_pinned_ok(c, lid):
+        return err(tr("At most {0} fields can be shown on the task rows", FIELD_PINNED_MAX))
+    srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM list_fields WHERE list_id=?", (lid,)).fetchone()[0]
+    fid = c.execute("INSERT INTO list_fields(list_id,name,type,options,pinned,sort,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (lid, name, ftype, json.dumps(opts, ensure_ascii=False), pinned, srt, iso(now_utc()))).lastrowid
+    bump(c)
+    c.commit()
+    return jsonify(field_dict(c.execute("SELECT * FROM list_fields WHERE id=?", (fid,)).fetchone()))
+
+
+@app.patch("/api/fields/<int:fid>")
+def field_update(fid):
+    """{name?, options?, pinned?, sort?}: owner only; the type cannot change. Removed select options
+    lose their values."""
+    b = body()
+    c = db()
+    r = need_field(c, fid)
+    name, _, opts = field_clean_def(b, r)
+    if "pinned" in b:
+        pinned = 1 if b["pinned"] else 0
+        if pinned and not r["pinned"] and not fields_pinned_ok(c, r["list_id"], fid):
+            return err(tr("At most {0} fields can be shown on the task rows", FIELD_PINNED_MAX))
+        c.execute("UPDATE list_fields SET pinned=? WHERE id=?", (pinned, fid))
+    if "sort" in b:
+        try:
+            c.execute("UPDATE list_fields SET sort=? WHERE id=?", (float(b["sort"]), fid))
+        except (TypeError, ValueError):
+            return err(tr("Invalid data"))
+    if r["type"] == "select":
+        keep = {o["id"] for o in opts["options"]}
+        for (oid,) in c.execute("SELECT DISTINCT value FROM task_field_values WHERE field_id=?", (fid,)).fetchall():
+            if oid not in keep:
+                c.execute("DELETE FROM task_field_values WHERE field_id=? AND value=?", (fid, oid))
+    c.execute("UPDATE list_fields SET name=?, options=? WHERE id=?", (name, json.dumps(opts, ensure_ascii=False), fid))
+    bump(c)
+    c.commit()
+    return jsonify(field_dict(c.execute("SELECT * FROM list_fields WHERE id=?", (fid,)).fetchone()))
+
+
+@app.delete("/api/fields/<int:fid>")
+def field_delete(fid):
+    c = db()
+    need_field(c, fid)
+    n = c.execute("DELETE FROM task_field_values WHERE field_id=?", (fid,)).rowcount
+    c.execute("DELETE FROM list_fields WHERE id=?", (fid,))
+    bump(c)
+    c.commit()
+    return jsonify(ok=True, values=n)
+
+
+def search_field_ids(c, uid, q):
+    """Task ids whose text / link / select value matches q (fields of the task's current list, visible lists)."""
+    ql = q.casefold()
+    hits = set()
+    for f in c.execute(f"SELECT * FROM list_fields WHERE list_id IN {vis_sql()}", (uid, uid)).fetchall():
+        if f["type"] in ("text", "url"):
+            hits.update(r[0] for r in c.execute("""SELECT v.task_id FROM task_field_values v JOIN tasks t ON t.id=v.task_id
+                                                   WHERE v.field_id=? AND t.list_id=? AND v.value LIKE ?""", (f["id"], f["list_id"], f"%{q}%")))
+        elif f["type"] == "select":
+            oids = [o["id"] for o in json.loads(f["options"] or "{}").get("options", []) if ql in o["name"].casefold()]
+            for oid in oids:
+                hits.update(r[0] for r in c.execute("""SELECT v.task_id FROM task_field_values v JOIN tasks t ON t.id=v.task_id
+                                                       WHERE v.field_id=? AND t.list_id=? AND v.value=?""", (f["id"], f["list_id"], oid)))
+    return hits
+
+
+def tpl_fields_of(c, lid):
+    """List template: the field definitions (in order) + {field id: index}."""
+    rows = c.execute("SELECT * FROM list_fields WHERE list_id=? ORDER BY sort, id", (lid,)).fetchall()
+    return ([{"name": r["name"], "type": r["type"], "options": json.loads(r["options"] or "{}"), "pinned": int(r["pinned"] or 0)} for r in rows],
+            {r["id"]: i for i, r in enumerate(rows)}, {r["id"]: r["type"] for r in rows})
+
+
+def tpl_clean_fields(defs):
+    out = []
+    for d in (defs if isinstance(defs, list) else [])[:FIELD_MAX]:
+        if not isinstance(d, dict):
+            continue
+        try:
+            name, ftype, opts = field_clean_def(d)
+        except BadInput as e:
+            raise ValueError(str(e)) from None
+        out.append({"name": name, "type": ftype, "options": opts, "pinned": 1 if d.get("pinned") else 0})
+    pins = 0
+    for d in out:  # at most FIELD_PINNED_MAX pinned
+        pins += d["pinned"]
+        if pins > FIELD_PINNED_MAX:
+            d["pinned"] = 0
+    return out
 
 
 # ---------------------------------------------------------------- statistics (per user)

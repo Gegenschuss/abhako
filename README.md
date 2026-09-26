@@ -5,6 +5,8 @@
 <p align="center">A self-hosted task manager inspired by TickTick and Asana: personal planning meets team collaboration.<br>
 Lists, calendar, Eisenhower matrix, habits, a focus timer, time tracking, comments and shared lists in one small web app you run yourself.</p>
 
+<p align="center"><a href="https://abhako.com"><b>abhako.com</b></a> · <a href="#quick-start">Quick start</a> · <a href="TRANSLATING.md">Translate</a></p>
+
 <p align="center"><img src="docs/today.png" alt="Today view with overdue and today's tasks, subtasks, tags and the list sidebar"></p>
 
 > **Language:** the interface is **English** by default, with **German** included (switch under *Settings > General > Language*); more languages are welcome, see [TRANSLATING.md](TRANSLATING.md). The name comes from the German *abhaken*, to tick off.
