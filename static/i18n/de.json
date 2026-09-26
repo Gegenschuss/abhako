@@ -771,5 +771,6 @@
   "At most {0} templates": "Höchstens {0} Vorlagen",
   "List: {0}": "Liste: {0}",
   "Open in Abhako: {0}": "In Abhako öffnen: {0}",
-  "Open tasks with a date": "Offene Aufgaben mit Datum"
+  "Open tasks with a date": "Offene Aufgaben mit Datum",
+  "<b>Only reachable at home or over a VPN?</b> Google Calendar, iCloud and Outlook.com fetch the feed from their own servers and then cannot reach it. Use an app that fetches on the device instead: on Android ICSx⁵ (the calendar then shows up in every calendar app), on a Mac the location “On My Mac” instead of iCloud, or Thunderbird.": "<b>Nur zu Hause oder über VPN erreichbar?</b> Google Kalender, iCloud und Outlook.com holen den Kalender von ihren eigenen Servern und kommen dann nicht heran. Dann eine App nehmen, die auf dem Gerät abruft: unter Android ICSx⁵ (der Kalender erscheint dann in jeder Kalender-App), am Mac als Ort „Auf meinem Mac“ statt iCloud, oder Thunderbird."
 }

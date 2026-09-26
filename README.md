@@ -180,6 +180,12 @@ repeat from the completion date only show their next date), reminders become ala
 description holds the notes, the list and a link back to the task. Completed tasks disappear on the next refresh;
 how often that happens is up to the calendar app (Google: every few hours).
 
+> [!NOTE]
+> Google Calendar, iCloud and Outlook.com fetch subscriptions from their own servers, so your Abhako must be
+> reachable from the internet at that address. If it only runs at home or behind a VPN, use a client that fetches
+> on the device: [ICSx⁵](https://icsx5.bitfire.at) on Android (the calendar then appears in every calendar app),
+> the location *On My Mac* instead of iCloud on a Mac, or Thunderbird.
+
 The secret in the URL is the only credential: anyone with the link can read these tasks. *New link* replaces it
 (the old URL stops working at once), *Turn off* removes it. Wrong tokens answer 404 and are rate-limited per
 address. With a login proxy, let `/ical/*` bypass it (see *Reverse proxy*); Abhako never reads the proxy header there.

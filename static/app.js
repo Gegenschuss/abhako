@@ -2399,7 +2399,8 @@ function settingsModal(focus) {
         <li>${tr('<b>Android / Google Calendar:</b> on a computer open calendar.google.com > Other calendars > + > From URL, paste the link. It then shows up in the Calendar app on the phone (tap the calendar under Settings to sync it).')}</li>
         <li>${tr('<b>iPhone / iPad:</b> Settings > Apps > Calendar > Calendar Accounts > Add Account > Other > Add Subscribed Calendar, paste the link. <b>Mac:</b> Calendar > File > New Calendar Subscription.')}</li>
         <li>${tr('<b>Thunderbird:</b> Calendar > New Calendar > On the Network, paste the link.')}</li>
-        <li>${tr('<b>Outlook:</b> Add calendar > Subscribe from web.')}</li></ul></details>
+        <li>${tr('<b>Outlook:</b> Add calendar > Subscribe from web.')}</li>
+        <li>${tr('<b>Only reachable at home or over a VPN?</b> Google Calendar, iCloud and Outlook.com fetch the feed from their own servers and then cannot reach it. Use an app that fetches on the device instead: on Android ICSx⁵ (the calendar then shows up in every calendar app), on a Mac the location “On My Mac” instead of iCloud, or Thunderbird.')}</li></ul></details>
       ${hint(tr('Anyone who knows the link sees these tasks. If it got out, create a new link: the old one stops working at once.'))}
       ${S.paperless?.enabled ? `<h4>Paperless</h4>
       <div class="row"><label>${tr('After upload')}</label>${chk('s-plkeep', s.paperless_keep === '1', tr('Also keep the attachment in Abhako'))}</div>` : ''}
