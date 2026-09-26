@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Abhako — self-hosted task manager (single user), inspired by TickTick.
+"""Abhako — self-hosted task manager (multi-user, shared lists), inspired by TickTick.
 
-Has NO login of its own: run it behind a reverse proxy that authenticates
-(e.g. Authelia, oauth2-proxy, basic auth) or only inside a private network / VPN.
+Login: either a trusted reverse proxy that sends the user name in a header (AUTH_PROXY_HEADER, only
+honoured from AUTH_TRUSTED_PROXIES and, if set, only on AUTH_PROXY_PORT) or the built-in
+username/password login with a session cookie. The first start without users shows a setup page.
 Storage: SQLite at /data/tasks.db. Dates are LOCAL ($TZ, Europe/Berlin):
 tasks.due = 'YYYY-MM-DD', tasks.due_time = 'HH:MM' or NULL (all-day).
 
-Modules: lists (+ sections = kanban columns), tasks with subtasks, tags,
-priority, reminders, recurrence (RRULE via dateutil), habits, pomodoro.
-A watchdog thread sends ntfy pushes for due reminders, finished focus
-sessions, habit reminders and the optional daily digest.
-TickTick CSV backups can be imported (idempotent via tasks.tt_id)."""
+Modules: lists (+ sections = kanban columns), tasks with subtasks, tags, priority, reminders,
+recurrence (RRULE via dateutil), habits, pomodoro. Lists have one owner and can be shared with other
+users (role edit / view); tasks in shared lists can be assigned. Habits, focus sessions, filters,
+folders, tags and settings are per user. A watchdog thread sends ntfy pushes (per user topic) for due
+reminders, finished focus sessions, habit reminders and the optional daily digest.
+TickTick CSV backups can be imported (idempotent via tasks.tt_id per user).
+
+CSRF: every state-changing /api request must carry the header "X-Requested-With: abhako" (the web
+client always sends it; a cross-site page cannot set it without a CORS preflight, which is never
+allowed). Session cookies are HttpOnly + SameSite=Lax."""
 import csv
 import glob
+import hashlib
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -31,10 +39,11 @@ from zoneinfo import ZoneInfo
 
 from dateutil.rrule import rrulestr
 from flask import Flask, Response, g, has_request_context, jsonify, redirect, request, send_file, send_from_directory
+from werkzeug.security import check_password_hash, generate_password_hash
 
 DB = os.environ.get("TASKS_DB", "/data/tasks.db")
 TZ = ZoneInfo(os.environ.get("TZ", "Europe/Berlin"))
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")  # topic of the first admin (seed); other users: settings
 NTFY_URL = os.environ.get("NTFY_URL", "https://ntfy.sh")
 NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")  # optional ntfy access token (write access to NTFY_TOPIC)
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:3040")
@@ -54,7 +63,40 @@ PL_PUBLIC = os.environ.get("PAPERLESS_PUBLIC_URL", "").rstrip("/")
 # Optional share inbox: every message on an ntfy topic becomes an inbox task (files as attachments).
 # Needs a token with read access to that topic (NTFY_INBOX_TOKEN).
 NTFY_IN = {"token": os.environ.get("NTFY_INBOX_TOKEN", ""), "url": os.environ.get("NTFY_INBOX_URL", "").rstrip("/"),
-           "public": os.environ.get("NTFY_INBOX_PUBLIC", "").rstrip("/"), "topic": os.environ.get("NTFY_INBOX_TOPIC", "inbox")}
+           "public": os.environ.get("NTFY_INBOX_PUBLIC", "").rstrip("/"), "topic": os.environ.get("NTFY_INBOX_TOPIC", "inbox"),
+           "user": os.environ.get("NTFY_INBOX_USER", "").strip().lower()}  # username; empty = first admin
+
+
+def _nets(s):
+    out = []
+    for part in (s or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            try:
+                out.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                print("AUTH_TRUSTED_PROXIES: ignoring invalid entry", repr(part), flush=True)
+    return out
+
+
+# ---- login. Proxy mode: the header is trusted only from these peers (and only on AUTH_PROXY_PORT
+# if set: a second listener, so other containers that share the docker gateway IP cannot spoof it).
+AUTH_HEADER = os.environ.get("AUTH_PROXY_HEADER", "").strip()
+AUTH_TRUSTED = _nets(os.environ.get("AUTH_TRUSTED_PROXIES", ""))
+AUTH_PROXY_PORT = os.environ.get("AUTH_PROXY_PORT", "").strip()
+BOOT_USER = (os.environ.get("AUTH_BOOTSTRAP_USER") or "admin").strip().lower()
+BOOT_NAME = (os.environ.get("AUTH_BOOTSTRAP_NAME") or BOOT_USER.capitalize()).strip()
+BOOT_PROXY = os.environ.get("AUTH_BOOTSTRAP_PROXY_LOGIN", "").strip() or None
+SESSION_DAYS = int(os.environ.get("AUTH_SESSION_DAYS", "30"))
+COOKIE = "abhako_session"
+CSRF_HEADER, CSRF_VALUE = "X-Requested-With", "abhako"
+# reachable without a user; the proxy header is never read on PROXY_IGNORE paths (they bypass the
+# proxy login, so a client could send its own header there)
+OPEN_PATHS = {"/", "/sw.js", "/manifest.json", "/api/health", "/drop",
+              "/api/auth/info", "/api/auth/login", "/api/auth/setup", "/api/auth/logout"}
+PROXY_IGNORE = {"/drop", "/manifest.json", "/sw.js", "/api/health"}
+USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
+MIN_PASSWORD = 8
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_MB * 4 * 1024 * 1024  # one request may carry several files
@@ -86,10 +128,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS tasks_list ON tasks(list_id);
 CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS tasks_open ON tasks(status) WHERE deleted_at IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS tasks_tt ON tasks(tt_id) WHERE tt_id IS NOT NULL;
-CREATE TABLE IF NOT EXISTS task_tags (
+CREATE TABLE IF NOT EXISTS task_tags (                -- tags are per user (user_id)
   task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  tag TEXT NOT NULL, PRIMARY KEY (task_id, tag));
+  user_id INTEGER NOT NULL DEFAULT 0,
+  tag TEXT NOT NULL, PRIMARY KEY (task_id, user_id, tag));
 CREATE TABLE IF NOT EXISTS habits (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, color TEXT NOT NULL DEFAULT '',
   goal INTEGER NOT NULL DEFAULT 1, days TEXT NOT NULL DEFAULT '1234567',
@@ -103,7 +145,7 @@ CREATE TABLE IF NOT EXISTS pomos (
   kind TEXT NOT NULL DEFAULT 'focus', minutes INTEGER NOT NULL,
   start TEXT NOT NULL, paused_at TEXT, paused_s INTEGER NOT NULL DEFAULT 0,
   end TEXT, done INTEGER NOT NULL DEFAULT 0, notified INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- global (server-internal)
 CREATE TABLE IF NOT EXISTS attachments (
   id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   name TEXT NOT NULL, mime TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0,
@@ -121,6 +163,24 @@ CREATE TABLE IF NOT EXISTS filters (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL,
   rules TEXT NOT NULL DEFAULT '{}',            -- json: {op, lists, dates, prios, tags}
   sort REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL DEFAULT '',
+  password_hash TEXT,                           -- NULL = no built-in login (proxy only)
+  proxy_login TEXT UNIQUE,                      -- value of AUTH_PROXY_HEADER that maps to this user
+  is_admin INTEGER NOT NULL DEFAULT 0, drop_token TEXT, created_at TEXT NOT NULL,
+  disabled INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (user_id, key));
+CREATE TABLE IF NOT EXISTS list_members (             -- shared lists: role edit | view; folder/sort/view = the member's own
+  list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL DEFAULT 'edit', folder TEXT NOT NULL DEFAULT '', sort REAL NOT NULL DEFAULT 0,
+  view TEXT, added_at TEXT NOT NULL, PRIMARY KEY (list_id, user_id));
+CREATE INDEX IF NOT EXISTS list_members_user ON list_members(user_id);
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
 """
 # additive migrations: (table, column, ddl)
 MIGRATIONS = [
@@ -129,25 +189,45 @@ MIGRATIONS = [
     ("tasks", "duration", "ALTER TABLE tasks ADD COLUMN duration INTEGER"),  # minutes, week/day calendar blocks
     ("habits", "per_week", "ALTER TABLE habits ADD COLUMN per_week INTEGER NOT NULL DEFAULT 0"),  # 0 = fixed weekdays
     ("habit_logs", "note", "ALTER TABLE habit_logs ADD COLUMN note TEXT NOT NULL DEFAULT ''"),
+    # multi-user (2026-09-26)
+    ("lists", "owner_id", "ALTER TABLE lists ADD COLUMN owner_id INTEGER"),
+    ("tasks", "created_by", "ALTER TABLE tasks ADD COLUMN created_by INTEGER"),
+    ("tasks", "assignee_id", "ALTER TABLE tasks ADD COLUMN assignee_id INTEGER"),
+    ("habits", "user_id", "ALTER TABLE habits ADD COLUMN user_id INTEGER"),
+    ("pomos", "user_id", "ALTER TABLE pomos ADD COLUMN user_id INTEGER"),
+    ("filters", "user_id", "ALTER TABLE filters ADD COLUMN user_id INTEGER"),
 ]
+INDEXES = """
+CREATE INDEX IF NOT EXISTS lists_owner ON lists(owner_id);
+CREATE INDEX IF NOT EXISTS tasks_assignee ON tasks(assignee_id);
+CREATE INDEX IF NOT EXISTS habits_user ON habits(user_id);
+CREATE INDEX IF NOT EXISTS pomos_user ON pomos(user_id);
+CREATE INDEX IF NOT EXISTS filters_user ON filters(user_id);
+CREATE INDEX IF NOT EXISTS task_tags_user ON task_tags(user_id, tag);
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_tt_user ON tasks(created_by, tt_id) WHERE tt_id IS NOT NULL;
+"""
 MAX_DEPTH = 3  # task > subtask > sub-subtask
-DEFAULT_SETTINGS = {
+# per user (table user_settings)
+USER_DEFAULTS = {
     "allday_time": "09:00",     # reminder base time for all-day tasks
     "default_reminder": "0",    # reminder preset for new timed tasks ('' = none)
     "digest_time": "",          # daily "due today" push (HH:MM, '' = off)
     "digest_sent": "",
     "pomo_focus": "25", "pomo_short": "5", "pomo_long": "15", "pomo_long_every": "4",
-    "ntfy_topic": "",
+    "ntfy_topic": "",           # set by an admin (a user could otherwise push into someone else's topic)
     "show_completed": "1",      # show the collapsed "Completed" group / done tasks in the calendar
     # modules that can be switched off in the settings (hidden from nav, data stays)
     "features": "cal,timeline,matrix,habits,pomo,kanban,paperless",
     "nav_order": "tasks,cal,matrix,habits,pomo",   # order of the mobile tab bar / desktop rail
-    "folders": "[]",
-    "features_rev": "1",        # one-shot migrations of the features list
-    "paperless_keep": "0",
-    "ntfy_inbox_since": "",     # last imported ntfy message id (or unix time on first start)      # 1 = keep the local attachment after it was consumed by Paperless            # json list: folder order in the sidebar (also keeps empty folders)
-    "lang": "en",               # UI + push language: en or a static/i18n/<code>.json (global, the watchdog sends pushes)
-    "version": "1",
+    "folders": "[]",            # json list: folder order in the sidebar (also keeps empty folders)
+    "features_rev": "2",        # one-shot migrations of the features list
+    "paperless_keep": "0",      # 1 = keep the local attachment after it was consumed by Paperless
+    "lang": "en",               # UI + push language: en or a static/i18n/<code>.json
+}
+# global, server-internal (table settings); the legacy single-user rows stay there untouched
+GLOBAL_DEFAULTS = {
+    "version": "1",             # bumped on every change; clients poll it
+    "ntfy_inbox_since": "",     # last imported ntfy message id (or unix time on first start)
 }
 PRIO = {0: "", 1: "niedrig", 3: "mittel", 5: "hoch"}
 
@@ -155,7 +235,7 @@ PRIO = {0: "", 1: "niedrig", 3: "mittel", 5: "hoch"}
 # ---------------------------------------------------------------- i18n
 # English is the source language: tr("English text", *args) returns the text in the UI language.
 # Translations are the same JSON files the web client loads (static/i18n/<code>.json, see TRANSLATING.md).
-# The "lang" setting is global because the watchdog sends pushes in it. A list value = [one, other] (trn()).
+# The language is a per-user setting; pushes use the recipient's language. A list value = [one, other] (trn()).
 I18N_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "i18n")
 
 
@@ -183,17 +263,24 @@ def languages():
                   key=lambda x: x["name"].casefold())
 
 
-def lang(c=None):
-    """UI language from the settings ('en' default). Works in requests and in the watchdog threads."""
+def lang(c=None, uid=None):
+    """UI language of a user (request: the logged-in user; no user: the first admin). Works in
+    requests and in the watchdog threads."""
     try:
+        if uid is None and has_request_context() and getattr(g, "user", None):
+            uid = g.user["id"]
         own = c is None and not has_request_context()
         c = c or (db() if has_request_context() else connect())
         try:
-            r = c.execute("SELECT value FROM settings WHERE key='lang'").fetchone()
+            if uid is None:
+                uid = default_uid(c)
+            r = c.execute("SELECT value FROM user_settings WHERE user_id=? AND key='lang'", (uid,)).fetchone() \
+                if uid else None
         finally:
             if own:
                 c.close()
-        return r[0] if r and r[0] in LANGS else "en"
+        v = r[0] if r else USER_DEFAULTS["lang"]
+        return v if v in LANGS else "en"
     except Exception:  # noqa: BLE001
         return "en"
 
@@ -259,38 +346,135 @@ def close_db(_):
         c.close()
 
 
+def random_topic():
+    return "abhako-" + secrets.token_urlsafe(9).replace("_", "").replace("-", "").lower()
+
+
+def default_uid(c):
+    """First enabled admin (owner of the migrated single-user data, target of env defaults)."""
+    r = c.execute("SELECT id FROM users WHERE is_admin=1 AND disabled=0 ORDER BY id LIMIT 1").fetchone() \
+        or c.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+    return r[0] if r else None
+
+
+def ensure_inbox(c, uid):
+    if not c.execute("SELECT 1 FROM lists WHERE is_inbox=1 AND owner_id=?", (uid,)).fetchone():
+        c.execute("INSERT INTO lists(name,is_inbox,sort,created_at,owner_id) VALUES('Eingang',1,-1,?,?)",
+                  (iso(now_utc()), uid))
+
+
+def adopt_orphans(c, uid):
+    """Rows from the single-user era (no owner) belong to uid. Idempotent (only NULL owners)."""
+    n = c.execute("UPDATE lists SET owner_id=? WHERE owner_id IS NULL", (uid,)).rowcount
+    n += c.execute("UPDATE tasks SET created_by=? WHERE created_by IS NULL", (uid,)).rowcount
+    for t in ("habits", "pomos", "filters"):
+        n += c.execute(f"UPDATE {t} SET user_id=? WHERE user_id IS NULL", (uid,)).rowcount
+    n += c.execute("UPDATE task_tags SET user_id=? WHERE user_id=0", (uid,)).rowcount
+    return n
+
+
+def create_user(c, username, display_name="", password=None, proxy_login=None, is_admin=False,
+                ntfy_topic=None, seed_global=False, drop_token=None):
+    """Inserts a user with settings (+ inbox unless the caller adopts an existing one). Returns the id."""
+    uid = c.execute("""INSERT INTO users(username,display_name,password_hash,proxy_login,is_admin,drop_token,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (username, display_name or username, generate_password_hash(password) if password else None,
+                     proxy_login or None, 1 if is_admin else 0, drop_token or secrets.token_urlsafe(24),
+                     iso(now_utc()))).lastrowid
+    vals = dict(USER_DEFAULTS)
+    if seed_global:  # the single-user settings become this user's settings
+        for r in c.execute("SELECT key, value FROM settings"):
+            if r["key"] in USER_DEFAULTS:
+                vals[r["key"]] = r["value"]
+    if ntfy_topic is not None:
+        vals["ntfy_topic"] = ntfy_topic
+    if not vals["ntfy_topic"]:
+        vals["ntfy_topic"] = random_topic()
+    for k, v in vals.items():
+        c.execute("INSERT OR REPLACE INTO user_settings(user_id,key,value) VALUES(?,?,?)", (uid, k, v))
+    return uid
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     os.makedirs(ATT_DIR, exist_ok=True)
     c = connect()
     c.executescript(SCHEMA)
-    for table, col, ddl in MIGRATIONS:
-        if col not in {r[1] for r in c.execute(f"PRAGMA table_info({table})")}:
-            c.execute(ddl)
-    for k, v in DEFAULT_SETTINGS.items():
-        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
-    # topic: env wins, otherwise a random private one generated once
-    if NTFY_TOPIC:
-        c.execute("UPDATE settings SET value=? WHERE key='ntfy_topic'", (NTFY_TOPIC,))
-    elif not c.execute("SELECT value FROM settings WHERE key='ntfy_topic'").fetchone()[0]:
-        c.execute("UPDATE settings SET value=? WHERE key='ntfy_topic'",
-                  ("abhako-" + secrets.token_urlsafe(9).replace("_", "").replace("-", "").lower(),))
-    # features_rev 2: paperless module added -> on by default for existing installs
-    if int(c.execute("SELECT value FROM settings WHERE key='features_rev'").fetchone()[0] or 1) < 2:
-        f = c.execute("SELECT value FROM settings WHERE key='features'").fetchone()[0]
-        if "paperless" not in f.split(","):
-            c.execute("UPDATE settings SET value=? WHERE key='features'", (f + ",paperless",))
-        c.execute("UPDATE settings SET value='2' WHERE key='features_rev'")
-    if not c.execute("SELECT 1 FROM lists WHERE is_inbox=1").fetchone():
-        c.execute("INSERT INTO lists(name,is_inbox,sort,created_at) VALUES('Eingang',1,-1,?)",
-                  (iso(now_utc()),))
-    c.commit()
+    c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        for table, col, ddl in MIGRATIONS:
+            if col not in {r[1] for r in c.execute(f"PRAGMA table_info({table})")}:
+                c.execute(ddl)
+        # task_tags from the single-user era: (task_id, tag) -> (task_id, user_id, tag); 0 = adopted below
+        if "user_id" not in {r[1] for r in c.execute("PRAGMA table_info(task_tags)")}:
+            c.execute("""CREATE TABLE task_tags_mu (task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                         user_id INTEGER NOT NULL DEFAULT 0, tag TEXT NOT NULL, PRIMARY KEY (task_id, user_id, tag))""")
+            c.execute("INSERT INTO task_tags_mu(task_id,user_id,tag) SELECT task_id, 0, tag FROM task_tags")
+            c.execute("DROP TABLE task_tags")
+            c.execute("ALTER TABLE task_tags_mu RENAME TO task_tags")
+        c.execute("DROP INDEX IF EXISTS tasks_tt")  # tt_id is unique per user now (tasks_tt_user)
+        for stmt in INDEXES.strip().split(";"):
+            if stmt.strip():
+                c.execute(stmt)
+        for k, v in GLOBAL_DEFAULTS.items():
+            c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+        # migration of a single-user install: its data belongs to the bootstrap admin
+        if not c.execute("SELECT 1 FROM users").fetchone():
+            has_data = (c.execute("SELECT COUNT(*) FROM lists").fetchone()[0] > 1
+                        or c.execute("SELECT 1 FROM tasks").fetchone() or c.execute("SELECT 1 FROM habits").fetchone()
+                        or c.execute("SELECT 1 FROM filters").fetchone() or c.execute("SELECT 1 FROM pomos").fetchone())
+            if has_data:
+                legacy_topic = (c.execute("SELECT value FROM settings WHERE key='ntfy_topic'").fetchone() or [""])[0]
+                uid = create_user(c, BOOT_USER, BOOT_NAME, None, BOOT_PROXY, True,
+                                  ntfy_topic=legacy_topic or NTFY_TOPIC or None, seed_global=True,
+                                  drop_token=os.environ.get("TASKS_DROP_TOKEN") or None)
+                n = adopt_orphans(c, uid)
+                print(f"multi-user migration: created user {BOOT_USER!r} (id {uid}), adopted {n} rows", flush=True)
+        first = default_uid(c)
+        if first:
+            n = adopt_orphans(c, first)
+            if n:
+                print("adopted", n, "ownerless rows for user", first, flush=True)
+            if NTFY_TOPIC:  # env topic seeds the first admin's topic when it is still empty
+                c.execute("UPDATE user_settings SET value=? WHERE user_id=? AND key='ntfy_topic' AND value=''",
+                          (NTFY_TOPIC, first))
+        for (uid,) in c.execute("SELECT id FROM users").fetchall():
+            ensure_inbox(c, uid)
+            for k, v in USER_DEFAULTS.items():
+                c.execute("INSERT OR IGNORE INTO user_settings(user_id,key,value) VALUES(?,?,?)", (uid, k, v))
+            # features_rev 2: paperless module added -> on by default for existing installs
+            s = usettings(c, uid)
+            if int(s.get("features_rev") or 1) < 2:
+                if "paperless" not in s["features"].split(","):
+                    uset(c, uid, "features", s["features"] + ",paperless")
+                uset(c, uid, "features_rev", "2")
+        c.execute("COMMIT")
+    except Exception:
+        c.execute("ROLLBACK")
+        raise
     c.close()
 
 
-def settings(c=None):
-    c = c or db()
-    return {r["key"]: r["value"] for r in c.execute("SELECT key,value FROM settings")}
+def gsetting(c, key):
+    r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r[0] if r else GLOBAL_DEFAULTS.get(key, "")
+
+
+def gset(c, key, value):
+    c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+              (key, str(value)))
+
+
+def usettings(c, uid):
+    s = dict(USER_DEFAULTS)
+    s.update({r["key"]: r["value"] for r in c.execute("SELECT key, value FROM user_settings WHERE user_id=?", (uid,))})
+    return s
+
+
+def uset(c, uid, key, value):
+    c.execute("INSERT INTO user_settings(user_id,key,value) VALUES(?,?,?) "
+              "ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value", (uid, key, str(value)))
 
 
 def bump(c):
@@ -305,6 +489,275 @@ def body():
     return request.get_json(silent=True) or {}
 
 
+# ---------------------------------------------------------------- auth
+
+def me():
+    return g.user["id"]
+
+
+def _peer_trusted():
+    """Direct peer is a trusted proxy (and the request came in on the proxy port, if one is set)."""
+    try:
+        ip = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        return False
+    if not any(ip in n for n in AUTH_TRUSTED):
+        return False
+    return not AUTH_PROXY_PORT or str(request.environ.get("SERVER_PORT", "")) == AUTH_PROXY_PORT
+
+
+def proxy_login_value():
+    """The trusted proxy header of this request, or '' (not configured / untrusted peer / bypassed path)."""
+    if not AUTH_HEADER or request.path in PROXY_IGNORE or request.path.startswith("/static/"):
+        return ""
+    v = (request.headers.get(AUTH_HEADER) or "").strip()
+    return v if v and _peer_trusted() else ""
+
+
+def _token_hash(t):
+    return hashlib.sha256(t.encode()).hexdigest()
+
+
+def client_ip():
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff and _peer_trusted():
+        return xff.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
+def _is_open(path, method):
+    return path in OPEN_PATHS or path.startswith("/static/") or (path == "/share" and method == "GET")
+
+
+@app.before_request
+def authenticate():
+    g.user, g.auth_via, g.auth_error, g.proxy_login = None, None, None, ""
+    c = db()
+    val = proxy_login_value()
+    if val:
+        u = c.execute("SELECT * FROM users WHERE proxy_login=? COLLATE NOCASE", (val,)).fetchone()
+        if u and not u["disabled"]:
+            g.user, g.auth_via = u, "proxy"
+        else:
+            g.auth_error, g.proxy_login = ("disabled" if u else "no_account"), val
+    if not g.user and not g.auth_error:
+        tok = request.cookies.get(COOKIE)
+        if tok:
+            r = c.execute("""SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
+                             WHERE s.token_hash=? AND s.expires_at>? AND u.disabled=0""",
+                          (_token_hash(tok), iso(now_utc()))).fetchone()
+            if r:
+                g.user, g.auth_via = r, "session"
+    path = request.path
+    if request.method not in ("GET", "HEAD", "OPTIONS") and path.startswith("/api/") \
+            and request.headers.get(CSRF_HEADER) != CSRF_VALUE:
+        return err(tr("Request blocked: header {0} missing", CSRF_HEADER), 403)
+    if g.user or _is_open(path, request.method):
+        return None
+    if path.startswith("/api/"):
+        if g.auth_error:
+            msg = tr("This account is disabled") if g.auth_error == "disabled" else tr("No account for {0}", g.proxy_login)
+            return jsonify(error=msg, auth=g.auth_error, login=g.proxy_login), 403
+        setup = not c.execute("SELECT 1 FROM users").fetchone()
+        return jsonify(error=tr("Please log in"), auth="setup" if setup else "login"), 401
+    return redirect("/", 303)
+
+
+_fails, _fail_lock = {}, threading.Lock()
+FAIL_WINDOW = 900  # s
+
+
+def _rate_keys(username):
+    return [("u:" + username, 5), ("ip:" + client_ip(), 20)]
+
+
+def _rate_blocked(keys):
+    now = time.time()
+    with _fail_lock:
+        for k, limit in keys:
+            arr = [t for t in _fails.get(k, []) if now - t < FAIL_WINDOW]
+            _fails[k] = arr
+            if len(arr) >= limit:
+                return True
+    return False
+
+
+def _rate_fail(keys):
+    with _fail_lock:
+        for k, _ in keys:
+            _fails.setdefault(k, []).append(time.time())
+
+
+def start_session(c, uid, remember):
+    tok = secrets.token_urlsafe(32)
+    days = SESSION_DAYS if remember else 1
+    c.execute("DELETE FROM sessions WHERE expires_at<?", (iso(now_utc()),))
+    c.execute("INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)",
+              (_token_hash(tok), uid, iso(now_utc()), iso(now_utc() + timedelta(days=days))))
+    return tok, (days * 86400 if remember else None)
+
+
+def set_cookie(resp, tok, max_age):
+    secure = request.is_secure or request.headers.get("X-Forwarded-Proto", "") == "https"
+    resp.set_cookie(COOKIE, tok, max_age=max_age, httponly=True, samesite="Lax", secure=secure, path="/")
+    return resp
+
+
+def user_public(u):
+    return {"id": u["id"], "username": u["username"], "display_name": u["display_name"] or u["username"]}
+
+
+@app.get("/api/auth/info")
+def auth_info():
+    """What the login screen needs (open): setup needed?, language, why a proxy login failed."""
+    c = db()
+    return jsonify(setup=not c.execute("SELECT 1 FROM users").fetchone(), lang=lang(),
+                   languages=languages(), user=user_public(g.user) if g.user else None,
+                   auth_error=g.auth_error, login=g.proxy_login or proxy_login_value())
+
+
+@app.post("/api/auth/login")
+def auth_login():
+    b = body()
+    username = (b.get("username") or "").strip().lower()
+    keys = _rate_keys(username)
+    if _rate_blocked(keys):
+        return err(tr("Too many failed logins, please wait a few minutes"), 429)
+    c = db()
+    u = c.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    ok = bool(u and u["password_hash"] and not u["disabled"]
+              and check_password_hash(u["password_hash"], b.get("password") or ""))
+    if not u or not u["password_hash"]:
+        check_password_hash(generate_password_hash("x"), "y")  # same timing for unknown users
+    if not ok:
+        _rate_fail(keys)
+        print("login failed for", repr(username), "from", client_ip(), flush=True)
+        return err(tr("Wrong username or password"), 401)
+    with _fail_lock:
+        _fails.pop("u:" + username, None)
+    tok, age = start_session(c, u["id"], bool(b.get("remember", True)))
+    c.commit()
+    return set_cookie(jsonify(ok=True, user=user_public(u)), tok, age)
+
+
+@app.post("/api/auth/setup")
+def auth_setup():
+    """First start without users: creates the first admin. With a trusted proxy header the account is
+    bound to that login and the password is optional."""
+    b = body()
+    c = db()
+    c.execute("BEGIN IMMEDIATE")
+    if c.execute("SELECT 1 FROM users").fetchone():
+        c.rollback()
+        return err(tr("Setup is already done"), 409)
+    username = (b.get("username") or "").strip().lower()
+    pw = b.get("password") or ""
+    proxy = proxy_login_value() or None
+    if not USERNAME_RE.fullmatch(username):
+        c.rollback()
+        return err(tr("Username: 1-32 characters a-z, 0-9, dot, dash, underscore"))
+    if (pw or not proxy) and len(pw) < MIN_PASSWORD:
+        c.rollback()
+        return err(tr("Password: at least {0} characters", MIN_PASSWORD))
+    uid = create_user(c, username, (b.get("display_name") or "").strip()[:60] or username, pw or None, proxy, True,
+                      ntfy_topic=NTFY_TOPIC or None, seed_global=True,
+                      drop_token=os.environ.get("TASKS_DROP_TOKEN") or None)
+    adopt_orphans(c, uid)
+    ensure_inbox(c, uid)
+    bump(c)
+    tok, age = start_session(c, uid, True) if pw else (None, None)
+    c.commit()
+    resp = jsonify(ok=True)
+    return set_cookie(resp, tok, age) if tok else resp
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    c = db()
+    tok = request.cookies.get(COOKIE)
+    if tok:
+        c.execute("DELETE FROM sessions WHERE token_hash=?", (_token_hash(tok),))
+        c.commit()
+    resp = jsonify(ok=True, proxy=g.auth_via == "proxy")
+    resp.delete_cookie(COOKIE, path="/")
+    return resp
+
+
+# ---------------------------------------------------------------- access control
+# A list is visible to its owner and its members; role 'view' is read-only. Objects the user cannot
+# see answer 404 (their existence is not revealed), writes with a view-only role 403.
+
+class Denied(Exception):
+    def __init__(self, code=404):
+        super().__init__(code)
+        self.code = code
+
+
+@app.errorhandler(Denied)
+def denied(e):
+    return err(tr("No permission (view only)") if e.code == 403 else tr("unknown"), e.code)
+
+
+def vis_sql():
+    """Subquery of the list ids the current user may see (two ? = user id)."""
+    return "(SELECT id FROM lists WHERE owner_id=? UNION SELECT list_id FROM list_members WHERE user_id=?)"
+
+
+def wr_sql():
+    """Subquery of the list ids the current user may change (two ? = user id)."""
+    return "(SELECT id FROM lists WHERE owner_id=? UNION SELECT list_id FROM list_members WHERE user_id=? AND role='edit')"
+
+
+def list_role(c, lid, uid=None):
+    uid = uid or me()
+    r = c.execute("SELECT owner_id FROM lists WHERE id=?", (lid,)).fetchone()
+    if not r:
+        return None
+    if r[0] == uid:
+        return "owner"
+    m = c.execute("SELECT role FROM list_members WHERE list_id=? AND user_id=?", (lid, uid)).fetchone()
+    return m[0] if m else None
+
+
+def need_list(c, lid, write=True, owner=False):
+    role = list_role(c, lid) if lid else None
+    if not role:
+        raise Denied(404)
+    if (owner and role != "owner") or (write and role == "view"):
+        raise Denied(403)
+    return role
+
+
+def need_task(c, tid, write=True):
+    r = c.execute("SELECT list_id FROM tasks WHERE id=?", (tid,)).fetchone()
+    if not r:
+        raise Denied(404)
+    return need_list(c, r[0], write)
+
+
+def list_people(c, lid):
+    """Owner + member ids of a list."""
+    r = c.execute("SELECT owner_id FROM lists WHERE id=?", (lid,)).fetchone()
+    ids = {r[0]} if r else set()
+    ids.update(x[0] for x in c.execute("SELECT user_id FROM list_members WHERE list_id=?", (lid,)))
+    return ids
+
+
+def my_inbox(c, uid=None):
+    uid = uid or me()
+    r = c.execute("SELECT id FROM lists WHERE is_inbox=1 AND owner_id=?", (uid,)).fetchone()
+    if r:
+        return r[0]
+    ensure_inbox(c, uid)
+    return c.execute("SELECT id FROM lists WHERE is_inbox=1 AND owner_id=?", (uid,)).fetchone()[0]
+
+
+def my_max_sort(c, uid):
+    a = c.execute("SELECT COALESCE(MAX(sort),0) FROM lists WHERE owner_id=?", (uid,)).fetchone()[0]
+    b = c.execute("SELECT COALESCE(MAX(sort),0) FROM list_members WHERE user_id=?", (uid,)).fetchone()[0]
+    return max(a, b)
+
+
 # ---------------------------------------------------------------- serializers
 
 def task_dict(r, tags):
@@ -314,10 +767,10 @@ def task_dict(r, tags):
     return d
 
 
-def tags_for(c, ids=None):
+def tags_for(c, ids=None, uid=None):
     out = {}
-    q = "SELECT task_id, tag FROM task_tags"
-    for r in c.execute(q + " ORDER BY tag"):
+    uid = uid or me()
+    for r in c.execute("SELECT task_id, tag FROM task_tags WHERE user_id=? ORDER BY tag", (uid,)):
         if ids is None or r["task_id"] in ids:
             out.setdefault(r["task_id"], []).append(r["tag"])
     return out
@@ -368,8 +821,8 @@ def unlink_files(paths):
             pass
 
 
-def running_pomo(c):
-    r = c.execute("SELECT * FROM pomos WHERE end IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+def running_pomo(c, uid=None):
+    r = c.execute("SELECT * FROM pomos WHERE end IS NULL AND user_id=? ORDER BY id DESC LIMIT 1", (uid or me(),)).fetchone()
     return dict(r) if r else None
 
 
@@ -405,12 +858,12 @@ def share():
     return send_from_directory(app.static_folder, "index.html")
 
 
-def new_inbox_task(c, title, content="", tt_id=None):
-    inbox = c.execute("SELECT id FROM lists WHERE is_inbox=1").fetchone()[0]
+def new_inbox_task(c, uid, title, content="", tt_id=None):
+    inbox = my_inbox(c, uid)
     ts = iso(now_utc())
     srt = c.execute("SELECT COALESCE(MIN(sort),0)-1 FROM tasks WHERE list_id=? AND parent_id IS NULL", (inbox,)).fetchone()[0]
-    return c.execute("INSERT INTO tasks(list_id,title,content,sort,created_at,updated_at,tt_id) VALUES(?,?,?,?,?,?,?)",
-                     (inbox, (title or tr("Shared"))[:300], content or "", srt, ts, ts, tt_id)).lastrowid
+    return c.execute("INSERT INTO tasks(list_id,title,content,sort,created_at,updated_at,tt_id,created_by) VALUES(?,?,?,?,?,?,?,?)",
+                     (inbox, (title or tr("Shared", lg=lang(c, uid)))[:300], content or "", srt, ts, ts, tt_id, uid)).lastrowid
 
 
 def save_attachment_bytes(c, tid, name, mime, data):
@@ -424,10 +877,20 @@ def save_attachment_bytes(c, tid, name, mime, data):
               (tid, name, mime, len(data), rel, iso(now_utc())))
 
 
+def inbox_user(c):
+    """User whose inbox receives the ntfy share inbox (NTFY_INBOX_USER, default the first admin)."""
+    if NTFY_IN["user"]:
+        r = c.execute("SELECT id FROM users WHERE username=? AND disabled=0", (NTFY_IN["user"],)).fetchone()
+        if r:
+            return r[0]
+    return default_uid(c)
+
+
 def ntfy_inbox_import(c, m):
     """One ntfy message -> one inbox task (+ attachment). Idempotent via tt_id 'ntfy:<id>'."""
     mid = m["id"]
-    if not c.execute("SELECT 1 FROM tasks WHERE tt_id=?", ("ntfy:" + mid,)).fetchone():
+    uid = inbox_user(c)
+    if uid and not c.execute("SELECT 1 FROM tasks WHERE tt_id=?", ("ntfy:" + mid,)).fetchone():
         att = m.get("attachment") or None
         msg = (m.get("message") or "").strip()
         if att and any(msg.startswith(p) for p in SHARE_PLACEHOLDERS):  # ntfy / Android placeholder texts
@@ -436,9 +899,9 @@ def ntfy_inbox_import(c, m):
         if (m.get("title") or "").strip():
             title, content = m["title"].strip(), msg
         else:  # first line becomes the title, the rest the description
-            title = first or (os.path.splitext(att["name"])[0] if att else tr("Shared"))
+            title = first or (os.path.splitext(att["name"])[0] if att else tr("Shared", lg=lang(c, uid)))
             content = msg.split("\n", 1)[1].strip() if "\n" in msg else ""
-        tid = new_inbox_task(c, title, content, "ntfy:" + mid)
+        tid = new_inbox_task(c, uid, title, content, "ntfy:" + mid)
         if att and att.get("url"):
             url = att["url"]
             if NTFY_IN["public"] and url.startswith(NTFY_IN["public"]):  # fetch via the internal URL
@@ -448,8 +911,8 @@ def ntfy_inbox_import(c, m):
                 data = r.read(MAX_FILE_MB * 1024 * 1024 + 1)
             if len(data) <= MAX_FILE_MB * 1024 * 1024:
                 save_attachment_bytes(c, tid, att.get("name") or "datei", att.get("type") or "", data)
-        print("ntfy inbox: task", tid, repr(title), "attachment" if att else "", flush=True)
-    c.execute("UPDATE settings SET value=? WHERE key='ntfy_inbox_since'", (mid,))
+        print("ntfy inbox: task", tid, "user", uid, repr(title), "attachment" if att else "", flush=True)
+    gset(c, "ntfy_inbox_since", mid)
     bump(c)
     c.commit()
 
@@ -459,10 +922,10 @@ def ntfy_inbox_loop():
     while True:
         try:
             c = connect()
-            since = settings(c).get("ntfy_inbox_since") or ""
+            since = gsetting(c, "ntfy_inbox_since") or ""
             if not since:  # first start: only messages from now on
                 since = str(int(time.time()))
-                c.execute("UPDATE settings SET value=? WHERE key='ntfy_inbox_since'", (since,))
+                gset(c, "ntfy_inbox_since", since)
                 c.commit()
             c.close()
             req = urllib.request.Request(f"{NTFY_IN['url']}/{NTFY_IN['topic']}/json?since={since}",
@@ -494,7 +957,7 @@ def share_post():
     text, url = (request.form.get("text") or "").strip(), (request.form.get("url") or "").strip()
     title = (request.form.get("title") or "").strip() or text.replace(url, "").strip() or url \
         or (os.path.splitext(safe_name(files[0].filename))[0] if files else tr("Shared"))
-    tid = new_inbox_task(c, title, url if url and url != title else "")
+    tid = new_inbox_task(c, me(), title, url if url and url != title else "")
     save_attachments(c, tid, files)
     bump(c)
     c.commit()
@@ -503,36 +966,48 @@ def share_post():
 
 # Placeholder texts some Android apps put next to a shared file; never a useful title.
 SHARE_PLACEHOLDERS = ("You received a file:", "Ein Bild wurde mit Dir geteilt", "Ein Bild wurde mit dir geteilt")
-DROP_TOKEN = os.environ.get("TASKS_DROP_TOKEN", "")
+
+
+def drop_user(c, auth):
+    """User whose personal drop token is in the Authorization header (constant-time compare)."""
+    if not auth.startswith("Bearer "):
+        return None
+    got, hit = auth[7:].encode(), None
+    for r in c.execute("SELECT * FROM users WHERE drop_token IS NOT NULL AND drop_token!='' AND disabled=0"):
+        if secrets.compare_digest(got, r["drop_token"].encode()):
+            hit = r
+    return hit
 
 
 @app.post("/drop")
 def drop_post():
     """Upload endpoint for the Android app HTTP Shortcuts (Chrome drops files shared to PWAs):
     one request = one inbox task with every file attached. Exclude /drop from the proxy login;
-    the bearer token (TASKS_DROP_TOKEN) is its lock."""
+    the bearer token (TASKS_DROP_TOKEN) is its lock. Every user has an own token (task lands in their inbox)."""
     auth = request.headers.get("Authorization", "")
-    if not DROP_TOKEN or not secrets.compare_digest(auth.encode(), f"Bearer {DROP_TOKEN}".encode()):
+    c = db()
+    u = drop_user(c, auth)
+    if not u:
         print("drop: 403, auth header", "missing" if not auth else
               f"len {len(auth)} starts {auth[:7]!r} ends-with-space {auth != auth.rstrip()}", flush=True)
         return Response(tr("not allowed") + "\n", 403, mimetype="text/plain")
-    c = db()
+    lg = lang(c, u["id"])
     files = [f for key in request.files for f in request.files.getlist(key) if f and f.filename]
     text = (request.form.get("text") or "").strip()
     if any(text.startswith(p) for p in SHARE_PLACEHOLDERS):
         text = ""
     if not files and not text:
-        return Response(tr("nothing received") + "\n", 400, mimetype="text/plain")
+        return Response(tr("nothing received", lg=lg) + "\n", 400, mimetype="text/plain")
     first, _, rest = text.partition("\n")
     title = first.strip() or (os.path.splitext(safe_name(files[0].filename))[0] if len(files) == 1
-                              else tr("{0} files shared", len(files)))
-    tid = new_inbox_task(c, title, rest.strip())
+                              else tr("{0} files shared", len(files), lg=lg))
+    tid = new_inbox_task(c, u["id"], title, rest.strip())
     e = save_attachments(c, tid, files) if files else None
     bump(c)
     c.commit()
-    print("drop: task", tid, repr(title), len(files), "files", e or "", flush=True)
-    n = trn(", {0} file", ", {0} files", len(files)) if files and title != tr("{0} files shared", len(files)) else ""
-    return Response(f"Abhako: {title}{n}" + (f" ({tr('error: {0}', e)})" if e else "") + "\n", mimetype="text/plain")
+    print("drop: task", tid, "user", u["id"], repr(title), len(files), "files", e or "", flush=True)
+    n = trn(", {0} file", ", {0} files", len(files), lg=lg) if files and title != tr("{0} files shared", len(files), lg=lg) else ""
+    return Response(f"Abhako: {title}{n}" + (f" ({tr('error: {0}', e, lg=lg)})" if e else "") + "\n", mimetype="text/plain")
 
 
 @app.get("/manifest.json")
@@ -560,21 +1035,56 @@ def health():
 
 @app.get("/api/version")
 def version():
-    return jsonify(v=int(settings()["version"]))
+    return jsonify(v=int(gsetting(db(), "version")))
 
 
 # ---------------------------------------------------------------- state
 
+def visible_lists(c, uid):
+    """Lists the user sees, with role, sharing info and the user's own folder / sort / view."""
+    rows = c.execute("""SELECT l.*, m.role AS m_role, m.folder AS m_folder, m.sort AS m_sort, m.view AS m_view
+                        FROM lists l LEFT JOIN list_members m ON m.list_id=l.id AND m.user_id=?
+                        WHERE l.owner_id=? OR m.user_id IS NOT NULL""", (uid, uid)).fetchall()
+    ids = [r["id"] for r in rows]
+    members, names = {}, {}
+    if ids:
+        q = ",".join("?" * len(ids))
+        for m in c.execute(f"""SELECT m.list_id, m.role, u.id, u.username, u.display_name FROM list_members m
+                               JOIN users u ON u.id=m.user_id WHERE m.list_id IN ({q}) ORDER BY m.added_at, u.id""", ids):
+            members.setdefault(m["list_id"], []).append({"user_id": m["id"], "name": m["display_name"] or m["username"],
+                                                         "role": m["role"]})
+        owners = {r["owner_id"] for r in rows}
+        q2 = ",".join("?" * len(owners))
+        names = {u["id"]: u["display_name"] or u["username"]
+                 for u in c.execute(f"SELECT id, username, display_name FROM users WHERE id IN ({q2})", list(owners))}
+    out = []
+    for r in rows:
+        d = {k: r[k] for k in r.keys() if not k.startswith("m_")}
+        if r["owner_id"] != uid:
+            d.update(folder=r["m_folder"], sort=r["m_sort"], view=r["m_view"] or r["view"], role=r["m_role"])
+        else:
+            d["role"] = "owner"
+        d["members"] = members.get(r["id"], [])
+        d["shared"] = bool(d["members"])
+        d["owner_name"] = names.get(r["owner_id"], "")
+        out.append(d)
+    out.sort(key=lambda d: (-d["is_inbox"], d["sort"], d["id"]))
+    return out
+
+
 @app.get("/api/state")
 def state():
     c = db()
-    s = settings(c)
+    uid = me()
+    s = usettings(c, uid)
     cutoff = iso(now_utc() - timedelta(days=14))
-    tasks = load_tasks(c, "deleted_at IS NULL AND (status=0 OR completed_at>=?)", (cutoff,))
-    habits = [dict(r) for r in c.execute("SELECT * FROM habits ORDER BY archived, sort, id")]
+    tasks = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND (status=0 OR completed_at>=?) ORDER BY id",
+                       (uid, uid, cutoff))
+    habits = [dict(r) for r in c.execute("SELECT * FROM habits WHERE user_id=? ORDER BY archived, sort, id", (uid,))]
     since = (local_now().date() - timedelta(days=400)).isoformat()
     logs, notes = {}, {}
-    for r in c.execute("SELECT habit_id, day, count, note FROM habit_logs WHERE day>=?", (since,)):
+    for r in c.execute("""SELECT l.habit_id, l.day, l.count, l.note FROM habit_logs l JOIN habits h ON h.id=l.habit_id
+                          WHERE h.user_id=? AND l.day>=?""", (uid, since)):
         if r["count"]:
             logs.setdefault(r["habit_id"], {})[r["day"]] = r["count"]
         if r["note"]:
@@ -582,20 +1092,26 @@ def state():
     for h in habits:
         h["logs"] = logs.get(h["id"], {})
         h["notes"] = notes.get(h["id"], {})
+    u = g.user
     return jsonify(
-        v=int(s["version"]),
-        lists=[dict(r) for r in c.execute("SELECT * FROM lists ORDER BY is_inbox DESC, sort, id")],
+        v=int(gsetting(c, "version")),
+        me={**user_public(u), "is_admin": bool(u["is_admin"]), "auth": g.auth_via, "has_password": bool(u["password_hash"]),
+            "ntfy_inbox": bool(NTFY_IN["token"]) and inbox_user(c) == uid},
+        lists=visible_lists(c, uid),
         filters=[{**dict(r), "rules": json.loads(r["rules"] or "{}")}
-                 for r in c.execute("SELECT * FROM filters ORDER BY sort, id")],
-        sections=[dict(r) for r in c.execute("SELECT * FROM sections ORDER BY sort, id")],
+                 for r in c.execute("SELECT * FROM filters WHERE user_id=? ORDER BY sort, id", (uid,))],
+        sections=[dict(r) for r in c.execute(f"SELECT * FROM sections WHERE list_id IN {vis_sql()} ORDER BY sort, id",
+                                             (uid, uid))],
         tasks=tasks,
         habits=habits,
         pomo=running_pomo(c),
         pomo_today=pomo_stats(c, days=1),
         counts=dict(
-            done=c.execute("SELECT COUNT(*) FROM tasks WHERE deleted_at IS NULL AND status!=0").fetchone()[0],
-            trash=c.execute("SELECT COUNT(*) FROM tasks WHERE deleted_at IS NOT NULL").fetchone()[0]),
-        settings={k: v for k, v in s.items() if k not in ("digest_sent", "version")},
+            done=c.execute(f"SELECT COUNT(*) FROM tasks WHERE list_id IN {vis_sql()} AND deleted_at IS NULL AND status!=0",
+                           (uid, uid)).fetchone()[0],
+            trash=c.execute(f"SELECT COUNT(*) FROM tasks WHERE list_id IN {wr_sql()} AND deleted_at IS NOT NULL",
+                            (uid, uid)).fetchone()[0]),
+        settings={k: v for k, v in s.items() if k not in ("digest_sent",)},
         paperless={"enabled": bool(PL_TOKEN), "url": PL_PUBLIC},
         ntfy_inbox={"enabled": bool(NTFY_IN["token"]), "server": NTFY_IN["public"], "topic": NTFY_IN["topic"]},
         ntfy_url=NTFY_URL,
@@ -606,22 +1122,26 @@ def state():
 @app.get("/api/tasks")
 def task_query():
     c = db()
+    uid = me()
     scope = request.args.get("scope", "done")
     limit = min(int(request.args.get("limit", 300)), 2000)
     if scope == "trash":
-        rows = load_tasks(c, "deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?", (limit,))
+        rows = load_tasks(c, f"list_id IN {wr_sql()} AND deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?",
+                          (uid, uid, limit))
     elif scope == "search":
         q = f"%{request.args.get('q', '').strip()}%"
-        rows = load_tasks(c, "deleted_at IS NULL AND (title LIKE ? OR content LIKE ?) "
-                             "ORDER BY status, updated_at DESC LIMIT ?", (q, q, limit))
+        rows = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND (title LIKE ? OR content LIKE ?) "
+                             "ORDER BY status, updated_at DESC LIMIT ?", (uid, uid, q, q, limit))
     else:
-        rows = load_tasks(c, "deleted_at IS NULL AND status!=0 ORDER BY completed_at DESC LIMIT ?", (limit,))
+        rows = load_tasks(c, f"list_id IN {vis_sql()} AND deleted_at IS NULL AND status!=0 ORDER BY completed_at DESC LIMIT ?",
+                          (uid, uid, limit))
     return jsonify(tasks=rows)
 
 
 # ---------------------------------------------------------------- lists / sections
 
 LIST_FIELDS = ("name", "color", "folder", "sort", "view", "archived")
+MEMBER_LIST_FIELDS = ("folder", "sort", "view")  # a member's own sidebar placement / view
 
 
 @app.post("/api/lists")
@@ -631,9 +1151,10 @@ def list_create():
     if not name:
         return err(tr("Name missing"))
     c = db()
-    srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM lists").fetchone()[0]
-    cur = c.execute("INSERT INTO lists(name,color,folder,sort,view,created_at) VALUES(?,?,?,?,?,?)",
-                    (name, b.get("color", ""), b.get("folder", ""), srt, b.get("view", "list"), iso(now_utc())))
+    uid = me()
+    srt = my_max_sort(c, uid) + 1
+    cur = c.execute("INSERT INTO lists(name,color,folder,sort,view,created_at,owner_id) VALUES(?,?,?,?,?,?,?)",
+                    (name, b.get("color", ""), b.get("folder", ""), srt, b.get("view", "list"), iso(now_utc()), uid))
     bump(c)
     c.commit()
     return jsonify(dict(c.execute("SELECT * FROM lists WHERE id=?", (cur.lastrowid,)).fetchone()))
@@ -643,9 +1164,17 @@ def list_create():
 def list_update(lid):
     b = body()
     c = db()
-    for k in LIST_FIELDS:
-        if k in b:
-            c.execute(f"UPDATE lists SET {k}=? WHERE id=?", (b[k], lid))
+    role = need_list(c, lid, write=False)
+    if role == "owner":
+        for k in LIST_FIELDS:
+            if k in b:
+                c.execute(f"UPDATE lists SET {k}=? WHERE id=?", (b[k], lid))
+    else:
+        if any(k in b for k in LIST_FIELDS if k not in MEMBER_LIST_FIELDS):
+            return err(tr("Only the owner can change this list"), 403)
+        for k in MEMBER_LIST_FIELDS:
+            if k in b:
+                c.execute(f"UPDATE list_members SET {k}=? WHERE list_id=? AND user_id=?", (b[k], lid, me()))
     bump(c)
     c.commit()
     return jsonify(ok=True)
@@ -653,13 +1182,16 @@ def list_update(lid):
 
 @app.post("/api/lists/reorder")
 def list_reorder():
-    """{ids: [...], folder?: {id: name}} -- sidebar order after a drag / arrow move."""
+    """{ids: [...], folder?: {id: name}} -- sidebar order after a drag / arrow move (per user)."""
     b = body()
     c = db()
+    uid = me()
     for i, lid in enumerate(b.get("ids", [])):
-        c.execute("UPDATE lists SET sort=? WHERE id=? AND is_inbox=0", (i, int(lid)))
+        c.execute("UPDATE lists SET sort=? WHERE id=? AND is_inbox=0 AND owner_id=?", (i, int(lid), uid))
+        c.execute("UPDATE list_members SET sort=? WHERE list_id=? AND user_id=?", (i, int(lid), uid))
     for lid, folder in (b.get("folder") or {}).items():
-        c.execute("UPDATE lists SET folder=? WHERE id=?", (folder, int(lid)))
+        c.execute("UPDATE lists SET folder=? WHERE id=? AND owner_id=?", (folder, int(lid), uid))
+        c.execute("UPDATE list_members SET folder=? WHERE list_id=? AND user_id=?", (folder, int(lid), uid))
     bump(c)
     c.commit()
     return jsonify(ok=True)
@@ -668,17 +1200,60 @@ def list_reorder():
 @app.delete("/api/lists/<int:lid>")
 def list_delete(lid):
     c = db()
+    need_list(c, lid, owner=True)
     r = c.execute("SELECT is_inbox FROM lists WHERE id=?", (lid,)).fetchone()
-    if not r:
-        return err(tr("unknown"), 404)
     if r["is_inbox"]:
         return err(tr("The inbox cannot be deleted"))
-    # tasks go to the trash inside the inbox so they stay restorable
-    inbox = c.execute("SELECT id FROM lists WHERE is_inbox=1").fetchone()[0]
+    # tasks go to the trash inside the owner's inbox so they stay restorable
+    inbox = my_inbox(c)
     ts = iso(now_utc())
-    c.execute("UPDATE tasks SET deleted_at=COALESCE(deleted_at,?), list_id=?, section_id=NULL WHERE list_id=?",
+    c.execute("UPDATE tasks SET deleted_at=COALESCE(deleted_at,?), list_id=?, section_id=NULL, assignee_id=NULL WHERE list_id=?",
               (ts, inbox, lid))
     c.execute("DELETE FROM lists WHERE id=?", (lid,))
+    bump(c)
+    c.commit()
+    return jsonify(ok=True)
+
+
+@app.put("/api/lists/<int:lid>/members")
+def member_set(lid):
+    """{user_id, role: edit|view} -- owner shares the list (or changes a member's role)."""
+    b = body()
+    c = db()
+    need_list(c, lid, owner=True)
+    if c.execute("SELECT is_inbox FROM lists WHERE id=?", (lid,)).fetchone()[0]:
+        return err(tr("The inbox cannot be shared"))
+    role = b.get("role", "edit")
+    if role not in ("edit", "view"):
+        return err(tr("Role must be edit or view"))
+    try:
+        uid = int(b.get("user_id") or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    u = c.execute("SELECT id FROM users WHERE id=? AND disabled=0", (uid,)).fetchone()
+    if not u or uid == me():
+        return err(tr("unknown user"), 404)
+    if c.execute("SELECT 1 FROM list_members WHERE list_id=? AND user_id=?", (lid, uid)).fetchone():
+        c.execute("UPDATE list_members SET role=? WHERE list_id=? AND user_id=?", (role, lid, uid))
+    else:
+        c.execute("INSERT INTO list_members(list_id,user_id,role,sort,added_at) VALUES(?,?,?,?,?)",
+                  (lid, uid, role, my_max_sort(c, uid) + 1, iso(now_utc())))
+    bump(c)
+    c.commit()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/lists/<int:lid>/members/<int:uid>")
+def member_remove(lid, uid):
+    """Owner removes a member, or a member leaves (uid = self)."""
+    c = db()
+    role = need_list(c, lid, write=False)
+    if uid != me() and role != "owner":
+        raise Denied(403)
+    if not c.execute("SELECT 1 FROM list_members WHERE list_id=? AND user_id=?", (lid, uid)).fetchone():
+        return err(tr("unknown"), 404)
+    c.execute("DELETE FROM list_members WHERE list_id=? AND user_id=?", (lid, uid))
+    c.execute("UPDATE tasks SET assignee_id=NULL WHERE list_id=? AND assignee_id=?", (lid, uid))
     bump(c)
     c.commit()
     return jsonify(ok=True)
@@ -691,18 +1266,24 @@ def filter_create():
     if not name:
         return err(tr("Name missing"))
     c = db()
-    srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM filters").fetchone()[0]
-    cur = c.execute("INSERT INTO filters(name,rules,sort,created_at) VALUES(?,?,?,?)",
-                    (name, json.dumps(b.get("rules") or {}), srt, iso(now_utc())))
+    srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM filters WHERE user_id=?", (me(),)).fetchone()[0]
+    cur = c.execute("INSERT INTO filters(name,rules,sort,created_at,user_id) VALUES(?,?,?,?,?)",
+                    (name, json.dumps(b.get("rules") or {}), srt, iso(now_utc()), me()))
     bump(c)
     c.commit()
     return jsonify(id=cur.lastrowid)
+
+
+def need_filter(c, fid):
+    if not c.execute("SELECT 1 FROM filters WHERE id=? AND user_id=?", (fid, me())).fetchone():
+        raise Denied(404)
 
 
 @app.patch("/api/filters/<int:fid>")
 def filter_update(fid):
     b = body()
     c = db()
+    need_filter(c, fid)
     if "name" in b and (b["name"] or "").strip():
         c.execute("UPDATE filters SET name=? WHERE id=?", (b["name"].strip(), fid))
     if "rules" in b:
@@ -717,6 +1298,7 @@ def filter_update(fid):
 @app.delete("/api/filters/<int:fid>")
 def filter_delete(fid):
     c = db()
+    need_filter(c, fid)
     c.execute("DELETE FROM filters WHERE id=?", (fid,))
     bump(c)
     c.commit()
@@ -725,7 +1307,7 @@ def filter_delete(fid):
 
 def _folders(c):
     try:
-        return json.loads(c.execute("SELECT value FROM settings WHERE key='folders'").fetchone()[0] or "[]")
+        return json.loads(usettings(c, me()).get("folders") or "[]")
     except (TypeError, ValueError):
         return []
 
@@ -737,9 +1319,10 @@ def folder_rename():
     if not old or not new:
         return err(tr("Name missing"))
     c = db()
-    c.execute("UPDATE lists SET folder=? WHERE folder=?", (new, old))
+    c.execute("UPDATE lists SET folder=? WHERE folder=? AND owner_id=?", (new, old, me()))
+    c.execute("UPDATE list_members SET folder=? WHERE folder=? AND user_id=?", (new, old, me()))
     f = [new if x == old else x for x in _folders(c)]
-    c.execute("UPDATE settings SET value=? WHERE key='folders'", (json.dumps(list(dict.fromkeys(f)), ensure_ascii=False),))
+    uset(c, me(), "folders", json.dumps(list(dict.fromkeys(f)), ensure_ascii=False))
     bump(c)
     c.commit()
     return jsonify(ok=True)
@@ -750,12 +1333,19 @@ def folder_delete():
     """Removes the folder only; its lists move to the top level."""
     name = (body().get("name") or "").strip()
     c = db()
-    c.execute("UPDATE lists SET folder='' WHERE folder=?", (name,))
-    c.execute("UPDATE settings SET value=? WHERE key='folders'",
-              (json.dumps([x for x in _folders(c) if x != name], ensure_ascii=False),))
+    c.execute("UPDATE lists SET folder='' WHERE folder=? AND owner_id=?", (name, me()))
+    c.execute("UPDATE list_members SET folder='' WHERE folder=? AND user_id=?", (name, me()))
+    uset(c, me(), "folders", json.dumps([x for x in _folders(c) if x != name], ensure_ascii=False))
     bump(c)
     c.commit()
     return jsonify(ok=True)
+
+
+def need_section(c, sid):
+    r = c.execute("SELECT list_id FROM sections WHERE id=?", (sid,)).fetchone()
+    if not r:
+        raise Denied(404)
+    need_list(c, r[0])
 
 
 @app.post("/api/sections")
@@ -765,6 +1355,7 @@ def section_create():
     if not name or not b.get("list_id"):
         return err(tr("Name/list missing"))
     c = db()
+    need_list(c, b["list_id"])
     srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM sections WHERE list_id=?", (b["list_id"],)).fetchone()[0]
     cur = c.execute("INSERT INTO sections(list_id,name,sort) VALUES(?,?,?)", (b["list_id"], name, srt))
     bump(c)
@@ -776,6 +1367,7 @@ def section_create():
 def section_update(sid):
     b = body()
     c = db()
+    need_section(c, sid)
     for k in ("name", "sort"):
         if k in b:
             c.execute(f"UPDATE sections SET {k}=? WHERE id=?", (b[k], sid))
@@ -787,6 +1379,7 @@ def section_update(sid):
 @app.delete("/api/sections/<int:sid>")
 def section_delete(sid):
     c = db()
+    need_section(c, sid)
     c.execute("DELETE FROM sections WHERE id=?", (sid,))
     bump(c)
     c.commit()
@@ -797,7 +1390,7 @@ def section_delete(sid):
 
 TASK_FIELDS = ("list_id", "section_id", "parent_id", "title", "content", "priority",
                "due", "due_time", "reminders", "repeat", "repeat_from", "sort",
-               "pinned", "start", "duration")
+               "pinned", "start", "duration", "assignee_id")
 
 
 def clean_task(b):
@@ -806,6 +1399,8 @@ def clean_task(b):
         if k in b:
             v = b[k]
             if k in ("due", "due_time", "section_id", "parent_id", "start", "duration") and v in ("", None):
+                v = None
+            if k == "assignee_id" and v in ("", None, 0):
                 v = None
             if k == "title":
                 v = (v or "").strip()
@@ -861,14 +1456,30 @@ def check_parent(c, tid, parent):
     return None
 
 
-def set_tags(c, tid, tags):
-    c.execute("DELETE FROM task_tags WHERE task_id=?", (tid,))
+def set_tags(c, tid, tags, uid=None):
+    uid = uid or me()
+    c.execute("DELETE FROM task_tags WHERE task_id=? AND user_id=?", (tid, uid))
     for t in dict.fromkeys(x.strip().lstrip("#") for x in tags if x and x.strip().lstrip("#")):
-        c.execute("INSERT INTO task_tags(task_id,tag) VALUES(?,?)", (tid, t))
+        c.execute("INSERT INTO task_tags(task_id,user_id,tag) VALUES(?,?,?)", (tid, uid, t))
+
+
+def my_tags(c, tid):
+    return [r[0] for r in c.execute("SELECT tag FROM task_tags WHERE task_id=? AND user_id=?", (tid, me()))]
 
 
 def one_task(c, tid):
     return load_tasks(c, "id=?", (tid,))[0]
+
+
+def check_assignee(c, lid, aid):
+    """None if aid may be assigned in list lid, else an error message."""
+    if aid is None:
+        return None
+    try:
+        aid = int(aid)
+    except (TypeError, ValueError):
+        return tr("unknown user")
+    return None if aid in list_people(c, lid) else tr("Only the owner or a member of the list can be assigned")
 
 
 @app.post("/api/tasks")
@@ -881,11 +1492,19 @@ def task_create():
     e = check_parent(c, None, f.get("parent_id"))
     if e:
         return err(e)
-    if not f.get("list_id"):
-        if f.get("parent_id"):
-            f["list_id"] = c.execute("SELECT list_id FROM tasks WHERE id=?", (f["parent_id"],)).fetchone()[0]
-        else:
-            f["list_id"] = c.execute("SELECT id FROM lists WHERE is_inbox=1").fetchone()[0]
+    if f.get("parent_id"):  # subtasks live in their parent's list
+        need_task(c, f["parent_id"])
+        f["list_id"] = c.execute("SELECT list_id FROM tasks WHERE id=?", (f["parent_id"],)).fetchone()[0]
+    elif f.get("list_id"):
+        need_list(c, f["list_id"])
+    else:
+        f["list_id"] = my_inbox(c)
+    if f.get("section_id") and not c.execute("SELECT 1 FROM sections WHERE id=? AND list_id=?",
+                                              (f["section_id"], f["list_id"])).fetchone():
+        f["section_id"] = None
+    e = check_assignee(c, f["list_id"], f.get("assignee_id"))
+    if e:
+        return err(e)
     if "sort" not in f:
         f["sort"] = c.execute("SELECT COALESCE(MIN(sort),0)-1 FROM tasks WHERE list_id=? AND parent_id IS ?",
                               (f["list_id"], f.get("parent_id"))).fetchone()[0]
@@ -893,6 +1512,7 @@ def task_create():
             f["sort"] = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM tasks WHERE parent_id=?",
                                   (f["parent_id"],)).fetchone()[0]
     ts = iso(now_utc())
+    f["created_by"] = me()
     cols = list(f) + ["created_at", "updated_at"]
     cur = c.execute(f"INSERT INTO tasks({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                     [f[k] for k in f] + [ts, ts])
@@ -906,8 +1526,7 @@ def task_create():
 @app.patch("/api/tasks/<int:tid>")
 def task_update(tid):
     c = db()
-    if not c.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
-        return err(tr("unknown"), 404)
+    need_task(c, tid)
     conflicts = []
     e = apply_update(c, tid, body(), conflicts)
     if e:
@@ -926,7 +1545,8 @@ def _norm(v):
 def apply_update(c, tid, b, conflicts=None):
     """b may carry `_prev` = the values the client saw before its edit (offline replay, detail typing).
     A field whose server value differs from `_prev` was changed elsewhere meanwhile: it is NOT
-    overwritten but reported back as a conflict (client lets the user pick)."""
+    overwritten but reported back as a conflict (client lets the user pick).
+    The caller checked write access to the task; moves are checked here (Denied)."""
     prev = b.get("_prev") if isinstance(b.get("_prev"), dict) else None
     if prev:
         row = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
@@ -935,7 +1555,7 @@ def apply_update(c, tid, b, conflicts=None):
             if k not in b or k.startswith("_"):
                 continue
             if k == "tags":
-                cur = [r[0] for r in c.execute("SELECT tag FROM task_tags WHERE task_id=?", (tid,))]
+                cur = my_tags(c, tid)
             elif k in row.keys():
                 cur = row[k]
             else:
@@ -947,8 +1567,8 @@ def apply_update(c, tid, b, conflicts=None):
     f = clean_task(b)
     if "title" in f and not f["title"]:
         return tr("Title missing")
+    cur = c.execute("SELECT start, due, list_id, section_id, assignee_id FROM tasks WHERE id=?", (tid,)).fetchone()
     if "start" in f or "due" in f:  # keep start <= due against the stored other half
-        cur = c.execute("SELECT start, due FROM tasks WHERE id=?", (tid,)).fetchone()
         st, du = f.get("start", cur["start"]), f.get("due", cur["due"])
         if st and (not du or st > du):
             f["start"] = du
@@ -957,25 +1577,43 @@ def apply_update(c, tid, b, conflicts=None):
         if e:
             return e
         if f["parent_id"]:  # indent: follow the new parent's list / section
+            need_task(c, f["parent_id"])
             p = c.execute("SELECT list_id, section_id FROM tasks WHERE id=?", (f["parent_id"],)).fetchone()
-            f.setdefault("list_id", p["list_id"])
+            f["list_id"] = p["list_id"]
             f["section_id"] = p["section_id"]
+    if "list_id" in f:
+        if not f["list_id"]:
+            del f["list_id"]
+        elif f["list_id"] != cur["list_id"]:
+            need_list(c, f["list_id"])  # moving out needs write on the source (caller), in on the target
+    lid = f.get("list_id", cur["list_id"])
+    if f.get("section_id") and not c.execute("SELECT 1 FROM sections WHERE id=? AND list_id=?", (f["section_id"], lid)).fetchone():
+        f["section_id"] = None
+    if "assignee_id" in f:
+        e = check_assignee(c, lid, f["assignee_id"])
+        if e:
+            return e
+    elif lid != cur["list_id"] and cur["assignee_id"] and cur["assignee_id"] not in list_people(c, lid):
+        f["assignee_id"] = None  # the assignee has no access to the new list
     if f:
         # a changed date / reminder set re-arms the reminder
-        if any(k in f for k in ("due", "due_time", "reminders")):
+        if any(k in f for k in ("due", "due_time", "reminders", "assignee_id")):
             f["reminded"] = "[]"
         f["updated_at"] = iso(now_utc())
         c.execute(f"UPDATE tasks SET {','.join(k + '=?' for k in f)} WHERE id=?", [*f.values(), tid])
         if "list_id" in f:  # subtasks follow their parent (all levels)
+            people = list_people(c, f["list_id"])
             for d in descendants(c, tid):
                 c.execute("UPDATE tasks SET list_id=? WHERE id=?", (f["list_id"], d))
+                a = c.execute("SELECT assignee_id FROM tasks WHERE id=?", (d,)).fetchone()[0]
+                if a and a not in people:
+                    c.execute("UPDATE tasks SET assignee_id=NULL WHERE id=?", (d,))
             if "section_id" not in f:
                 c.execute("UPDATE tasks SET section_id=NULL WHERE id=?", (tid,))
     if "tags" in b:
         set_tags(c, tid, b["tags"])
     elif "add_tags" in b:
-        cur = [r[0] for r in c.execute("SELECT tag FROM task_tags WHERE task_id=?", (tid,))]
-        set_tags(c, tid, cur + list(b["add_tags"]))
+        set_tags(c, tid, my_tags(c, tid) + list(b["add_tags"]))
     return None
 
 
@@ -1008,9 +1646,8 @@ def rr_with_count(repeat, n):
 @app.post("/api/tasks/<int:tid>/complete")
 def task_complete(tid):
     c = db()
+    need_task(c, tid)
     t = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
-    if not t:
-        return err(tr("unknown"), 404)
     b = body()
     # the same recurring task ticked on two devices (one offline): only the first tick advances it
     if t["repeat"] and b.get("expect_due") and t["status"] == 0 and b["expect_due"] != t["due"]:
@@ -1035,8 +1672,8 @@ def do_complete(c, tid, status=2):
         vals.update(status=2, repeat="", completed_at=ts, updated_at=ts, reminded="[]")
         cur = c.execute(f"INSERT INTO tasks({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                         [vals[k] for k in cols])
-        for r in c.execute("SELECT tag FROM task_tags WHERE task_id=?", (tid,)).fetchall():
-            c.execute("INSERT INTO task_tags(task_id,tag) VALUES(?,?)", (cur.lastrowid, r["tag"]))
+        for r in c.execute("SELECT user_id, tag FROM task_tags WHERE task_id=?", (tid,)).fetchall():
+            c.execute("INSERT INTO task_tags(task_id,user_id,tag) VALUES(?,?,?)", (cur.lastrowid, r["user_id"], r["tag"]))
         start = t["start"]
         if start:  # timeline range moves along with the due date
             start = (date.fromisoformat(start) + (date.fromisoformat(nxt) - date.fromisoformat(t["due"]))).isoformat()
@@ -1058,8 +1695,9 @@ def do_complete(c, tid, status=2):
 def task_skip(tid):
     """'Skip this occurrence': move a recurring task to its next date without a done copy."""
     c = db()
+    need_task(c, tid)
     t = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
-    if not t or not t["repeat"] or not t["due"]:
+    if not t["repeat"] or not t["due"]:
         return err(tr("Not a recurring task"))
     cnt = rr_count(t["repeat"])
     base = dict(t)
@@ -1081,6 +1719,7 @@ def task_skip(tid):
 @app.post("/api/tasks/<int:tid>/reopen")
 def task_reopen(tid):
     c = db()
+    need_task(c, tid)
     c.execute("UPDATE tasks SET status=0, completed_at=NULL, updated_at=? WHERE id=?", (iso(now_utc()), tid))
     bump(c)
     c.commit()
@@ -1090,6 +1729,7 @@ def task_reopen(tid):
 @app.delete("/api/tasks/<int:tid>")
 def task_delete(tid):
     c = db()
+    need_task(c, tid)
     files = []
     if request.args.get("hard") == "1":
         files = attachment_files(c, [tid])
@@ -1111,6 +1751,7 @@ def do_delete(c, tid):
 @app.post("/api/tasks/<int:tid>/restore")
 def task_restore(tid):
     c = db()
+    need_task(c, tid)
     r = c.execute("SELECT deleted_at FROM tasks WHERE id=?", (tid,)).fetchone()
     if r:
         c.execute("UPDATE tasks SET deleted_at=NULL WHERE id=?", (tid,))
@@ -1126,10 +1767,11 @@ def task_restore(tid):
 
 @app.post("/api/tasks/purge-done")
 def purge_done():
-    """Settings > 'Delete all completed': every done / won't-do task -> trash."""
+    """Settings > 'Delete all completed': every done / won't-do task in MY lists -> trash
+    (shared lists of other owners are left alone)."""
     c = db()
-    n = c.execute("UPDATE tasks SET deleted_at=? WHERE status!=0 AND deleted_at IS NULL",
-                  (iso(now_utc()),)).rowcount
+    n = c.execute("""UPDATE tasks SET deleted_at=? WHERE status!=0 AND deleted_at IS NULL
+                     AND list_id IN (SELECT id FROM lists WHERE owner_id=?)""", (iso(now_utc()), me())).rowcount
     bump(c)
     c.commit()
     return jsonify(count=n)
@@ -1137,9 +1779,13 @@ def purge_done():
 
 @app.delete("/api/trash")
 def trash_empty():
+    """Hard-deletes the trash the user sees: deleted tasks in lists they may change."""
     c = db()
-    files = attachment_files(c, [r[0] for r in c.execute("SELECT id FROM tasks WHERE deleted_at IS NOT NULL")])
-    c.execute("DELETE FROM tasks WHERE deleted_at IS NOT NULL")
+    ids = [r[0] for r in c.execute(f"SELECT id FROM tasks WHERE deleted_at IS NOT NULL AND list_id IN {wr_sql()}",
+                                   (me(), me()))]
+    files = attachment_files(c, ids)
+    for i in ids:
+        c.execute("DELETE FROM tasks WHERE id=?", (i,))
     bump(c)
     c.commit()
     unlink_files(files)
@@ -1157,8 +1803,7 @@ def safe_name(n):
 @app.post("/api/tasks/<int:tid>/attachments")
 def attachment_upload(tid):
     c = db()
-    if not c.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
-        return err(tr("unknown"), 404)
+    need_task(c, tid)
     files = request.files.getlist("file")
     if not files:
         return err(tr("File missing"))
@@ -1191,11 +1836,17 @@ def save_attachments(c, tid, files):
     return None
 
 
+def need_attachment(c, aid, write):
+    a = c.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
+    if not a:
+        raise Denied(404)
+    need_task(c, a["task_id"], write)
+    return a
+
+
 @app.get("/api/attachments/<int:aid>")
 def attachment_get(aid):
-    a = db().execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
-    if not a:
-        return err(tr("unknown"), 404)
+    a = need_attachment(db(), aid, False)
     full = os.path.join(ATT_DIR, a["path"])
     if not os.path.isfile(full):
         return err(tr("File missing on the server"), 404)
@@ -1291,8 +1942,7 @@ def paperless_thumb(doc_id):
 @app.post("/api/tasks/<int:tid>/paperless")
 def paperless_link(tid):
     c = db()
-    if not c.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
-        return err(tr("unknown"), 404)
+    need_task(c, tid)
     doc_id = int(body().get("doc_id") or 0)
     if not c.execute("SELECT 1 FROM paperless_links WHERE task_id=? AND doc_id=?", (tid, doc_id)).fetchone():
         d = pl_doc(doc_id)
@@ -1310,6 +1960,7 @@ def paperless_unlink(lid):
     r = c.execute("SELECT task_id FROM paperless_links WHERE id=?", (lid,)).fetchone()
     if not r:
         return err(tr("unknown"), 404)
+    need_task(c, r["task_id"])
     c.execute("DELETE FROM paperless_links WHERE id=?", (lid,))
     bump(c)
     c.commit()
@@ -1337,9 +1988,7 @@ def attachment_to_paperless(aid):
     """Upload an attachment into Paperless. The link is 'pending' until Paperless has consumed it;
     the watchdog then swaps it for the real document and removes the local copy."""
     c = db()
-    a = c.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
-    if not a:
-        return err(tr("unknown"), 404)
+    a = need_attachment(c, aid, True)
     if c.execute("SELECT 1 FROM paperless_links WHERE att_id=? AND status='pending'", (aid,)).fetchone():
         return err(tr("Already being sent to Paperless"))
     with open(os.path.join(ATT_DIR, a["path"]), "rb") as f:
@@ -1357,6 +2006,12 @@ def attachment_to_paperless(aid):
     return jsonify(one_task(c, a["task_id"]))
 
 
+def task_owner(c, tid):
+    """Owner of the list a task is in (settings for server-side work on the task)."""
+    r = c.execute("SELECT l.owner_id FROM tasks t JOIN lists l ON l.id=t.list_id WHERE t.id=?", (tid,)).fetchone()
+    return r[0] if r else default_uid(c)
+
+
 def paperless_poll(c):
     """Watchdog: resolve pending uploads (success -> link doc + drop the local attachment)."""
     rows = c.execute("SELECT * FROM paperless_links WHERE status='pending'").fetchall()
@@ -1366,13 +2021,14 @@ def paperless_poll(c):
         except PaperlessError as e:
             print("paperless poll:", e, flush=True)
             return
+        owner = task_owner(c, p["task_id"])
         lst = j if isinstance(j, list) else j.get("results", [])
         t = next((x for x in lst if x.get("task_id") == p["ptask"]), None)
         age = (now_utc() - parse_iso(p["added_at"])).total_seconds()
         if not t:
             if age > 1800:
                 c.execute("UPDATE paperless_links SET status='error', message=? WHERE id=?",
-                          (tr("Paperless did not confirm the upload", lg=lang(c)), p["id"]))
+                          (tr("Paperless did not confirm the upload", lg=lang(c, owner)), p["id"]))
                 bump(c)
                 c.commit()
             continue
@@ -1395,7 +2051,7 @@ def paperless_poll(c):
                 doc_id = int(m.group(1))
             else:
                 c.execute("UPDATE paperless_links SET status='error', message=? WHERE id=?",
-                          ((res_txt or tr("Paperless could not consume the document", lg=lang(c)))[:300], p["id"]))
+                          ((res_txt or tr("Paperless could not consume the document", lg=lang(c, owner)))[:300], p["id"]))
                 bump(c)
                 c.commit()
                 continue
@@ -1413,7 +2069,7 @@ def paperless_poll(c):
                   (d["doc_id"], d["title"], d["correspondent"], d["created"],
                    "war schon in Paperless" if dup else "", p["id"]))
         files = []
-        keep = settings(c).get("paperless_keep") == "1"
+        keep = usettings(c, owner).get("paperless_keep") == "1"
         if p["att_id"] and not keep:
             a = c.execute("SELECT path FROM attachments WHERE id=?", (p["att_id"],)).fetchone()
             if a:
@@ -1427,9 +2083,7 @@ def paperless_poll(c):
 @app.delete("/api/attachments/<int:aid>")
 def attachment_delete(aid):
     c = db()
-    a = c.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
-    if not a:
-        return err(tr("unknown"), 404)
+    a = need_attachment(c, aid, True)
     c.execute("DELETE FROM attachments WHERE id=?", (aid,))
     bump(c)
     c.commit()
@@ -1439,13 +2093,34 @@ def attachment_delete(aid):
 
 @app.post("/api/tasks/reorder")
 def task_reorder():
-    """[{id, sort, section_id?, list_id?, priority?, due?}] — one call per drag."""
+    """[{id, sort, section_id?, list_id?, priority?, due?}] — one call per drag. All items are checked
+    first (write on the task, and on the target list for moves); nothing changes if one is forbidden."""
     c = db()
     ts = iso(now_utc())
+    items = []
     for it in body().get("items", []):
+        if not isinstance(it, dict) or not it.get("id"):
+            continue
+        r = c.execute("SELECT list_id FROM tasks WHERE id=?", (int(it["id"]),)).fetchone()
+        if not r or not list_role(c, r[0]):
+            continue  # unknown (e.g. deleted elsewhere, or not visible): nothing to do
+        need_list(c, r[0])
+        if it.get("list_id"):
+            need_list(c, int(it["list_id"]))
+        items.append(it)
+    for it in items:
         f = clean_task({k: v for k, v in it.items()
                         if k in ("sort", "section_id", "list_id", "priority", "due", "start", "due_time")})
+        if "list_id" in f and not f["list_id"]:
+            del f["list_id"]
         if f:
+            cur = c.execute("SELECT list_id, assignee_id FROM tasks WHERE id=?", (it["id"],)).fetchone()
+            lid = f.get("list_id", cur["list_id"])
+            if f.get("section_id") and not c.execute("SELECT 1 FROM sections WHERE id=? AND list_id=?",
+                                                     (f["section_id"], lid)).fetchone():
+                f["section_id"] = None
+            if lid != cur["list_id"] and cur["assignee_id"] and cur["assignee_id"] not in list_people(c, lid):
+                f["assignee_id"] = None
             f["updated_at"] = ts
             c.execute(f"UPDATE tasks SET {','.join(k + '=?' for k in f)} WHERE id=?", [*f.values(), it["id"]])
             if "list_id" in f:
@@ -1458,29 +2133,36 @@ def task_reorder():
 
 @app.post("/api/tasks/batch")
 def task_batch():
-    """{ids: [...], action: patch|complete|reopen|delete, data: {...}} — multi-select."""
+    """{ids: [...], action: patch|complete|reopen|delete, data: {...}} — multi-select.
+    Tasks the user may not change are skipped and reported in errors."""
     b = body()
     c = db()
     ids = [int(i) for i in b.get("ids", [])]
     action, data = b.get("action"), b.get("data") or {}
     ts = iso(now_utc())
-    errors = []
+    errors, done = [], 0
     for tid in ids:
         if not c.execute("SELECT 1 FROM tasks WHERE id=? AND deleted_at IS NULL", (tid,)).fetchone():
             continue
-        if action == "patch":
-            e = apply_update(c, tid, data)
-            if e:
-                errors.append(e)
-        elif action == "complete":
-            do_complete(c, tid, int(data.get("status", 2)))
-        elif action == "reopen":
-            c.execute("UPDATE tasks SET status=0, completed_at=NULL, updated_at=? WHERE id=?", (ts, tid))
-        elif action == "delete":
-            do_delete(c, tid)
+        try:
+            need_task(c, tid)
+            if action == "patch":
+                e = apply_update(c, tid, data)
+                if e:
+                    errors.append(e)
+                    continue
+            elif action == "complete":
+                do_complete(c, tid, int(data.get("status", 2)))
+            elif action == "reopen":
+                c.execute("UPDATE tasks SET status=0, completed_at=NULL, updated_at=? WHERE id=?", (ts, tid))
+            elif action == "delete":
+                do_delete(c, tid)
+            done += 1
+        except Denied as e:
+            errors.append(tr("No permission (view only)") if e.code == 403 else tr("unknown"))
     bump(c)
     c.commit()
-    return jsonify(ok=True, count=len(ids), errors=list(dict.fromkeys(errors)))
+    return jsonify(ok=True, count=done, errors=list(dict.fromkeys(errors)))
 
 
 @app.get("/api/occurrences")
@@ -1494,8 +2176,9 @@ def occurrences():
     if (hi - lo).days > 400:
         return err(tr("Date range too large"))
     out = []
-    for t in db().execute("""SELECT id, due, repeat FROM tasks WHERE status=0 AND deleted_at IS NULL
-                             AND repeat!='' AND due IS NOT NULL AND due<=?""", (hi.isoformat(),)):
+    for t in db().execute(f"""SELECT id, due, repeat FROM tasks WHERE status=0 AND deleted_at IS NULL
+                              AND repeat!='' AND due IS NOT NULL AND due<=? AND list_id IN {vis_sql()}""",
+                          (hi.isoformat(), me(), me())):
         try:
             d0 = date.fromisoformat(t["due"])
             start = datetime(d0.year, d0.month, d0.day)
@@ -1508,9 +2191,14 @@ def occurrences():
     return jsonify(items=out)
 
 
-# ---------------------------------------------------------------- habits
+# ---------------------------------------------------------------- habits (private per user)
 
 HABIT_FIELDS = ("name", "color", "goal", "days", "remind_at", "sort", "archived", "per_week")
+
+
+def need_habit(c, hid):
+    if not c.execute("SELECT 1 FROM habits WHERE id=? AND user_id=?", (hid, me())).fetchone():
+        raise Denied(404)
 
 
 @app.post("/api/habits")
@@ -1520,10 +2208,10 @@ def habit_create():
     if not name:
         return err(tr("Name missing"))
     c = db()
-    srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM habits").fetchone()[0]
-    cur = c.execute("INSERT INTO habits(name,color,goal,days,remind_at,sort,per_week,created_at) VALUES(?,?,?,?,?,?,?,?)",
+    srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM habits WHERE user_id=?", (me(),)).fetchone()[0]
+    cur = c.execute("INSERT INTO habits(name,color,goal,days,remind_at,sort,per_week,created_at,user_id) VALUES(?,?,?,?,?,?,?,?,?)",
                     (name, b.get("color", ""), int(b.get("goal") or 1), b.get("days") or "1234567",
-                     b.get("remind_at", ""), srt, int(b.get("per_week") or 0), iso(now_utc())))
+                     b.get("remind_at", ""), srt, int(b.get("per_week") or 0), iso(now_utc()), me()))
     bump(c)
     c.commit()
     return jsonify(id=cur.lastrowid)
@@ -1533,6 +2221,7 @@ def habit_create():
 def habit_update(hid):
     b = body()
     c = db()
+    need_habit(c, hid)
     for k in HABIT_FIELDS:
         if k in b:
             c.execute(f"UPDATE habits SET {k}=? WHERE id=?", (b[k], hid))
@@ -1544,6 +2233,7 @@ def habit_update(hid):
 @app.delete("/api/habits/<int:hid>")
 def habit_delete(hid):
     c = db()
+    need_habit(c, hid)
     c.execute("DELETE FROM habits WHERE id=?", (hid,))
     bump(c)
     c.commit()
@@ -1555,6 +2245,7 @@ def habit_log(hid):
     b = body()
     day = b.get("day") or local_now().date().isoformat()
     c = db()
+    need_habit(c, hid)
     old = c.execute("SELECT count, note FROM habit_logs WHERE habit_id=? AND day=?", (hid, day)).fetchone()
     cnt = max(0, int(b["count"])) if "count" in b else (old["count"] if old else 0)
     note = (b.get("note") or "").strip()[:500] if "note" in b else (old["note"] if old else "")
@@ -1569,7 +2260,7 @@ def habit_log(hid):
     return jsonify(ok=True)
 
 
-# ---------------------------------------------------------------- pomodoro
+# ---------------------------------------------------------------- pomodoro (private per user)
 
 def pomo_elapsed(p, ref=None):
     ref = ref or now_utc()
@@ -1577,10 +2268,10 @@ def pomo_elapsed(p, ref=None):
     return max(0, (end - parse_iso(p["start"])).total_seconds() - p["paused_s"])
 
 
-def pomo_stats(c, days=1):
+def pomo_stats(c, days=1, uid=None):
     since = local_now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days - 1)
-    rows = c.execute("SELECT * FROM pomos WHERE kind IN ('focus','stopwatch') AND end IS NOT NULL AND start>=?",
-                     (iso(since),)).fetchall()
+    rows = c.execute("SELECT * FROM pomos WHERE kind IN ('focus','stopwatch') AND end IS NOT NULL AND start>=? AND user_id=?",
+                     (iso(since), uid or me())).fetchall()
     return dict(count=sum(1 for r in rows if r["done"] and r["kind"] == "focus"),
                 minutes=round(sum(pomo_elapsed(r) for r in rows) / 60))
 
@@ -1589,14 +2280,20 @@ def pomo_stats(c, days=1):
 def pomo_start():
     b = body()
     c = db()
-    s = settings(c)
+    s = usettings(c, me())
     kind = b.get("kind", "focus")
     mins = 0 if kind == "stopwatch" else int(b.get("minutes") or s["pomo_" + ("focus" if kind == "focus" else "short")])
     ts = iso(now_utc())
-    for p in c.execute("SELECT * FROM pomos WHERE end IS NULL").fetchall():  # one at a time
+    for p in c.execute("SELECT * FROM pomos WHERE end IS NULL AND user_id=?", (me(),)).fetchall():  # one at a time
         c.execute("UPDATE pomos SET end=? WHERE id=?", (ts, p["id"]))
-    c.execute("INSERT INTO pomos(task_id,kind,minutes,start) VALUES(?,?,?,?)",
-              (b.get("task_id"), kind, mins, ts))
+    task = b.get("task_id")
+    try:
+        if task:
+            need_task(c, int(task), write=False)
+    except (Denied, TypeError, ValueError):
+        task = None
+    c.execute("INSERT INTO pomos(task_id,kind,minutes,start,user_id) VALUES(?,?,?,?,?)",
+              (task, kind, mins, ts, me()))
     bump(c)
     c.commit()
     return jsonify(running_pomo(c))
@@ -1605,7 +2302,7 @@ def pomo_start():
 @app.post("/api/pomo/<int:pid>/<action>")
 def pomo_action(pid, action):
     c = db()
-    p = c.execute("SELECT * FROM pomos WHERE id=?", (pid,)).fetchone()
+    p = c.execute("SELECT * FROM pomos WHERE id=? AND user_id=?", (pid, me())).fetchone()
     if not p:
         return err(tr("unknown"), 404)
     ts = now_utc()
@@ -1628,9 +2325,10 @@ def pomo_action(pid, action):
 def pomo_stats_api():
     c = db()
     since = local_now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=29)
-    rows = c.execute("""SELECT p.*, t.title FROM pomos p LEFT JOIN tasks t ON t.id=p.task_id
-                        WHERE p.kind IN ('focus','stopwatch') AND p.end IS NOT NULL AND p.start>=? ORDER BY p.start DESC""",
-                     (iso(since),)).fetchall()
+    rows = c.execute(f"""SELECT p.*, t.title FROM pomos p
+                         LEFT JOIN tasks t ON t.id=p.task_id AND t.list_id IN {vis_sql()}
+                         WHERE p.user_id=? AND p.kind IN ('focus','stopwatch') AND p.end IS NOT NULL AND p.start>=?
+                         ORDER BY p.start DESC""", (me(), me(), me(), iso(since))).fetchall()
     per_day, per_task = {}, {}
     for r in rows:
         d = parse_iso(r["start"]).astimezone(TZ).date().isoformat()
@@ -1646,17 +2344,17 @@ def pomo_stats_api():
                    recent=recent)
 
 
-# ---------------------------------------------------------------- settings / export
+# ---------------------------------------------------------------- settings / export (per user)
 
 @app.patch("/api/settings")
 def settings_update():
     b = body()
     c = db()
     for k, v in b.items():
-        if k in DEFAULT_SETTINGS and k not in ("version", "digest_sent", "ntfy_topic"):
+        if k in USER_DEFAULTS and k not in ("digest_sent", "ntfy_topic"):
             if k == "lang" and v not in LANGS:
                 continue
-            c.execute("UPDATE settings SET value=? WHERE key=?", (str(v), k))
+            uset(c, me(), k, str(v))
     bump(c)
     c.commit()
     return jsonify(ok=True)
@@ -1664,19 +2362,211 @@ def settings_update():
 
 @app.post("/api/ntfy/test")
 def ntfy_test():
-    ok = ntfy("Abhako: Test", tr("Notifications are arriving."), "default", PUBLIC_URL)
+    ok = ntfy("Abhako: Test", tr("Notifications are arriving."), "default", PUBLIC_URL,
+              topic=usettings(db(), me())["ntfy_topic"])
     return jsonify(ok=ok)
 
 
 @app.get("/api/export.json")
 def export_json():
+    """My data: lists I own (also shared ones, with their tasks / sections / files), my tags,
+    habits, focus sessions, filters and settings. Attachment files stay in data/attachments/."""
     c = db()
-    data = {t: [dict(r) for r in c.execute(f"SELECT * FROM {t}")]
-            for t in ("lists", "sections", "tasks", "task_tags", "habits", "habit_logs", "pomos", "filters",
-                      "attachments", "paperless_links")}  # attachment files themselves stay in data/attachments/
+    uid = me()
+    own = "(SELECT id FROM lists WHERE owner_id=?)"
+    task_ids = f"(SELECT id FROM tasks WHERE list_id IN {own})"
+    q = {
+        "lists": (f"SELECT * FROM lists WHERE owner_id=?", (uid,)),
+        "list_members": (f"SELECT * FROM list_members WHERE list_id IN {own}", (uid,)),
+        "sections": (f"SELECT * FROM sections WHERE list_id IN {own}", (uid,)),
+        "tasks": (f"SELECT * FROM tasks WHERE list_id IN {own}", (uid,)),
+        "task_tags": ("SELECT * FROM task_tags WHERE user_id=?", (uid,)),
+        "habits": ("SELECT * FROM habits WHERE user_id=?", (uid,)),
+        "habit_logs": ("SELECT * FROM habit_logs WHERE habit_id IN (SELECT id FROM habits WHERE user_id=?)", (uid,)),
+        "pomos": ("SELECT * FROM pomos WHERE user_id=?", (uid,)),
+        "filters": ("SELECT * FROM filters WHERE user_id=?", (uid,)),
+        "attachments": (f"SELECT * FROM attachments WHERE task_id IN {task_ids}", (uid,)),
+        "paperless_links": (f"SELECT * FROM paperless_links WHERE task_id IN {task_ids}", (uid,)),
+        "settings": ("SELECT key, value FROM user_settings WHERE user_id=?", (uid,)),
+    }
+    data = {t: [dict(r) for r in c.execute(sql, args)] for t, (sql, args) in q.items()}
+    data["user"] = user_public(g.user)
     name = f"abhako-export-{local_now():%Y-%m-%d}.json"
     return Response(json.dumps(data, ensure_ascii=False, indent=1), mimetype="application/json",
                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+# ---------------------------------------------------------------- users / account
+
+def need_admin():
+    if not g.user["is_admin"]:
+        raise Denied(403)
+
+
+def user_admin_dict(c, u):
+    return {**user_public(u), "is_admin": bool(u["is_admin"]), "disabled": bool(u["disabled"]),
+            "has_password": bool(u["password_hash"]), "proxy_login": u["proxy_login"] or "",
+            "created_at": u["created_at"], "ntfy_topic": usettings(c, u["id"])["ntfy_topic"],
+            "lists": c.execute("SELECT COUNT(*) FROM lists WHERE owner_id=? AND is_inbox=0", (u["id"],)).fetchone()[0]}
+
+
+@app.get("/api/users")
+def users_list():
+    """Everyone: enabled users (for sharing). Admins: all users with account details."""
+    c = db()
+    if g.user["is_admin"]:
+        return jsonify(users=[user_admin_dict(c, u) for u in c.execute("SELECT * FROM users ORDER BY id")])
+    return jsonify(users=[user_public(u) for u in c.execute("SELECT * FROM users WHERE disabled=0 ORDER BY id")])
+
+
+def _proxy_taken(c, login, uid=None):
+    return bool(login) and bool(c.execute("SELECT 1 FROM users WHERE proxy_login=? COLLATE NOCASE AND id IS NOT ?",
+                                          (login, uid)).fetchone())
+
+
+def _active_admins(c, without=None):
+    return c.execute("SELECT COUNT(*) FROM users WHERE is_admin=1 AND disabled=0 AND id IS NOT ?", (without,)).fetchone()[0]
+
+
+@app.post("/api/users")
+def user_create():
+    need_admin()
+    b = body()
+    c = db()
+    username = (b.get("username") or "").strip().lower()
+    if not USERNAME_RE.fullmatch(username):
+        return err(tr("Username: 1-32 characters a-z, 0-9, dot, dash, underscore"))
+    if c.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+        return err(tr("Username already exists"), 409)
+    pw = b.get("password") or ""
+    if pw and len(pw) < MIN_PASSWORD:
+        return err(tr("Password: at least {0} characters", MIN_PASSWORD))
+    proxy = (b.get("proxy_login") or "").strip() or None
+    if _proxy_taken(c, proxy):
+        return err(tr("This proxy login is already assigned"), 409)
+    uid = create_user(c, username, (b.get("display_name") or "").strip()[:60] or username, pw or None, proxy,
+                      bool(b.get("is_admin")), ntfy_topic=(b.get("ntfy_topic") or "").strip() or None)
+    uset(c, uid, "lang", usettings(c, me())["lang"])  # start in the admin's language
+    ensure_inbox(c, uid)
+    bump(c)
+    c.commit()
+    return jsonify(user_admin_dict(c, c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()))
+
+
+@app.patch("/api/users/<int:uid>")
+def user_update(uid):
+    need_admin()
+    b = body()
+    c = db()
+    u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        return err(tr("unknown user"), 404)
+    if uid == me() and (("is_admin" in b and not b["is_admin"]) or b.get("disabled")):
+        return err(tr("You cannot remove your own admin rights or disable yourself"))
+    if (("is_admin" in b and not b["is_admin"]) or b.get("disabled")) and u["is_admin"] and not _active_admins(c, uid):
+        return err(tr("At least one active admin is needed"))
+    if "display_name" in b:
+        c.execute("UPDATE users SET display_name=? WHERE id=?", ((b["display_name"] or "").strip()[:60] or u["username"], uid))
+    if "proxy_login" in b:
+        proxy = (b["proxy_login"] or "").strip() or None
+        if _proxy_taken(c, proxy, uid):
+            return err(tr("This proxy login is already assigned"), 409)
+        c.execute("UPDATE users SET proxy_login=? WHERE id=?", (proxy, uid))
+    if "is_admin" in b:
+        c.execute("UPDATE users SET is_admin=? WHERE id=?", (1 if b["is_admin"] else 0, uid))
+    if "disabled" in b:
+        c.execute("UPDATE users SET disabled=? WHERE id=?", (1 if b["disabled"] else 0, uid))
+        if b["disabled"]:
+            c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+    if "password" in b:  # reset ('' = remove the built-in login)
+        pw = b["password"] or ""
+        if pw and len(pw) < MIN_PASSWORD:
+            return err(tr("Password: at least {0} characters", MIN_PASSWORD))
+        c.execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(pw) if pw else None, uid))
+        c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+    if "ntfy_topic" in b:
+        uset(c, uid, "ntfy_topic", (b["ntfy_topic"] or "").strip())
+    bump(c)
+    c.commit()
+    return jsonify(user_admin_dict(c, c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()))
+
+
+@app.delete("/api/users/<int:uid>")
+def user_delete(uid):
+    """Refused while the user owns lists besides the inbox (the safer option: nothing shared with
+    others disappears). Deletes their inbox (+ its tasks), habits, focus sessions, filters, tags and
+    settings; tasks they created in other people's lists stay (creator cleared)."""
+    need_admin()
+    c = db()
+    u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        return err(tr("unknown user"), 404)
+    if uid == me():
+        return err(tr("You cannot delete yourself"))
+    n = c.execute("SELECT COUNT(*) FROM lists WHERE owner_id=? AND is_inbox=0", (uid,)).fetchone()[0]
+    if n:
+        return err(trn("The user still owns {0} list. Delete it or disable the user instead.",
+                       "The user still owns {0} lists. Delete them or disable the user instead.", n), 409)
+    inbox = [r[0] for r in c.execute("SELECT id FROM lists WHERE owner_id=?", (uid,))]
+    files = attachment_files(c, [r[0] for r in c.execute(
+        f"SELECT id FROM tasks WHERE list_id IN ({','.join('?' * len(inbox)) or 'NULL'})", inbox)])
+    for lid in inbox:
+        c.execute("DELETE FROM lists WHERE id=?", (lid,))
+    c.execute("DELETE FROM habits WHERE user_id=?", (uid,))
+    c.execute("DELETE FROM pomos WHERE user_id=?", (uid,))
+    c.execute("DELETE FROM filters WHERE user_id=?", (uid,))
+    c.execute("DELETE FROM task_tags WHERE user_id=?", (uid,))
+    c.execute("UPDATE tasks SET assignee_id=NULL WHERE assignee_id=?", (uid,))
+    c.execute("UPDATE tasks SET created_by=NULL WHERE created_by=?", (uid,))
+    c.execute("DELETE FROM users WHERE id=?", (uid,))  # cascades: settings, memberships, sessions
+    bump(c)
+    c.commit()
+    unlink_files(files)
+    return jsonify(ok=True)
+
+
+@app.get("/api/me")
+def me_get():
+    c = db()
+    u = g.user
+    return jsonify({**user_public(u), "is_admin": bool(u["is_admin"]), "auth": g.auth_via,
+                    "has_password": bool(u["password_hash"]), "proxy_login": u["proxy_login"] or "",
+                    "drop_token": u["drop_token"] or "", "ntfy_topic": usettings(c, u["id"])["ntfy_topic"]})
+
+
+@app.patch("/api/me")
+def me_update():
+    """Own display name and password (the current password is required when one is set)."""
+    b = body()
+    c = db()
+    u = g.user
+    if "display_name" in b:
+        c.execute("UPDATE users SET display_name=? WHERE id=?", ((b["display_name"] or "").strip()[:60] or u["username"], u["id"]))
+    if "password" in b:
+        keys = _rate_keys(u["username"])
+        if _rate_blocked(keys):
+            return err(tr("Too many failed logins, please wait a few minutes"), 429)
+        if u["password_hash"] and not check_password_hash(u["password_hash"], b.get("current_password") or ""):
+            _rate_fail(keys)
+            return err(tr("Current password is wrong"), 403)
+        pw = b["password"] or ""
+        if len(pw) < MIN_PASSWORD:
+            return err(tr("Password: at least {0} characters", MIN_PASSWORD))
+        c.execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(pw), u["id"]))
+        tok = request.cookies.get(COOKIE)  # other sessions end, this one stays
+        c.execute("DELETE FROM sessions WHERE user_id=? AND token_hash IS NOT ?", (u["id"], _token_hash(tok) if tok else None))
+    bump(c)
+    c.commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/me/drop-token")
+def me_drop_token():
+    c = db()
+    tok = secrets.token_urlsafe(24)
+    c.execute("UPDATE users SET drop_token=? WHERE id=?", (tok, me()))
+    c.commit()
+    return jsonify(drop_token=tok)
 
 
 # ---------------------------------------------------------------- TickTick import
@@ -1713,14 +2603,15 @@ def tt_reminders(s):
     return ",".join(dict.fromkeys(out))
 
 
-def import_ticktick(c, text):
+def import_ticktick(c, text, uid):
+    """Imports into the lists of user uid (matched by name among the lists they own)."""
     text = text.lstrip("﻿")
     i = text.find('"Folder Name"')
     if i < 0:
-        raise ValueError(tr("Not a TickTick CSV (header 'Folder Name' missing)"))
+        raise ValueError(tr("Not a TickTick CSV (header 'Folder Name' missing)", lg=lang(c, uid)))
     rows = list(csv.DictReader(io.StringIO(text[i:])))
-    lists = {r["name"]: r["id"] for r in c.execute("SELECT id, name FROM lists")}
-    inbox = c.execute("SELECT id FROM lists WHERE is_inbox=1").fetchone()[0]
+    lists = {r["name"]: r["id"] for r in c.execute("SELECT id, name FROM lists WHERE owner_id=? AND is_inbox=0", (uid,))}
+    inbox = my_inbox(c, uid)
     sections = {}
     stats = dict(tasks=0, skipped=0, lists=0)
     idmap = {}
@@ -1735,15 +2626,16 @@ def import_ticktick(c, text):
         elif name in lists:
             lid = lists[name]
         else:
-            srt = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM lists").fetchone()[0]
-            lid = c.execute("INSERT INTO lists(name,folder,sort,view,created_at) VALUES(?,?,?,?,?)",
+            srt = my_max_sort(c, uid) + 1
+            lid = c.execute("INSERT INTO lists(name,folder,sort,view,created_at,owner_id) VALUES(?,?,?,?,?,?)",
                             (name, r.get("Folder Name") or "", srt,
-                             "kanban" if r.get("View Mode") == "kanban" else "list", ts)).lastrowid
+                             "kanban" if r.get("View Mode") == "kanban" else "list", ts, uid)).lastrowid
             lists[name] = lid
             stats["lists"] += 1
         tt = r.get("taskId") or None
-        if tt and c.execute("SELECT id FROM tasks WHERE tt_id=?", (tt,)).fetchone():
-            idmap[tt] = c.execute("SELECT id FROM tasks WHERE tt_id=?", (tt,)).fetchone()[0]
+        old = c.execute("SELECT id FROM tasks WHERE tt_id=? AND created_by=?", (tt, uid)).fetchone() if tt else None
+        if old:
+            idmap[tt] = old[0]
             stats["skipped"] += 1
             continue
         sec = None
@@ -1785,15 +2677,15 @@ def import_ticktick(c, text):
             repeat = ""  # ERULE / custom date lists are not supported
         cur = c.execute(
             """INSERT INTO tasks(list_id,section_id,title,content,priority,status,due,due_time,reminders,
-               reminded,repeat,sort,created_at,updated_at,completed_at,tt_id,start)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (lid, sec, (r.get("Title") or tr("(untitled)", lg=lang(c))).strip(), content, int(r.get("Priority") or 0),
+               reminded,repeat,sort,created_at,updated_at,completed_at,tt_id,start,created_by)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (lid, sec, (r.get("Title") or tr("(untitled)", lg=lang(c, uid))).strip(), content, int(r.get("Priority") or 0),
              status, due, due_time, rems, json.dumps(reminded), repeat, stats["tasks"], created, ts, completed, tt,
-             start))
+             start, uid))
         idmap[tt] = cur.lastrowid
         tags = [t.strip() for t in (r.get("Tags") or "").split(",") if t.strip()]
         if tags:
-            set_tags(c, cur.lastrowid, tags)
+            set_tags(c, cur.lastrowid, tags, uid)
         stats["tasks"] += 1
         r["_id"] = cur.lastrowid
     for r in rows:  # second pass: parents
@@ -1811,7 +2703,7 @@ def import_api():
     if not f:
         return err(tr("File missing"))
     try:
-        stats = import_ticktick(db(), f.read().decode("utf-8-sig"))
+        stats = import_ticktick(db(), f.read().decode("utf-8-sig"), me())
     except (ValueError, KeyError) as e:
         return err(str(e))
     return jsonify(stats)
@@ -1820,7 +2712,6 @@ def import_api():
 # ---------------------------------------------------------------- watchdog / ntfy
 
 def ntfy(title, msg, prio="default", click=None, topic=None, actions=None):
-    topic = topic or NTFY_TOPIC
     if not topic:
         return False
     hdr = {"Title": title.encode("utf-8"), "Priority": prio}  # no Tags header: no emoji icon in the push
@@ -1839,19 +2730,30 @@ def ntfy(title, msg, prio="default", click=None, topic=None, actions=None):
         return False
 
 
+def reminder_recipient(c, t, users):
+    """Assignee, else the creator, else the list owner -- the first one that (still) sees the list."""
+    for uid in (t["assignee_id"], t["created_by"], t["list_owner"]):
+        if uid and uid in users and (uid == t["list_owner"] or list_role(c, t["list_id"], uid)):
+            return uid
+    return None
+
+
 def watchdog_tick(c):
-    global NTFY_TOPIC
     if PL_TOKEN:
         paperless_poll(c)
-    s = settings(c)
-    NTFY_TOPIC = s["ntfy_topic"]
-    lg = s.get("lang") if s.get("lang") in LANGS else "en"
+    users = {r["id"]: r for r in c.execute("SELECT * FROM users WHERE disabled=0")}
+    S = {uid: usettings(c, uid) for uid in users}
+    LG = {uid: s.get("lang") if s.get("lang") in LANGS else "en" for uid, s in S.items()}
     now = local_now()
-    # task reminders -- fire once per (due, offset); skip if missed by > 6 h
-    rows = c.execute("""SELECT t.*, l.name AS list_name, l.is_inbox AS list_inbox FROM tasks t JOIN lists l ON l.id=t.list_id
+    # task reminders -- fire once per (due, offset); skip if missed by > 6 h. Goes to the assignee,
+    # unassigned tasks to their creator.
+    rows = c.execute("""SELECT t.*, l.name AS list_name, l.is_inbox AS list_inbox, l.owner_id AS list_owner
+                        FROM tasks t JOIN lists l ON l.id=t.list_id
                         WHERE t.status=0 AND t.deleted_at IS NULL AND t.due IS NOT NULL
                           AND t.reminders!=''""").fetchall()
     for t in rows:
+        rcpt = reminder_recipient(c, t, users)
+        s, lg = S.get(rcpt, USER_DEFAULTS), LG.get(rcpt, "en")
         base = datetime.fromisoformat(f"{t['due']}T{t['due_time'] or s['allday_time'] or '09:00'}").replace(tzinfo=TZ)
         fired = json.loads(t["reminded"] or "[]")
         changed = False
@@ -1864,14 +2766,14 @@ def watchdog_tick(c):
                 continue
             fired.append(key)
             changed = True
-            if now - at > timedelta(hours=6):
+            if now - at > timedelta(hours=6) or not rcpt:
                 continue
             when = tr("all day", lg=lg) if not t["due_time"] else tr("at {0}", t["due_time"], lg=lg)
             day = tr("today", lg=lg) if t["due"] == now.date().isoformat() else \
                 date.fromisoformat(t["due"]).strftime("%d.%m." if lg == "de" else "%d %b")
             lname = tr("Inbox", lg=lg) if t["list_inbox"] and t["list_name"] == "Eingang" else t["list_name"]
             ntfy(t["title"], tr("Due {0} {1} · {2}", day, when, lname, lg=lg),
-                 "high" if t["priority"] == 5 else "default", f"{PUBLIC_URL}/#t/{t['id']}",
+                 "high" if t["priority"] == 5 else "default", f"{PUBLIC_URL}/#t/{t['id']}", topic=s["ntfy_topic"],
                  actions=[(tr("Snooze", lg=lg), f"{PUBLIC_URL}/#snooze/{t['id']}"),
                           (tr("Done|action", lg=lg), f"{PUBLIC_URL}/#done/{t['id']}")])
         if changed:
@@ -1883,11 +2785,14 @@ def watchdog_tick(c):
         if p["minutes"] > 0 and pomo_elapsed(p) >= p["minutes"] * 60:  # stopwatch (0 min) never ends by itself
             c.execute("UPDATE pomos SET notified=1 WHERE id=?", (p["id"],))
             c.commit()
+            if p["user_id"] not in users:
+                continue
+            s, lg = S[p["user_id"]], LG[p["user_id"]]
             if p["kind"] == "focus":
                 ntfy(tr("Focus done", lg=lg), tr("{0} min{1}. Time for a break.", p["minutes"], " · " + p["title"] if p["title"] else "", lg=lg),
-                     "default", f"{PUBLIC_URL}/#pomo")
+                     "default", f"{PUBLIC_URL}/#pomo", topic=s["ntfy_topic"])
             else:
-                ntfy(tr("Break is over", lg=lg), tr("Back to it.", lg=lg), "default", f"{PUBLIC_URL}/#pomo")
+                ntfy(tr("Break is over", lg=lg), tr("Back to it.", lg=lg), "default", f"{PUBLIC_URL}/#pomo", topic=s["ntfy_topic"])
     # habit reminders
     today = now.date().isoformat()
     wd = str(now.isoweekday())
@@ -1903,23 +2808,34 @@ def watchdog_tick(c):
                 continue
         c.execute("UPDATE habits SET reminded_on=? WHERE id=?", (today, h["id"]))
         c.commit()
+        if h["user_id"] not in users:
+            continue
+        s, lg = S[h["user_id"]], LG[h["user_id"]]
         done = c.execute("SELECT count FROM habit_logs WHERE habit_id=? AND day=?", (h["id"], today)).fetchone()
         if not done or done[0] < h["goal"]:
-            ntfy(tr("Habit: {0}", h["name"], lg=lg), tr("Still open today.", lg=lg), "default", f"{PUBLIC_URL}/#habits")
-    # daily digest
-    dt = s.get("digest_time") or ""
-    if dt and s.get("digest_sent") != today and now.strftime("%H:%M") >= dt:
-        c.execute("UPDATE settings SET value=? WHERE key='digest_sent'", (today,))
+            ntfy(tr("Habit: {0}", h["name"], lg=lg), tr("Still open today.", lg=lg), "default", f"{PUBLIC_URL}/#habits",
+                 topic=s["ntfy_topic"])
+    # daily digest per user: tasks in my own lists (unassigned or mine) + tasks assigned to me
+    for uid in users:
+        s, lg = S[uid], LG[uid]
+        dt = s.get("digest_time") or ""
+        if not dt or s.get("digest_sent") == today or now.strftime("%H:%M") < dt:
+            continue
+        uset(c, uid, "digest_sent", today)
         c.commit()
-        rows = c.execute("""SELECT title, due, due_time FROM tasks WHERE status=0 AND deleted_at IS NULL
-                            AND parent_id IS NULL AND due IS NOT NULL AND due<=?
-                            ORDER BY due, due_time IS NULL, due_time, priority DESC""", (today,)).fetchall()
+        rows = c.execute(f"""SELECT t.title, t.due, t.due_time FROM tasks t JOIN lists l ON l.id=t.list_id
+                             WHERE t.status=0 AND t.deleted_at IS NULL AND t.parent_id IS NULL
+                               AND t.due IS NOT NULL AND t.due<=?
+                               AND ((l.owner_id=? AND (t.assignee_id IS NULL OR t.assignee_id=?))
+                                    OR (t.assignee_id=? AND t.list_id IN {vis_sql()}))
+                             ORDER BY t.due, t.due_time IS NULL, t.due_time, t.priority DESC""",
+                         (today, uid, uid, uid, uid, uid)).fetchall()
         if rows:
             over = sum(1 for r in rows if r["due"] < today)
             lines = [f"- {r['title']}" + (f" ({r['due_time']})" if r["due_time"] else "") for r in rows[:15]]
             head = trn("{0} task today", "{0} tasks today", len(rows), lg=lg) + \
                 (tr(", {0} of them overdue", over, lg=lg) if over else "")
-            ntfy(tr("Today", lg=lg), head + "\n" + "\n".join(lines), "default", f"{PUBLIC_URL}/#today")
+            ntfy(tr("Today", lg=lg), head + "\n" + "\n".join(lines), "default", f"{PUBLIC_URL}/#today", topic=s["ntfy_topic"])
 
 
 def watchdog():
@@ -1941,10 +2857,26 @@ if os.environ.get("TASKS_WATCHDOG", "1") == "1":
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) == 3 and sys.argv[1] == "import":
+    if len(sys.argv) >= 3 and sys.argv[1] == "import":
         c = connect()
-        print(import_ticktick(c, open(sys.argv[2], encoding="utf-8-sig").read()))
+        uid = default_uid(c)
+        if len(sys.argv) == 4:
+            uid = c.execute("SELECT id FROM users WHERE username=?", (sys.argv[3].lower(),)).fetchone()[0]
+        print(import_ticktick(c, open(sys.argv[2], encoding="utf-8-sig").read(), uid))
         c.close()
         sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "set-password":  # docker exec -it <container> python app.py set-password <user>
+        import getpass
+        c = connect()
+        pw = getpass.getpass("new password: ")
+        if len(pw) < MIN_PASSWORD or pw != getpass.getpass("again: "):
+            sys.exit(f"passwords differ or shorter than {MIN_PASSWORD} characters")
+        n = c.execute("UPDATE users SET password_hash=?, disabled=0 WHERE username=?",
+                      (generate_password_hash(pw), sys.argv[2].lower())).rowcount
+        c.commit()
+        c.close()
+        sys.exit(0 if n else f"no user {sys.argv[2]!r}")
     from waitress import serve
-    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 3040)), threads=8)
+    port = int(os.environ.get("PORT", 3040))
+    listen = f"0.0.0.0:{port}" + (f" 0.0.0.0:{AUTH_PROXY_PORT}" if AUTH_PROXY_PORT and AUTH_PROXY_PORT != str(port) else "")
+    serve(app, listen=listen, threads=8)

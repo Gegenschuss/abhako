@@ -30,6 +30,12 @@ Lists, calendar, Eisenhower matrix, habits and a focus timer in one small web ap
 - Habits per day or *n* times per week, counters (e.g. 8 glasses of water), notes per day, streaks
 - Pomodoro timer and stopwatch, focus minutes per task
 
+**Together**
+- Several users, each with their own inbox, habits, filters, tags, settings and notifications
+- Share a list with others (can edit or view only); shared lists show up in their smart lists, calendar and search
+- Assign tasks in shared lists: reminders go to the assignee, plus an *Assigned to me* list
+- Built-in login or single sign-on through your reverse proxy (Authelia, Authentik, oauth2-proxy)
+
 **Everywhere**
 - Installable web app (PWA) for phone and desktop, works offline: changes queue up and sync later, with conflict detection
 - Mobile layout with swipe gestures, long-press drag, configurable tab bar per device
@@ -58,11 +64,12 @@ docker compose up -d --build
 ```
 
 Abhako now listens on `http://127.0.0.1:3040`. Data (SQLite database and attachments) lives in `./data`.
+Open it: the first start shows a **setup page** that creates the first account (the admin). Do this right
+after installing, whoever gets there first becomes admin.
 
 > [!IMPORTANT]
-> **Abhako has no login of its own.** It is built for a single user behind an authenticating reverse proxy
-> (Authelia, Authentik, oauth2-proxy, basic auth, ...) or inside a private network / VPN.
-> Never expose port 3040 directly to the internet.
+> Use HTTPS (a reverse proxy) for anything beyond your own machine: the login sends your password and
+> the session cookie is only marked `Secure` behind HTTPS.
 
 ## Try it locally
 
@@ -75,36 +82,82 @@ To try it from your phone or another device on your network, change the port lin
 app works, but it cannot be installed and has no offline mode.
 
 > [!WARNING]
-> Without a proxy there is no login: anyone on your network can read and change everything. Fine for a test at
-> home; for daily use put it behind a reverse proxy with authentication (next section) and switch the port back.
+> Over plain HTTP your password travels unencrypted through your network. Fine for a test at home; for daily
+> use put it behind a reverse proxy with HTTPS (next section) and switch the port back.
 
 To remove the test again: `docker compose down` and delete the folder (your test data is in `./data`).
 
+## Users and sharing
+
+- **Accounts:** admins manage users under *Settings > Users* (username, display name, optional password,
+  optional SSO login, admin flag, ntfy topic, disable / delete). Everyone can change their own display name and
+  password under *Settings > Account*. A user who still owns lists cannot be deleted (delete the lists or
+  disable the user instead); deleting removes their inbox, habits, filters and focus history.
+- **Private per user:** inbox, habits, focus sessions, filters, folders and sidebar order, tags (two people can tag
+  the same shared task differently), settings (language, notifications, digest, ...), ntfy topic, upload token.
+- **Sharing:** open a list's menu (*Edit list > Sharing*) and add people with *Can edit* or *View only*. Only the
+  owner renames, archives, deletes or re-shares a list; members can leave. The inbox cannot be shared.
+  Moving a task into a list needs edit rights there, moving it out needs edit rights on its current list;
+  subtasks always follow their parent.
+- **Assignment:** in shared lists a task can be assigned to the owner or a member (task panel > *Assignee*).
+  Reminders go to the assignee, otherwise to whoever created the task. The daily digest contains your own
+  lists' tasks plus everything assigned to you.
+- **Export** (*Settings > Export*) contains your data and the lists you own.
+
+## Login
+
+**Built-in (default):** username and password (hashed with scrypt), an HttpOnly `SameSite=Lax` session cookie
+("stay logged in" = 30 days), failed logins are rate-limited per user and IP. Upgrading from the single-user
+version: your data is moved to the user `admin` (or `AUTH_BOOTSTRAP_USER`); give it a password once with
+`docker exec -it abhako python app.py set-password admin`.
+
+**Single sign-on via your reverse proxy:** set `AUTH_PROXY_HEADER` (e.g. `Remote-User`) and
+`AUTH_TRUSTED_PROXIES`, then enter each person's proxy user name as *SSO login* in *Settings > Users*. A logged-in
+proxy user without an Abhako account sees a "no account, ask the admin" page. Without the header (or from an
+untrusted address) Abhako falls back to its own login page.
+
+> [!CAUTION]
+> The header is a password: whoever can send it to Abhako is that user. Abhako only trusts it from
+> `AUTH_TRUSTED_PROXIES` (the **direct** peer address), never on `/drop`, `/manifest.json` and static files, and
+> your proxy **must remove client-supplied copies** before its auth step, especially on paths that bypass the login.
+> With Docker port publishing every connection (your proxy, other containers, monitoring) usually arrives from the
+> Docker bridge gateway address; then also set `AUTH_PROXY_PORT=3045` and publish that container port only
+> on the address your proxy uses (`127.0.0.1:3040:3045`), so nothing else can reach the port that trusts the header.
+
+**CSRF:** every state-changing API request must carry `X-Requested-With: abhako` (the app always sends it; other
+sites cannot without a CORS preflight, which Abhako never allows).
+
 ## Reverse proxy
 
-Put your proxy's login in front of everything except three kinds of paths:
+Terminate HTTPS in your proxy. If the proxy has its own login (single sign-on), put it in front of everything
+except these paths:
 
 | Path | Why it must bypass the login |
 |---|---|
 | `/manifest.json`, `/static/icon-192.png`, `/static/icon-512.png` | Browsers fetch these without cookies when installing the PWA. They contain no data. |
-| `/drop` | Upload endpoint for share apps (only if you set `TASKS_DROP_TOKEN`). Protected by its own bearer token. |
+| `/drop` | Upload endpoint for share apps. Protected by each user's own bearer token. |
 
-Example for Caddy with basic auth:
+Example for Caddy with Authelia (single sign-on). The `route` keeps the order: first strip any client-sent
+`Remote-*` headers, then let `forward_auth` set the real ones:
 
 ```caddyfile
 tasks.example.com {
-	@open path /manifest.json /static/icon-192.png /static/icon-512.png /drop
-	handle @open {
-		reverse_proxy 127.0.0.1:3040
-	}
-	handle {
-		basic_auth {
-			me $2a$14$...   # caddy hash-password
+	route {
+		request_header -Remote-User
+		request_header -Remote-Groups
+		request_header -Remote-Email
+		request_header -Remote-Name
+		@gated not path /manifest.json /static/icon-192.png /static/icon-512.png /drop
+		forward_auth @gated authelia:9091 {
+			uri /api/authz/forward-auth
+			copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
 		}
 		reverse_proxy 127.0.0.1:3040
 	}
 }
 ```
+
+With the built-in login a plain `reverse_proxy 127.0.0.1:3040` is enough.
 
 ## Configuration
 
@@ -115,21 +168,27 @@ All settings are environment variables in `.env` (see [.env.example](.env.exampl
 | `TZ` | `Europe/Berlin` | Time zone for due dates and reminders |
 | `PUBLIC_URL` | `http://localhost:3040` | Your address, used in notification links |
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server for push notifications |
-| `NTFY_TOPIC` | random | Topic to publish to (generated on first start if empty) |
+| `NTFY_TOPIC` | random | Topic of the first admin; every other user gets a random one (editable by admins) |
 | `NTFY_TOKEN` | | Access token for a protected ntfy server |
-| `TASKS_DROP_TOKEN` | | Enables `POST /drop` (see *Sharing from Android*) |
+| `AUTH_PROXY_HEADER` | | Header with the user name from an authenticating proxy (e.g. `Remote-User`); empty = built-in login only |
+| `AUTH_TRUSTED_PROXIES` | | Comma list of IPs / CIDRs whose header is trusted (direct peer) |
+| `AUTH_PROXY_PORT` | | Extra container port; if set, the header is only trusted on it (see *Login*) |
+| `AUTH_BOOTSTRAP_USER`, `AUTH_BOOTSTRAP_NAME`, `AUTH_BOOTSTRAP_PROXY_LOGIN` | `admin` | Account that receives the data when upgrading from the single-user version |
+| `AUTH_SESSION_DAYS` | `30` | Lifetime of a "stay logged in" session |
+| `TASKS_DROP_TOKEN` | | Becomes the first admin's `/drop` token (every user has an own one, see *Sharing from Android*) |
 | `NTFY_INBOX_URL`, `NTFY_INBOX_TOKEN`, `NTFY_INBOX_TOPIC` | | Optional share inbox: each message on this ntfy topic becomes an inbox task |
+| `NTFY_INBOX_USER` | first admin | Username whose inbox receives the share inbox |
 | `NTFY_INBOX_PUBLIC` | | Public ntfy URL, if attachment links use a different address than `NTFY_INBOX_URL` |
 | `PAPERLESS_API`, `PAPERLESS_PUBLIC_URL`, `PAPERLESS_TOKEN` | | Paperless-ngx integration (internal API URL, URL for your browser, API token) |
 | `TASKS_MAX_FILE_MB` | `50` | Maximum size per attachment |
 
-Everything else (language, reminder defaults, digest time, pomodoro lengths, which modules are shown) is set in the app under *Settings*.
+Everything else (language, reminder defaults, digest time, pomodoro lengths, which modules are shown) is set per user in the app under *Settings*.
 
 ## Language
 
 Abhako starts in **English**. Open *Settings > Language* (in German: *Einstellungen > Sprache*) to switch; **Deutsch**
-is included. The choice is stored on the server, so it applies to every device and also to the push notifications
-(reminders, focus end, habit reminders, daily digest) and server messages.
+is included. The choice is stored per user on the server, so it applies to all your devices and also to your push
+notifications (reminders, focus end, habit reminders, daily digest) and server messages.
 
 Each language other than English is one JSON file in [`static/i18n/`](static/i18n/) that is picked up
 automatically. Want Abhako in your language? [TRANSLATING.md](TRANSLATING.md) explains how to add one in a few
@@ -150,7 +209,7 @@ Task titles, list names, tags and notes are never translated.
 ## Notifications
 
 1. Install the ntfy app ([Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy), [iOS](https://apps.apple.com/app/ntfy/id1625396347)).
-2. Open Abhako > *Settings*: the topic is shown there. Subscribe to it in the ntfy app.
+2. Open Abhako > *Settings*: your topic is shown there (every user has an own one). Subscribe to it in the ntfy app.
 3. Press *Send test*.
 
 On ntfy.sh anyone who knows the topic name can read it, so keep it random or run your own ntfy server with a token.
@@ -160,11 +219,11 @@ On ntfy.sh anyone who knows the topic name can read it, so keep it random or run
 Chrome currently passes no files to installed web apps via the share sheet (links and text work). Two ways around it:
 
 **HTTP Shortcuts** (several files per share, recommended)
-1. Set `TASKS_DROP_TOKEN` to a long random string and let your proxy pass `/drop` (see above).
+1. Get your personal token under *Settings > Account > Upload token* (with a login proxy, let it pass `/drop`, see above).
 2. Install [HTTP Shortcuts](https://http-shortcuts.rmy.ch) and create a shortcut: method `POST`, URL `https://tasks.example.com/drop`.
 3. Authentication: *Bearer token* with your token.
 4. Request body: *Form data*, one parameter of type *file* named `file` with multiple files allowed. Optionally a text parameter `text` (first line = title).
-5. Share images from the gallery to the shortcut: one inbox task with all files attached.
+5. Share images from the gallery to the shortcut: one task in *your* inbox with all files attached.
 
 **ntfy** (one file per share): set the `NTFY_INBOX_*` variables, then share to the ntfy app on that topic.
 

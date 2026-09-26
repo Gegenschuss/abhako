@@ -628,3 +628,32 @@ code.topic{background:var(--bg3);padding:3px 8px;border-radius:6px;font-family:v
 .navrow .temoji{font-size:15px;height:18px;line-height:18px}
 .navrow .tsw{width:10px;height:10px;margin:3px}
 .navrow svg.i.l{width:16px;height:16px;color:var(--muted)}
+/* multi-user: sharing, assignment, account, login */
+.avatar{display:inline-grid;place-items:center;flex:none;width:22px;height:22px;border-radius:50%;background:color-mix(in srgb,var(--accent) 22%,var(--bg3));color:var(--accent);font-size:10px;font-weight:700;letter-spacing:.02em}
+.srow .shr{display:inline-flex;color:var(--muted);opacity:.8}
+.srow .shr svg{width:14px;height:14px}
+.srow.suser .avatar{width:20px;height:20px}
+.meta .who{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:50%;background:var(--bg4);color:var(--text);font-size:9px;font-weight:700}
+.meta .who.me{background:color-mix(in srgb,var(--accent) 30%,var(--bg3));color:var(--accent)}
+.trow.ro .chk{opacity:.45;cursor:default}
+.rohint{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;padding:6px 4px 10px}
+.rotag{display:inline-flex;align-items:center;gap:4px;color:var(--muted);font-size:12px;padding:0 6px}
+.h5note{font-weight:400;text-transform:none;letter-spacing:0;font-size:11px}
+.members{display:flex;flex-direction:column;gap:4px}
+.mrow{display:flex;align-items:center;gap:8px;padding:5px 2px;min-height:34px;flex-wrap:wrap}
+.mrow .n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mrow select{max-width:140px}
+.mrow.madd select:first-child{flex:1;max-width:none;min-width:140px}
+.mrow.off{opacity:.55}
+.mhint{font-size:12px;padding:4px 2px}
+.acct{display:inline-flex;align-items:center;gap:8px;min-width:0}
+.chkl{display:inline-flex;gap:8px;align-items:center;color:var(--text);font-size:14px}
+.chkl input{flex:none}
+.authscreen{background:var(--bg);z-index:90}
+.authscreen .card{width:min(380px,100%);padding:26px 24px}
+.authscreen .alogo{display:flex;align-items:center;gap:10px;margin-bottom:14px;font-size:20px}
+.authscreen .alogo img{width:34px;height:34px}
+.authscreen p{margin:0 0 12px;line-height:1.5}
+.authscreen form{display:flex;flex-direction:column;gap:10px}
+.authscreen form .btn{margin-top:4px;padding:10px 14px}
+.authscreen .aerr{color:var(--danger);font-size:13px;min-height:1em}

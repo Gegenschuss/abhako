@@ -12,6 +12,9 @@ services:
     volumes:
       - ./data:/data
     ports:
-      # Abhako has NO login of its own. Keep it on localhost and put a reverse proxy
-      # with authentication in front, or expose it only inside a private network / VPN.
+      # Built-in login by default (setup page on the first start). Keep it on localhost behind a
+      # reverse proxy with HTTPS for use outside your network.
       - "127.0.0.1:3040:3040"
+      # Single sign-on via a trusted proxy header (see .env.example / README): map the proxy port
+      # only to the address your proxy connects to, e.g. instead of the line above:
+      # - "127.0.0.1:3040:3045"
