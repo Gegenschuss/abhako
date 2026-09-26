@@ -136,15 +136,16 @@ const S = {
   calMode: LS.get('calMode', 'month'), tlStart: null, quickPreset: {}, editContent: false,
   tl: {id: null}, drafts: {}, cfiles: {}, cedit: null, editLink: false,  // comments timeline of the open task
 };
-const FEATS = [['cal', N_('Calendar')], ['timeline', N_('Timeline')], ['matrix', N_('Eisenhower matrix')], ['habits', N_('Habits')], ['pomo', N_('Focus (Pomodoro)')], ['kanban', N_('Kanban')], ['paperless', N_('Paperless link')], ['collab', N_('Collaboration')], ['stats', N_('Statistics')]];
-const FEAT_DESC = {collab: N_('Comments, activity history, @mentions, News, sharing lists and assigning tasks'), stats: N_('Completed tasks, on-time rate, overdue trend, focus time and habit streaks')};
+const FEATS = [['cal', N_('Calendar')], ['timeline', N_('Timeline')], ['matrix', N_('Eisenhower matrix')], ['habits', N_('Habits')], ['pomo', N_('Focus (Pomodoro)')], ['kanban', N_('Kanban')], ['paperless', N_('Paperless link')], ['collab', N_('Collaboration')], ['stats', N_('Statistics')], ['time', N_('Time tracking')]];
+const FEAT_DESC = {collab: N_('Comments, activity history, @mentions, News, sharing lists and assigning tasks'), stats: N_('Completed tasks, on-time rate, overdue trend, focus time and habit streaks'),
+  time: N_('Timer on tasks, manual entries, reports per list and task, CSV export and a printable timesheet')};
 const feat = f => (S.settings.features ?? FEATS.map(x => x[0]).join(',')).split(',').includes(f);
 // collaboration module off: no comments / activity / mentions / sharing / assigning in the UI (data stays, API works)
 const collab = () => feat('collab');
 // module views: tasks always, News with the collaboration module, the rest by their own switch
 const modOn = m => m === 'tasks' || (m === 'news' ? collab() : feat(m));
 // no "+" button on views without tasks
-const noFab = () => ['habits', 'pomo', 'news', 'stats'].includes(S.route.mod) || ['done', 'trash', 'search'].includes(S.route.key);
+const noFab = () => ['habits', 'pomo', 'news', 'stats', 'time'].includes(S.route.mod) || ['done', 'trash', 'search'].includes(S.route.key);
 const inbox = () => S.lists.find(l => l.is_inbox);
 const listById = id => S.lists.find(l => l.id === id);
 // sharing: role of the logged-in user in a list (owner | edit | view); view = read only
@@ -186,7 +187,7 @@ async function rawFetch(method, url, body) {
   if (!r.ok) { const e = new Error(j.error || tr('Error {0}', r.status)); e.status = r.status; throw e; }
   return j;
 }
-const queueable = (method, url) => method !== 'GET' && /^\/api\/(tasks|habits\/\d+\/log)/.test(url) && !/\/(comments|seen|timeline)$/.test(url);
+const queueable = (method, url) => method !== 'GET' && /^\/api\/(tasks|habits\/\d+\/log|time\/(start|stop|entries))/.test(url) && !/\/(comments|seen|timeline)$/.test(url);
 async function api(method, url, body) {
   if (queueable(method, url) && !(body instanceof FormData) && OUT.q.length) return enqueue(method, url, body);
   try { return await rawFetch(method, url, body); }
@@ -218,6 +219,7 @@ function applyLocal(e) {
   const {method, url, body = {}} = e;
   const m = url.match(/^\/api\/tasks\/(-?\d+)(?:\/(\w+))?/);
   const nowIso = new Date().toISOString();
+  if (url.startsWith('/api/time/')) return timeLocal(e);
   if (method === 'POST' && url === '/api/tasks') {
     const par = body.parent_id && S.tasks.get(body.parent_id);
     const t = {id: e.tmp, list_id: body.list_id || (par ? par.list_id : inbox().id), section_id: body.section_id ?? null, parent_id: body.parent_id ?? null,
@@ -261,6 +263,7 @@ async function flush() {
       const url = e.url.replace(/\/(-\d+)(?=\/|$)/, (_, n) => '/' + (idmap[n] || n));
       let body = e.body;
       if (body && body.parent_id) body = {...body, parent_id: fix(body.parent_id)};
+      if (body && body.task_id) body = {...body, task_id: fix(body.task_id)};
       if (body && body.items) body = {...body, items: body.items.map(it => ({...it, id: fix(it.id)}))};
       if (body && body.ids) body = {...body, ids: body.ids.map(fix)};
       try {
@@ -353,6 +356,7 @@ function applyState(j) {
   S.ntfyInbox = j.ntfy_inbox || {enabled: false};
   S.news = j.news || {unread: 0, sig: ''};
   S.templates = j.templates || [];
+  S.timer = j.timer || null; S.timeTotals = j.time_totals || {};
   // language changed on another device: switch once its file is loaded (the boot awaits it itself)
   if (S.booted && (j.settings.lang || 'en') !== I18N.code) i18nLoad(j.settings.lang).then(ok => { if (ok) render(); });
 }
@@ -376,12 +380,13 @@ async function load() {
   LS.set('cache', j);
   if (S.extra) await loadExtra().catch(() => {});
   if (S.sel && collab() && S.tl.id === S.sel && S.tl.v !== S.v) loadTimeline(S.sel);
+  if (S.sel && timeOn() && S.te.tid === S.sel && S.te.v !== S.v) loadTaskTime(S.sel);
 }
 async function loadExtra() {
   const k = S.route.key;
   if (S.route.mod === 'tasks' && (k === 'done' || k === 'trash')) {
     S.extra = (await api('GET', `/api/tasks?scope=${k}`)).tasks;
-  } else if (S.route.mod !== 'news') S.extra = null;  // News: tasks fetched on demand stay
+  } else if (S.route.mod !== 'news' && S.route.mod !== 'time') S.extra = null;  // News / time reports: tasks fetched on demand stay
 }
 function putTask(t) { S.tasks.set(t.id, t); }
 
@@ -421,7 +426,7 @@ function parseHash() {
   if (a === 'f' && b) return {mod: 'tasks', key: 'f:' + b};
   if (a === 'l') return {mod: 'tasks', key: 'l:' + b};
   if (a === 'tag') return {mod: 'tasks', key: 'tag:' + b};
-  if (['cal', 'matrix', 'habits', 'pomo', 'news', 'stats'].includes(a)) return {mod: a, key: a};
+  if (['cal', 'matrix', 'habits', 'pomo', 'news', 'stats', 'time'].includes(a)) return {mod: a, key: a};
   if (SMART[a]) return {mod: 'tasks', key: a};
   return {mod: 'tasks', key: 'today'};
 }
@@ -430,7 +435,7 @@ async function route() {
   const r = parseHash();
   if (!modOn(r.mod)) {  // e.g. the "News" app shortcut while collaboration is off
     const off = r.mod;
-    if (S.booted && (off === 'news' || off === 'stats')) setTimeout(() => toast(off === 'news' ? tr('News are part of the collaboration module, which is off (Settings > Layout)') : tr('Statistics are off (Settings > Layout)')), 50);
+    if (S.booted && (off === 'news' || off === 'stats' || off === 'time')) setTimeout(() => toast(off === 'news' ? tr('News are part of the collaboration module, which is off (Settings > Layout)') : off === 'time' ? tr('Time tracking is off (Settings > Layout)') : tr('Statistics are off (Settings > Layout)')), 50);
     r.mod = 'tasks'; r.key = LS.get('lastKey', 'today');
   }
   if (r.key.startsWith('f:') && !S.filters.some(f => f.id === +r.key.slice(2))) r.key = 'today';
@@ -438,7 +443,7 @@ async function route() {
   if (S.route.mod !== 'tasks' || r.key !== S.lastRouteKey) { S.multi.clear(); S.multiMode = false; }
   S.lastRouteKey = r.key;
   if (r.mod === 'tasks' && r.key !== 'search') LS.set('lastKey', r.key);
-  S.extra = (r.key === 'done' || r.key === 'trash' || r.mod === 'news') ? [] : null;
+  S.extra = (r.key === 'done' || r.key === 'trash' || r.mod === 'news' || r.mod === 'time') ? [] : null;
   if (S.extra) await loadExtra().catch(() => { S.extra = []; });
   closeSide();
   if (r.task) { render(); openDetail(r.task); history.replaceState(null, '', '#' + keyToHash(S.route.key)); return; }
@@ -769,6 +774,7 @@ function tabItem(id) {
   if (kind === 'tag' && v) return {id, go: 'tag/' + encodeURIComponent(v), icon: ic('tag', 'l'), label: v, key: 'tag:' + v};
   if (id === 'news') return collab() ? {id, go: 'news', icon: ic('bell', 'l'), label: tr('News'), mod: 'news'} : null;
   if (id === 'stats') return feat('stats') ? {id, go: 'stats', icon: ic('chart', 'l'), label: tr('Statistics'), mod: 'stats'} : null;
+  if (id === 'time') return timeOn() ? {id, go: 'time', icon: ic('clock', 'l'), label: tr('Time|tracked'), mod: 'time'} : null;
   if (id === 'search') return {id, go: 'search', icon: ic('search', 'l'), label: tr('Search'), key: 'search'};
   if (id === 'settings') return {id, act: 'settings', icon: ic('gear', 'l'), label: tr('Settings')};
   return null;
@@ -784,7 +790,7 @@ function tabOn(items) {
 function tabBtn(t, on, cls = '') {
   const tgt = t.go != null ? `data-go="${esc(t.go)}"` : `data-act="${t.act}"`;
   const nb = t.id === 'news' && S.news?.unread ? `<span class="nbadge">${S.news.unread > 99 ? '99+' : S.news.unread}</span>` : '';
-  return `<button class="${cls} ${on ? 'on' : ''}" ${tgt} title="${esc(t.label)}">${t.icon}<span>${esc(t.label)}</span>${t.mod === 'pomo' && S.pomo ? '<span class="dot"></span>' : ''}${nb}</button>`;
+  return `<button class="${cls} ${on ? 'on' : ''}" ${tgt} title="${esc(t.label)}">${t.icon}<span>${esc(t.label)}</span>${t.mod === 'pomo' && S.pomo ? '<span class="dot"></span>' : ''}${t.mod === 'time' && S.timer ? '<span class="dot rec"></span>' : ''}${nb}</button>`;
 }
 function renderRail() {
   const items = tabItems().filter(t => t.id !== 'search' && t.id !== 'settings'), on = tabOn(items);
@@ -793,6 +799,7 @@ function renderRail() {
     [...items, ...extra].map(t => tabBtn(t, t.id === on && S.route.key !== 'search', 'rbtn')).join('') +
     `<button class="rbtn ${S.route.key === 'search' ? 'on' : ''}" data-go="search" title="${tr('Search (/)')}">${ic('search')}</button>
      ${feat('stats') && !items.some(t => t.id === 'stats') ? `<button class="rbtn ${S.route.mod === 'stats' ? 'on' : ''}" data-go="stats" title="${tr('Statistics')}">${ic('chart')}</button>` : ''}
+     ${timeOn() && !items.some(t => t.id === 'time') ? `<button class="rbtn ${S.route.mod === 'time' ? 'on' : ''}" data-go="time" title="${tr('Time tracking')}">${ic('clock')}${S.timer ? '<span class="dot rec"></span>' : ''}</button>` : ''}
      <div class="spacer"></div>
      <button class="rbtn" data-act="settings" title="${tr('Settings')}">${ic('gear')}</button>`;
 }
@@ -801,7 +808,7 @@ function tabOverflow() {
   const items = tabItems(), shown = items.length > TAB_MAX ? items.slice(0, TAB_MAX - 1) : items;
   const rest = items.slice(shown.length);
   const mods2 = mods().filter(([m]) => !items.some(t => t.mod === m)).map(([m]) => tabItem('m:' + m));
-  const misc = ['news', 'stats', 'search', 'settings'].filter(k => !items.some(t => t.id === k)).map(tabItem).filter(Boolean);
+  const misc = ['news', 'stats', 'time', 'search', 'settings'].filter(k => !items.some(t => t.id === k)).map(tabItem).filter(Boolean);
   // search + settings are also in the side menu: they alone do not justify a "Mehr" tab
   return {shown, more: rest.length || mods2.length ? [...rest, ...mods2, ...misc] : []};
 }
@@ -814,7 +821,7 @@ function renderTabs() {
 }
 function tabsMore(anchor) {
   const {more} = tabOverflow();
-  menu(anchor, [...more.map(t => ({label: t.id === 'news' && S.news?.unread ? `${t.label} (${S.news.unread})` : t.label, icon: t.id === 'settings' ? 'gear' : t.id === 'search' ? 'search' : t.id === 'news' ? 'bell' : t.id === 'stats' ? 'chart' : t.mod ? MODS.find(x => x[0] === t.mod)[1] : t.id.startsWith('f:') ? 'filter' : t.id.startsWith('tag:') ? 'tag' : t.id.startsWith('s:') ? SMART[t.key].icon : 'list',
+  menu(anchor, [...more.map(t => ({label: t.id === 'news' && S.news?.unread ? `${t.label} (${S.news.unread})` : t.label, icon: t.id === 'settings' ? 'gear' : t.id === 'search' ? 'search' : t.id === 'news' ? 'bell' : t.id === 'stats' ? 'chart' : t.id === 'time' ? 'clock' : t.mod ? MODS.find(x => x[0] === t.mod)[1] : t.id.startsWith('f:') ? 'filter' : t.id.startsWith('tag:') ? 'tag' : t.id.startsWith('s:') ? SMART[t.key].icon : 'list',
     fn: () => t.act ? settingsModal() : go(t.go)})), '-', {label: tr('Customize tab bar'), icon: 'edit', fn: () => settingsModal('tabbar')}]);
 }
 function counts() {
@@ -872,6 +879,7 @@ function renderSide() {
       ${row('trash', ic('trash'), tr('Trash'), S.counts.trash || '')}
       ${archived.length ? `<div class="folder">${ic('eye', 's')}${tr('Archived')}</div>` + archived.map(l => row('l:' + l.id, `<span class="sw"></span>`, listName(l.name), '', `data-list="${l.id}"`)).join('') : ''}
       ${feat('stats') ? `<button class="srow ${S.route.mod === 'stats' ? 'on' : ''}" data-go="stats">${ic('chart')}<span class="n">${tr('Statistics')}</span></button>` : ''}
+      ${timeOn() ? `<button class="srow ${S.route.mod === 'time' ? 'on' : ''}" data-go="time">${ic('clock')}<span class="n">${tr('Time tracking')}</span>${S.timer ? '<span class="c"><span class="recdot"></span></span>' : ''}</button>` : ''}
       <button class="srow" data-go="search">${ic('search')}<span class="n">${tr('Search')}</span></button>
       <button class="srow" data-act="settings">${ic('gear')}<span class="n">${tr('Settings')}</span></button>
       ${S.me ? `<button class="srow suser" data-act="user-menu" title="${esc(S.me.username)}"><span class="avatar">${esc(initials(S.me.display_name))}</span><span class="n">${esc(S.me.display_name)}</span></button>` : ''}
@@ -879,7 +887,7 @@ function renderSide() {
 }
 function renderTop() {
   const m = S.route.mod, k = S.route.key;
-  let title = m === 'tasks' ? titleFor(k) : tr({cal: N_('Calendar'), matrix: N_('Eisenhower matrix'), habits: N_('Habits'), pomo: N_('Focus'), news: N_('News'), stats: N_('Statistics')}[m]);
+  let title = m === 'tasks' ? titleFor(k) : tr({cal: N_('Calendar'), matrix: N_('Eisenhower matrix'), habits: N_('Habits'), pomo: N_('Focus'), news: N_('News'), stats: N_('Statistics'), time: N_('Time tracking')}[m]);
   let acts = '';
   if (m === 'tasks' && (k.startsWith('l:') || k === 'inbox')) {
     const l = k === 'inbox' ? inbox() : listById(+k.slice(2));
@@ -896,7 +904,7 @@ function renderTop() {
   const pm = S.pomo && m !== 'pomo' ? `<button class="pomo-mini" data-go="pomo">${ic(S.pomo.paused_at ? 'pause' : 'timer', 's')}<span data-pomo-mini>${pomoDisplay()}</span></button>` : '';
   const off = !OUT.online || OUT.q.length ? `<span class="offline" title="${tr('Changes are sent as soon as the server is reachable')}">${OUT.online ? 'sync' : 'offline'}${OUT.q.length ? ' · ' + OUT.q.length : ''}</span>` : '';
   const cf = S.conflicts?.length ? `<button class="cfpill" data-act="conflicts" title="${tr('Review conflicts')}">${ic('alert', 's')}${S.conflicts.length}</button>` : '';
-  $('#top').innerHTML = `<button class="iconbtn menu" data-act="side" aria-label="${tr('Menu')}">${ic('menu')}</button><h1>${esc(title)}</h1>${cf}${off}${pm}${acts}${bellBtn()}`;
+  $('#top').innerHTML = `<button class="iconbtn menu" data-act="side" aria-label="${tr('Menu')}">${ic('menu')}</button><h1>${esc(title)}</h1>${cf}${off}${timerPill()}${pm}${acts}${bellBtn()}`;
 }
 function routeList() {
   const k = S.route.key;
@@ -916,6 +924,7 @@ function renderView() {
   else if (m === 'pomo') { el.innerHTML = viewPomo(); loadPomoStats(); }
   else if (m === 'news') el.innerHTML = viewNews();
   else if (m === 'stats') el.innerHTML = viewStats();
+  else if (m === 'time') el.innerHTML = viewTime();
   else if (S.route.key === 'search') el.innerHTML = viewSearch();
   else if (S.route.key === 'done' || S.route.key === 'trash') el.innerHTML = viewHistory();
   else if (isKanban()) el.innerHTML = viewKanban();
@@ -943,6 +952,10 @@ function taskRow(t, opts = {}) {
   if (t.attachments?.length) meta.push(`<span>${ic('clip', 's')}${t.attachments.length}</span>`);
   if (t.paperless?.length && plOn()) meta.push(`<span>${ic('archive', 's')}${t.paperless.length}</span>`);
   if (t.url) meta.push(`<a class="lnk" href="${esc(t.url)}" target="_blank" rel="noopener noreferrer" title="${esc(t.url)}">${ic('link', 's')}${esc(urlHost(t.url))}</a>`);
+  if (timeOn() && t.id > 0) {
+    const [ta, tm] = taskTime(t.id), live = S.timer && S.timer.task_id === t.id;
+    if (ta >= 60 || live) meta.push(`<span class="tchip ${live ? 'live' : ''}" data-tt="${t.id}" title="${esc(live ? tr('Timer running') : ta - tm >= 60 ? tr('{0} in total, {1} by you', fmtDur(ta), fmtDur(tm)) : tr('Tracked: {0}', fmtDur(ta)))}">${ic('clock', 's')}<b>${fmtDur(ta)}</b></span>`);
+  }
   if (t.comment_count && collab()) meta.push(`<span class="cmc ${t.unread ? 'unread' : ''}" title="${esc(t.unread ? trn('{0} new comment', '{0} new comments', t.unread) : trn('{0} comment', '{0} comments', t.comment_count))}">${ic('comment', 's')}${t.comment_count}</span>`);
   if (t.assignee_id && collab()) { const who = personName(t.list_id, t.assignee_id); meta.push(`<span class="who ${S.me && t.assignee_id === S.me.id ? 'me' : ''}" title="${esc(tr('Assigned to {0}', who || '?'))}">${esc(initials(who))}</span>`); }
   for (const g of t.tags) meta.push(`<span class="tag">#${esc(g)}</span>`);
@@ -1479,6 +1492,7 @@ async function pomoStart(taskId) {
   const tid = taskId || (kind === 'focus' || kind === 'stopwatch' ? ($('#pomo-task')?.value || '') : '');
   if (kind === 'focus' || kind === 'stopwatch') { pomoTask = tid; LS.set('pomoTask', tid); }
   S.pomo = await api('POST', '/api/pomo/start', {kind: kind === 'focus' || kind === 'stopwatch' ? kind : 'break', minutes: kind === 'stopwatch' ? 0 : pomoMinutes(kind), task_id: tid ? +tid : null});
+  if (tid && timeOn() && S.timer && (kind === 'focus' || kind === 'stopwatch')) setTimeout(() => toast(tr('A timer is running: this session is not tracked a second time')), 60);
   if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
   render();
 }
@@ -1498,6 +1512,7 @@ function openDetail(id) {
   if (isMobile()) history.pushState({detail: id}, '', location.hash);
   if (collab() && id > 0 && S.tl.id !== id) S.tl = {id};
   loadTimeline(id);
+  loadTaskTime(id);
 }
 function closeDetail(fromPop) {
   flushSaves();
@@ -1550,10 +1565,12 @@ function renderDetail() {
         <label>${tr('Link')}</label>${linkField(t, ro)}
         ${collab() && (shared || t.assignee_id) ? `<label>${tr('Assignee')}</label><select id="d-assignee" ${ro ? 'disabled' : ''}><option value="">${tr('Nobody')}</option>${listPeople(l).map(p => `<option value="${p.user_id}" ${p.user_id === t.assignee_id ? 'selected' : ''}>${esc(p.name)}${S.me && p.user_id === S.me.id ? ' ' + tr('(me)') : ''}</option>`).join('')}</select>` : ''}
       </div>
+      ${timeOn() && t.id > 0 ? `<div class="dsec tesec" id="d-time">${taskTimeHtml(t)}</div>` : ''}
       ${collab() && t.id > 0 ? `<div class="dsec cmsec" id="d-tl">${timelineHtml(t)}</div>` : ''}
     </div>
     <div class="dfoot">${t.status === 2 && t.completed_at ? tr('Completed {0}', new Date(t.completed_at).toLocaleString(LOCALE(), {dateStyle: 'medium', timeStyle: 'short'})) : tr('Created {0}', new Date(t.created_at).toLocaleString(LOCALE(), {dateStyle: 'medium', timeStyle: 'short'}))}
       <span class="spacer"></span>
+      ${timeOn() && t.id > 0 ? `<button class="iconbtn ${S.timer && S.timer.task_id === t.id ? 'recon' : ''}" data-act="timer-toggle" data-id="${t.id}" title="${S.timer && S.timer.task_id === t.id ? tr('Stop timer') : tr('Start timer')}">${ic(S.timer && S.timer.task_id === t.id ? 'stop' : 'clock', 's')}</button>` : ''}
       ${t.status === 0 ? `<button class="iconbtn" data-act="pomo-task" data-id="${t.id}" title="${tr('Start focus')}">${ic('timer', 's')}</button>` : ''}
       ${ro ? '' : `<button class="iconbtn danger" data-act="delete" data-id="${t.id}" title="${tr('Delete')}">${ic('trash', 's')}</button>`}</div>`;
   autosize($('#d-title')); autosize($('#d-content')); autosize($('#c-input'));
@@ -2211,6 +2228,8 @@ function taskMenu(anchor, id) {
     ...(i > 0 && depthOf(sib[i - 1]) < 2 ? [{label: tr('Indent (under “{0}”)', sib[i - 1].title.slice(0, 24)), icon: 'indent', fn: () => patchTask(id, {parent_id: sib[i - 1].id})}] : []),
     ...(t.parent_id ? [{label: tr('Outdent'), icon: 'outdent', fn: () => patchTask(id, {parent_id: S.tasks.get(t.parent_id)?.parent_id || null})}] : []),
     ...(feat('pomo') ? [{label: tr('Start focus'), icon: 'timer', fn: () => { pomoStart(id); go('pomo'); }}] : []),
+    ...(timeOn() ? [S.timer && S.timer.task_id === id ? {label: tr('Stop timer'), icon: 'stop', fn: timerStop} : {label: tr('Start timer'), icon: 'clock', fn: () => timerStart({task_id: id})},
+      {label: tr('Add time…'), icon: 'plus', fn: () => entryModal(null, {task_id: id})}] : []),
     {label: t.status === -1 ? tr('Reopen') : tr("Won't do (discard)"), icon: 'ban', fn: () => t.status === -1 ? toggleTask(id) : wontDo(id)},
     {label: tr('Save as template'), icon: 'copy', fn: () => saveTemplate({task_id: id}, t.title)},
     {label: tr('Duplicate'), icon: 'sub', fn: () => createTask({title: t.title, content: t.content, list_id: t.list_id, section_id: t.section_id, priority: t.priority, due: t.due, due_time: t.due_time, reminders: t.reminders, repeat: t.repeat, repeat_from: t.repeat_from, tags: t.tags, parent_id: t.parent_id, url: t.url || null})},
@@ -2269,6 +2288,7 @@ function listModal(id, folder = '') {
     <div class="emogrid hidden" id="l-emogrid"><button data-emo="" class="none" title="${tr('No icon')}">${ic('ban', 's')}</button>${EMOJIS.map(e => `<button data-emo="${e}" class="${e === emo ? 'on' : ''}">${e}</button>`).join('')}<input id="l-emocustom" placeholder="${tr('custom')}" maxlength="8"></div>
     <div class="row"><label>${tr('Folder')}</label><input id="l-folder" value="${esc(l.folder)}" list="l-folders" placeholder="${tr('optional')}"><datalist id="l-folders">${folderNames().map(f => `<option value="${esc(f)}">`).join('')}</datalist></div>
     <div class="row"><label>${tr('View')}</label><select id="l-view"><option value="list">${tr('List')}</option>${feat('kanban') ? `<option value="kanban" ${l.view === 'kanban' ? 'selected' : ''}>${tr('Kanban')}</option>` : ''}${feat('timeline') ? `<option value="timeline" ${l.view === 'timeline' ? 'selected' : ''}>${tr('Timeline')}</option>` : ''}</select></div>
+    ${timeOn() && (own || l.rate) ? `<div class="row"><label>${tr('Hourly rate')}</label><input id="l-rate" inputmode="decimal" value="${l.rate != null ? esc(String(l.rate).replace('.', LOCALE().startsWith('de') ? ',' : '.')) : ''}" placeholder="${tr('optional')}" style="max-width:110px" ${dis}><span class="muted">${esc(S.settings.time_currency || '')} · ${tr('time reports')}</span></div>` : ''}
     <div class="row"><label>${tr('Color')}</label><div class="colors" id="l-col">${LCOLORS.map(c => `<button style="background:${c || 'var(--bg4)'}" class="${(l.color || '') === c ? 'on' : ''}" data-c="${c}" ${dis}></button>`).join('')}</div></div>
     ${id && !l.is_inbox && collab() ? `<h4>${tr('Sharing')}</h4><div class="members" id="l-members"></div>` : ''}
     <div class="foot">${id && !l.is_inbox && own ? `<button class="btn danger" data-m="del">${tr('Delete')}</button><button class="btn" data-m="arch">${l.archived ? tr('Reactivate') : tr('Archive')}</button>` : ''}${id && !own ? `<button class="btn danger" data-m="leave">${ic('logout', 's')} ${tr('Leave list')}</button>` : ''}${id ? `<button class="btn" data-m="tpl" title="${tr('Save the sections and open tasks as a template')}">${ic('copy', 's')} ${tr('Save as template')}</button>` : ''}<span class="spacer"></span><button class="btn" data-m="close">${tr('Cancel')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
@@ -2326,11 +2346,11 @@ function listModal(id, folder = '') {
     if (a === 'save') {
       const nm = $('#l-name', md).value.trim().replace(EMO_RE, '');
       if (!nm) return $('#l-name', md).focus();
-      const body = own ? {name: l.is_inbox && !emo && nm === tr('Inbox') ? 'Eingang' : emo + nm, folder: $('#l-folder', md).value.trim(), view: $('#l-view', md).value, color: $('#l-col button.on', md)?.dataset.c || ''}
+      const body = own ? {name: l.is_inbox && !emo && nm === tr('Inbox') ? 'Eingang' : emo + nm, folder: $('#l-folder', md).value.trim(), view: $('#l-view', md).value, color: $('#l-col button.on', md)?.dataset.c || '', ...($('#l-rate', md) ? {rate: $('#l-rate', md).value.trim()} : {})}
         : {folder: $('#l-folder', md).value.trim(), view: $('#l-view', md).value};  // members: only their own placement / view
       if (body.folder && !folderNames().includes(body.folder)) await api('PATCH', '/api/settings', {folders: JSON.stringify([...folderNames(), body.folder])});
-      if (id) await api('PATCH', '/api/lists/' + id, body);
-      else { const n = await api('POST', '/api/lists', body); md.remove(); await load(); go('l/' + n.id); return; }
+      if (id) { try { await api('PATCH', '/api/lists/' + id, body); } catch { return; } }
+      else { const {rate, ...b0} = body; const n = await api('POST', '/api/lists', b0); if (rate) await api('PATCH', '/api/lists/' + n.id, {rate}).catch(() => {}); md.remove(); await load(); go('l/' + n.id); return; }
       md.remove(); await load(); render();
     }
     if (a === 'arch') { await api('PATCH', '/api/lists/' + id, {archived: l.archived ? 0 : 1}); md.remove(); await load(); render(); }
@@ -2354,9 +2374,9 @@ function listModal(id, folder = '') {
 // language, color scheme, tab bar and the account / user actions apply immediately, as before.
 // The last opened section is remembered per device (LS settingsSec).
 const SET_SECS = [['account', 'user', N_('Account')], ['general', 'sliders', N_('General')], ['notify', 'bell', N_('Notifications')],
-  ['layout', 'grid', N_('Layout')], ['focus', 'timer', N_('Focus')], ['integr', 'link', N_('Integrations')], ['data', 'download', N_('Data')],
+  ['layout', 'grid', N_('Layout')], ['focus', 'timer', N_('Focus')], ['time', 'clock', N_('Time tracking')], ['integr', 'link', N_('Integrations')], ['data', 'download', N_('Data')],
   ['users', 'users', N_('Users')], ['help', 'help', N_('Help')]];
-const SET_SAVE = '#s-allday,#s-defrem,#s-digest,#s-pf,#s-ps,#s-pl,#s-pe,#s-showdone,#s-plkeep,#s-icalscope,#s-icalalarm,[data-feat]';
+const SET_SAVE = '#s-allday,#s-defrem,#s-digest,#s-pf,#s-ps,#s-pl,#s-pe,#s-showdone,#s-plkeep,#s-icalscope,#s-icalalarm,#s-trnd,#s-ttarget,#s-tcur,#s-tfocus,#s-trem,#s-tstop,[data-feat]';
 function settingsModal(focus) {
   const s = S.settings;
   const topicUrl = `${S.ntfyUrl}/${s.ntfy_topic}`;
@@ -2390,6 +2410,15 @@ function settingsModal(focus) {
     focus: `<h4>${tr('Focus (minutes)')}</h4>
       <div class="row"><label>${tr('Focus / short / long')}</label><input type="number" id="s-pf" value="${esc(s.pomo_focus)}" min="1" style="max-width:80px"><input type="number" id="s-ps" value="${esc(s.pomo_short)}" min="1" style="max-width:80px"><input type="number" id="s-pl" value="${esc(s.pomo_long)}" min="1" style="max-width:80px"></div>
       <div class="row"><label>${tr('Long break after')}</label><input type="number" id="s-pe" value="${esc(s.pomo_long_every)}" min="1" style="max-width:80px"><span class="muted">${tr('pomos')}</span></div>`,
+    time: timeOn() ? `<h4>${tr('Reports')}</h4>
+      <div class="row"><label>${tr('Rounding')}</label><select id="s-trnd">${[0, 5, 6, 10, 15, 30].map(v => `<option value="${v}" ${String(v) === String(s.time_rounding || '0') ? 'selected' : ''}>${v ? tr('up to {0} min per entry', v) : tr('none')}</option>`).join('')}</select></div>
+      ${hint(tr('Rounding applies to the report, the CSV export and the timesheet; the tracked times stay exact. Hourly rate: in the list dialog (owner).'))}
+      <div class="row"><label>${tr('Currency')}</label><input id="s-tcur" value="${esc(s.time_currency ?? '€')}" maxlength="8" style="max-width:80px"></div>
+      <div class="row"><label>${tr('Daily target')}</label><input type="number" id="s-ttarget" value="${esc(s.time_target || '0')}" min="0" max="24" step="0.25" style="max-width:80px"><span class="muted">${tr('hours, 0 = none')}</span></div>
+      <h4>${tr('Timer')}</h4>
+      <div class="row"><label>${tr('Reminder after')}</label><input type="number" id="s-trem" value="${esc(s.time_remind_h ?? '4')}" min="0" max="48" step="0.5" style="max-width:80px"><span class="muted">${tr('hours, push “still running?”, 0 = off')}</span></div>
+      <div class="row"><label>${tr('Stop automatically after')}</label><input type="number" id="s-tstop" value="${esc(s.time_autostop_h ?? '12')}" min="0" max="72" step="0.5" style="max-width:80px"><span class="muted">${tr('hours, end = start + value, 0 = off')}</span></div>
+      <div class="row"><label>${tr('Focus sessions')}</label>${chk('s-tfocus', s.time_focus !== '0', tr('count as time entries (not while a timer runs)'))}</div>` : '',
     integr: `<h4 id="s-ical-h">${tr('Calendar subscription')}</h4>
       ${hint(tr('Your open tasks with a date as a calendar for Google Calendar, Apple Calendar, Outlook or Thunderbird: read-only, the calendar app refreshes it by itself (usually every few hours, some apps every 15 minutes). Timed tasks appear with their duration, all-day tasks as all-day events, recurring tasks with all future dates.'))}
       <div id="s-ical"><div class="muted mhint">${tr('Loading…')}</div></div>
@@ -2423,6 +2452,7 @@ function settingsModal(focus) {
       <div class="shelp">${tr('After completing, reopening, deleting, moving to another list, snoozing / changing the date or a batch action, a message with “Undo” shows for a few seconds (Ctrl+Z / ⌘Z on a computer). Offline, the change is simply not sent.')}</div>
       <h4>${tr('Templates')}</h4>
       <div class="shelp">${tr('Task menu (…) or list dialog > Save as template. The template button in the add bar creates the task in the current list, Lists > + > New list from template a whole list. Manage them under Settings > Data.')}</div>
+      ${timeOn() ? `<h4>${tr('Time tracking')}</h4><div class="shelp">${tr('Start a timer from a task (detail panel, task menu …) or add time by hand; the running timer shows in the top bar on every device. Sidebar > Time tracking: hours per list and task for a week, month or any range, CSV export and a printable timesheet. In shared lists everyone sees the time of all members, but only changes their own entries. Finished focus sessions on a task count as time unless a timer ran at the same time.')}</div>` : ''}
       ${feat('stats') ? `<h4>${tr('Statistics')}</h4><div class="shelp">${tr('Sidebar > Statistics (or pin it as a tab): completions per week / day and per list, on-time rate, overdue trend, focus time and habit streaks of the last 12 weeks.')}</div>` : ''}
       <h4>${tr('Gestures (phone)')}</h4>
       <div class="shelp">${tr('Swipe right: complete · swipe left: snooze / delete · long-press and drag: reorder, move to another column, quadrant or onto a day; drag to the left edge and hold briefly to open the lists (dropping a subtask there = standalone task in that list).')}</div>`,
@@ -2463,7 +2493,7 @@ function settingsModal(focus) {
       grp(N_('Lists'), S.lists.filter(l => !l.is_inbox && !l.archived).map(l => opt('l:' + l.id, listName(l.name))).join('')) +
       grp(N_('Filters'), S.filters.map(f => opt('f:' + f.id, f.name)).join('')) +
       grp(N_('Tags'), Object.keys(counts().tags).sort((a, b) => a.localeCompare(b, 'de')).map(t => opt('tag:' + t, '#' + t)).join('')) +
-      grp(N_('Other'), (collab() ? opt('news', tr('News')) : '') + (feat('stats') ? opt('stats', tr('Statistics')) : '') + opt('search', tr('Search')) + opt('settings', tr('Settings')));
+      grp(N_('Other'), (collab() ? opt('news', tr('News')) : '') + (feat('stats') ? opt('stats', tr('Statistics')) : '') + (timeOn() ? opt('time', tr('Time tracking')) : '') + opt('search', tr('Search')) + opt('settings', tr('Settings')));
   };
   const tabSet = ids => { LS.set('tabbar', ids); tabDraw(); renderTabs(); renderRail(); };
   tabDraw();
@@ -2512,7 +2542,9 @@ function settingsModal(focus) {
     if (a === 'test') { const j = await api('POST', '/api/ntfy/test'); toast(j.ok ? tr('Test sent') : tr('ntfy not reachable')); }
     if (a === 'save') {
       await api('PATCH', '/api/settings', {...($('#s-plkeep', md) ? {paperless_keep: $('#s-plkeep', md).checked ? '1' : '0'} : {}), nav_order: $$('#s-nav .navrow', md).map(r => r.dataset.mod).join(','), features: $$('[data-feat]', md).filter(x => x.checked).map(x => x.dataset.feat).join(','), show_completed: $('#s-showdone', md).checked ? '1' : '0', ical_scope: $('#s-icalscope', md).value, ical_alarms: $('#s-icalalarm', md).checked ? '1' : '0', allday_time: $('#s-allday', md).value || '09:00', default_reminder: $('#s-defrem', md).value, digest_time: $('#s-digest', md).value,
-        pomo_focus: $('#s-pf', md).value, pomo_short: $('#s-ps', md).value, pomo_long: $('#s-pl', md).value, pomo_long_every: $('#s-pe', md).value});
+        pomo_focus: $('#s-pf', md).value, pomo_short: $('#s-ps', md).value, pomo_long: $('#s-pl', md).value, pomo_long_every: $('#s-pe', md).value,
+        ...($('#s-trnd', md) ? {time_rounding: $('#s-trnd', md).value, time_currency: $('#s-tcur', md).value.trim(), time_target: String(Math.max(0, +$('#s-ttarget', md).value || 0)),
+          time_remind_h: String(Math.max(0, +$('#s-trem', md).value || 0)), time_autostop_h: String(Math.max(0, +$('#s-tstop', md).value || 0)), time_focus: $('#s-tfocus', md).checked ? '1' : '0'} : {})});
       md.remove(); await load(); await route(); toast(tr('Saved'));
     }
   });
@@ -2880,6 +2912,7 @@ function viewStats() {
     [j.ontime.rate == null ? '–' : j.ontime.rate + '%', tr('on time'), j.ontime.with_due ? tr('{0} of {1} with a date', j.ontime.ontime, j.ontime.with_due) : tr('no completed tasks with a date')],
     [j.streak.current, trn('day in a row', 'days in a row', j.streak.current), tr('best: {0}', j.streak.best)],
     ...(feat('pomo') ? [[fmtH(j.focus.this_week), tr('focus this week'), tr('12 weeks: {0}', fmtH(j.focus.total))]] : []),
+    ...(timeOn() && j.time ? [[fmtH(j.time.this_week), tr('tracked this week'), tr('12 weeks: {0}', fmtH(j.time.total))]] : []),
   ];
   const mode = st.mode;
   let h = `<div class="stats"><div class="sttiles">${tiles.map(([v, l, s]) => `<div><b>${esc(String(v))}</b><span>${esc(l)}</span><small>${esc(s)}</small></div>`).join('')}</div>
@@ -2894,6 +2927,9 @@ function viewStats() {
   if (feat('pomo')) h += `<section class="stcard"><div class="sthead"><h3>${tr('Focus time')}</h3><span class="muted">${tr('12 weeks: {0}', fmtH(j.focus.total))}</span></div>
       ${barChart(j.focus.per_week, wl, {fmt: v => fmtH(Math.round(v)), tip: i => tipW(i, fmtH(j.focus.per_week[i])), label: tr('Focus minutes per week')})}
       <h4>${tr('By list')}</h4>${hbarChart(j.focus.by_list.map(x => ({name: listLabel(x), v: x.minutes})), {fmt: fmtH, label: tr('Focus by list')})}</section>`;
+  if (timeOn() && j.time) h += `<section class="stcard"><div class="sthead"><h3>${tr('Tracked time')}</h3><span class="muted">${tr('12 weeks: {0}', fmtH(j.time.total))}</span><span class="spacer"></span><button class="btn sm" data-go="time">${ic('clock', 's')} ${tr('Reports')}</button></div>
+      ${barChart(j.time.per_week, wl, {fmt: v => fmtH(Math.round(v)), tip: i => tipW(i, fmtH(j.time.per_week[i])), label: tr('Tracked minutes per week')})}
+      <h4>${tr('By list')}</h4>${hbarChart(j.time.by_list.map(x => ({name: listLabel(x), v: x.minutes})), {fmt: fmtH, label: tr('Tracked time by list')})}</section>`;
   const hs = feat('habits') ? S.habits.filter(x => !x.archived) : [];
   if (hs.length) h += `<section class="stcard"><div class="sthead"><h3>${tr('Habits')}</h3></div><div class="sthabits">
       <div class="shh muted"><span></span><span>${tr('rate')}</span><span>${tr('streak')}</span><span>${tr('best')}</span></div>
@@ -2904,6 +2940,322 @@ function viewStats() {
 }
 let statsResize;
 window.addEventListener('resize', () => { if (S.route.mod !== 'stats') return; clearTimeout(statsResize); statsResize = setTimeout(renderView, 150); });
+
+// ------------------------------------------------------------------ time tracking (module "time")
+// Timer (one per user, kept on the server, so it follows you across devices), manual entries, reports,
+// CSV export and a printable timesheet. The rules (who sees which entries, focus vs. timer, days, rounding)
+// are documented at the time tracking section of app.py. Start / stop carry the device time and a client
+// id, so they can wait in the offline outbox and still land at the right time.
+const timeOn = () => feat('time');
+const hmm = s => { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 3600)}:${pad(Math.floor(s % 3600 / 60))}`; };
+const fmtDur = s => fmtH(Math.floor(Math.max(0, s) / 60));
+const fmtClock = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+const hoursDec = s => (s / 3600).toLocaleString(LOCALE(), {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const money = (v, cur) => v.toLocaleString(LOCALE(), {minimumFractionDigits: 2, maximumFractionDigits: 2}) + (cur ? ' ' + cur : '');
+const timerElapsed = () => S.timer ? Math.max(0, (Date.now() - new Date(S.timer.start)) / 1000) : 0;
+const newCid = () => (window.crypto?.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+function taskTime(id) {  // [everyone I can see, mine] in seconds, incl. my running timer
+  const [a, m] = (S.timeTotals || {})[id] || [0, 0], run = S.timer && S.timer.task_id === id ? timerElapsed() : 0;
+  return [a + run, m + run];
+}
+function addLocalTotal(tid, sec) {  // offline: keep the task chips right until the next sync
+  if (!tid || !(sec > 0)) return;
+  const [a, m] = (S.timeTotals ||= {})[tid] || [0, 0];
+  S.timeTotals[tid] = [a + sec, m + sec];
+}
+function timeLocal(e) {  // applyLocal part of the outbox (start / stop / entries)
+  const {url, body = {}} = e;
+  if (url === '/api/time/start') {
+    if (S.timer) addLocalTotal(S.timer.task_id, (new Date(body.at) - new Date(S.timer.start)) / 1000);
+    const t = body.task_id ? S.tasks.get(body.task_id) : null;
+    S.timer = {id: null, client_id: body.client_id, task_id: body.task_id || null, list_id: t ? t.list_id : body.list_id || null, title: t ? t.title : '',
+      start: body.at, end: null, note: body.note || '', running: true, mine: true, source: 'timer', seconds: 0};
+    return {entry: S.timer, timer: S.timer, stopped: null, queued: true};
+  }
+  if (url === '/api/time/stop') {
+    if (S.timer && (!body.client_id || body.client_id === S.timer.client_id)) { addLocalTotal(S.timer.task_id, (new Date(body.at) - new Date(S.timer.start)) / 1000); S.timer = null; }
+    return {entry: null, timer: null, queued: true};
+  }
+  return {ok: true, queued: true};
+}
+async function timeChanged(j) {
+  if (!j || !j.queued) await load().catch(() => {});
+  render();
+  if (S.sel) { renderDetail(); loadTaskTime(S.sel); }
+}
+async function timerStart(target, note = '') {
+  let j;
+  try { j = await api('POST', '/api/time/start', {...target, note, at: new Date().toISOString(), client_id: newCid()}); } catch { return; }
+  if (j.timer !== undefined) S.timer = j.timer;
+  if (j.stopped) toast(tr('Previous timer stopped ({0})', hmm(j.stopped.seconds)));
+  else if (j.queued) toast(tr('Timer started, will be sent as soon as the server is reachable'));
+  await timeChanged(j);
+}
+async function timerStop() {
+  const r = S.timer; if (!r) return;
+  let j;
+  try { j = await api('POST', '/api/time/stop', {...(r.id ? {id: r.id} : {}), ...(r.client_id ? {client_id: r.client_id} : {}), at: new Date().toISOString()}); } catch { return; }
+  S.timer = j.timer ?? null;
+  toast(j.discarded ? tr('Timer discarded (shorter than a second)') : tr('Timer stopped: {0}', hmm(j.entry ? j.entry.seconds : timerElapsed())));
+  await timeChanged(j);
+}
+const timerToggle = tid => S.timer && S.timer.task_id === tid ? timerStop() : timerStart({task_id: tid});
+function timerPill() {
+  if (!S.timer || !timeOn()) return '';
+  const n = S.timer.title || tr('No task');
+  return `<button class="tmini" data-act="timer-pill" title="${esc(tr('Timer running: {0}', n))}"><span class="rec"></span><span data-timer-mini>${fmtT(timerElapsed())}</span><span class="tmt">${esc(n)}</span></button>`;
+}
+function timerMenu(a) {
+  const t = S.timer; if (!t) return;
+  menu(a, [{label: tr('Stop timer'), icon: 'stop', fn: timerStop},
+    ...(t.task_id && taskById(t.task_id) ? [{label: tr('Open task'), icon: 'edit', fn: () => openDetail(t.task_id)}] : []),
+    ...(t.id ? [{label: tr('Change start time or note…'), icon: 'clock', fn: () => entryModal(t)}] : []),
+    {label: tr('Time tracking'), icon: 'clock', fn: () => go('time')}]);
+}
+setInterval(() => {  // live timer: top pill, detail panel, the running task's chip
+  if (!S.timer) return;
+  const el = timerElapsed();
+  $$('[data-timer-mini],[data-timer-live]').forEach(x => { x.textContent = fmtT(el); });
+  $$(`[data-tt="${S.timer.task_id}"] b`).forEach(x => { x.textContent = fmtDur(taskTime(S.timer.task_id)[0]); });
+}, 1000);
+
+// ---- entries of the open task (detail panel)
+S.te = {tid: null, items: null, v: -1, all: false, err: null};
+async function loadTaskTime(id) {
+  if (!timeOn() || !(id > 0)) return;
+  const v = S.v;
+  if (S.te.tid !== id) S.te = {tid: id, items: null, v: -1, all: false, err: null};
+  try { const j = await rawFetch('GET', `/api/time/entries?task_id=${id}`); if (S.te.tid === id) Object.assign(S.te, {items: j.entries, v, err: null}); }
+  catch (e) { if (S.te.tid === id) Object.assign(S.te, {v, err: e instanceof Offline ? 'offline' : e.message}); }
+  drawTaskTime();
+}
+function drawTaskTime() { const el = $('#d-time'), t = taskById(S.sel); if (el && t && S.te.tid === t.id) el.innerHTML = taskTimeHtml(t); }
+function taskTimeHtml(t) {
+  const [all, mine] = taskTime(t.id), run = S.timer && S.timer.task_id === t.id;
+  const items = S.te.tid === t.id ? S.te.items : null;
+  let h = `<h5>${tr('Time|tracked')}${all >= 60 ? ` <span class="muted h5note">${all - mine >= 60 ? tr('{0} in total, {1} by you', fmtDur(all), fmtDur(mine)) : fmtDur(all)}</span>` : ''}</h5>
+    <div class="tebtns"><button class="btn sm ${run ? 'recon' : ''}" data-act="timer-toggle" data-id="${t.id}">${run ? `${ic('stop', 's')} ${tr('Stop')} <span data-timer-live>${fmtT(timerElapsed())}</span>` : `${ic('play', 's')} ${tr('Start timer')}`}</button><button class="btn sm" data-act="te-add" data-id="${t.id}">${ic('plus', 's')} ${tr('Add time')}</button></div>`;
+  if (items === null) return h + (S.te.err === 'offline' ? `<div class="muted mhint">${tr('Time entries are only available online.')}</div>` : '');
+  const shown = S.te.all ? items : items.slice(0, 8);
+  return h + `<div class="telist">${shown.map(e => teRow(e, {task: false})).join('')}</div>` +
+    (items.length > shown.length ? `<button class="btn sm telink" data-act="te-more">${tr('Show all ({0})', items.length)}</button>` : '');
+}
+function teRow(e, {task = true, day = true} = {}) {
+  const s = new Date(e.start), en = e.end ? new Date(e.end) : null;
+  const src = e.source === 'focus' ? `<span class="tesrc" title="${tr('From a focus session')}">${ic('timer', 's')}</span>`
+    : e.auto_stopped ? `<span class="tesrc warn" title="${tr('Stopped automatically, please check the end')}">${ic('alert', 's')}</span>` : '';
+  const who = e.mine ? '' : `<span class="who" title="${esc(e.user_name)}">${esc(initials(e.user_name))}</span>`;
+  const title = task ? `<span class="tett" ${e.task_id ? `data-act="te-open" data-id="${e.task_id}"` : ''}>${esc(e.title || tr('No task'))}</span>` : '';
+  const acts = e.mine ? `<span class="teacts">${!e.running && (e.task_id || e.list_id) ? `<button class="iconbtn" data-act="te-resume" data-eid="${e.id}" title="${tr('Continue (same task and note)')}">${ic('play', 's')}</button>` : ''}<button class="iconbtn" data-act="te-edit" data-eid="${e.id}" title="${tr('Edit')}">${ic('edit', 's')}</button><button class="iconbtn danger" data-act="te-del" data-eid="${e.id}" title="${tr('Delete')}">${ic('trash', 's')}</button></span>` : '';
+  return `<div class="terow ${e.running ? 'live' : ''}">${day ? `<span class="ted">${esc(dayLabel(ds(s)))}</span>` : ''}<span class="tet">${fmtClock(s)}–${en ? fmtClock(en) : tr('now')}</span>${title}<span class="ten">${esc(e.note)}</span>${src}${who}<b class="tedur" ${e.running ? 'data-timer-live' : ''}>${e.running ? fmtT(timerElapsed()) : hmm(e.seconds)}</b>${acts}</div>`;
+}
+const findEntry = id => [...(S.te.items || []), ...(S.tv.data?.entries || []), ...(S.timer ? [S.timer] : [])].find(e => e.id === id);
+// "1:30" = 90 min, "45m" = 45 min, "1.5" / "1,5h" = 90 min (a bare number means hours)
+function parseDur(v) {
+  v = String(v || '').trim().toLowerCase(); if (!v) return null;
+  let m;
+  if ((m = v.match(/^(\d+):(\d{1,2})$/))) return +m[1] * 60 + +m[2];
+  if ((m = v.match(/^(\d+)\s*m(in)?$/))) return +m[1];
+  const f = parseFloat(v.replace(',', '.').replace(/\s*h$/, ''));
+  return isNaN(f) || f <= 0 ? null : Math.round(f * 60);
+}
+function targetOptions(tid, lid) {
+  const lists = S.lists.filter(l => !l.archived || l.id === lid || (tid && taskById(tid)?.list_id === l.id));
+  const cur = tid && taskById(tid);
+  return lists.map(l => {
+    const ts = sortTasks(openTasks().filter(t => t.list_id === l.id && !t.parent_id));
+    if (cur && cur.list_id === l.id && !ts.includes(cur)) ts.unshift(cur);
+    const sub = x => [x, ...children(x.id).filter(k => k.status === 0 || k.id === tid).flatMap(sub)];
+    return `<optgroup label="${esc(lname(l))}"><option value="l:${l.id}" ${!tid && lid === l.id ? 'selected' : ''}>${esc(tr('(whole list, no task)'))}</option>${ts.flatMap(sub).map(t => `<option value="t:${t.id}" ${t.id === tid ? 'selected' : ''}>${' '.repeat(depthOf(t))}${esc(t.title)}</option>`).join('')}</optgroup>`;
+  }).join('');
+}
+// new entry (e = null; preset {task_id} | {list_id}) or edit my entry (a running timer: start time, note, task)
+function entryModal(e, preset = {}) {
+  const run = !!(e && e.running), s = e ? new Date(e.start) : null, en = e && e.end ? new Date(e.end) : null;
+  const tid = e ? e.task_id : preset.task_id || null, lid = e ? e.list_id : preset.list_id || (tid ? taskById(tid)?.list_id : null) || routeList()?.id || inbox()?.id;
+  const md = modal(`<h3>${run ? tr('Running timer') : e ? tr('Edit time entry') : tr('Add time')}</h3>
+    <div class="row"><label>${tr('Task')}</label><select id="te-target">${targetOptions(tid, lid)}</select></div>
+    <div class="row"><label>${tr('Date')}</label><input type="date" id="te-date" value="${ds(s || new Date())}" max="${today()}"></div>
+    <div class="row"><label>${run ? tr('Started at') : tr('From – to')}</label><input type="time" id="te-from" value="${s ? fmtClock(s) : ''}">${run ? '' : `<span class="muted">–</span><input type="time" id="te-to" value="${en ? fmtClock(en) : ''}">`}</div>
+    ${run ? '' : `<div class="row"><label>${tr('or duration')}</label><input id="te-dur" placeholder="${tr('e.g. 1:30, 45m or 1.5')}" inputmode="decimal" autocomplete="off"></div>`}
+    <div class="row"><label>${tr('Note')}</label><input id="te-note" value="${esc(e?.note || '')}" maxlength="500" autocomplete="off"></div>
+    ${run ? '' : `<div class="shint">${tr('An end before the start means the next day. Only a duration: the entry ends now (today) or starts at 9:00.')}</div>`}
+    <div class="foot">${e && !run ? `<button class="btn danger" data-m="del">${tr('Delete')}</button>` : ''}<span class="spacer"></span><button class="btn" data-m="close">${tr('Cancel')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
+  const times = () => {
+    const date = $('#te-date', md).value, from = $('#te-from', md).value, to = $('#te-to', md)?.value, dur = parseDur($('#te-dur', md)?.value);
+    if (!date) return null;
+    let a = from ? new Date(`${date}T${from}`) : null, b = null;
+    if (run) return a ? {start: a} : null;
+    if (a && to && !dur) { b = new Date(`${date}T${to}`); if (b <= a) b = new Date(b.getTime() + 864e5); }
+    else if (dur) {
+      if (a) b = new Date(a.getTime() + dur * 6e4);
+      else if (date === today()) { b = new Date(); b.setSeconds(0, 0); a = new Date(b.getTime() - dur * 6e4); }
+      else { a = new Date(`${date}T09:00`); b = new Date(a.getTime() + dur * 6e4); }
+    }
+    return a && b ? {start: a, end: b} : null;
+  };
+  md.addEventListener('click', async ev => {
+    const b = ev.target.closest('button'); if (!b) return;
+    if (b.dataset.m === 'close') { md.remove(); return; }
+    if (b.dataset.m === 'del') { md.remove(); teDelete(e.id); return; }
+    if (b.dataset.m !== 'save') return;
+    const tm = times();
+    if (!tm) { toast(run ? tr('Please enter the start time') : tr('Please enter start and end, or a duration')); return; }
+    if (tm.end && tm.end - tm.start < 6e4) { toast(tr('The end is before the start')); return; }
+    if (tm.start > new Date()) { toast(tr('Entries cannot lie in the future')); return; }
+    const [k, v] = $('#te-target', md).value.split(':'), body = {note: $('#te-note', md).value.trim()};
+    const target = k === 't' ? {task_id: +v} : {list_id: +v};
+    if (!e || (k === 't' ? +v !== e.task_id : e.task_id || +v !== e.list_id)) Object.assign(body, target);
+    const iso = d => d.toISOString();
+    if (!e || fmtClock(tm.start) !== fmtClock(s) || ds(tm.start) !== ds(s) || (!run && (!en || fmtClock(tm.end) !== fmtClock(en) || ds(tm.end) !== ds(en)))) {
+      body.start = iso(tm.start); if (!run) body.end = iso(tm.end);
+    }
+    let j;
+    try { j = e ? await api('PATCH', `/api/time/entries/${e.id || 0}`, body) : await api('POST', '/api/time/entries', {...target, ...body}); } catch { return; }
+    md.remove();
+    toast(j.queued ? tr('Will be sent as soon as the server is reachable') : e ? tr('Saved') : tr('Time added: {0}', hmm(j.seconds)));
+    await timeChanged(j);
+  });
+  md.addEventListener('keydown', ev => { if (ev.key === 'Enter' && ev.target.tagName === 'INPUT') $('[data-m="save"]', md).click(); });
+  setTimeout(() => $(e ? '#te-note' : run ? '#te-from' : '#te-dur', md)?.focus(), 50);
+}
+async function teDelete(id) {
+  const e = findEntry(id); if (!e) return;
+  let r;
+  try { r = await api('DELETE', `/api/time/entries/${id}`); } catch { return; }
+  if (S.timer && S.timer.id === id) S.timer = null;
+  const back = {...(e.task_id ? {task_id: e.task_id} : {list_id: e.list_id}), start: e.start, end: e.end, seconds: e.seconds, note: e.note, source: e.source};
+  await timeChanged(r);
+  if (e.end) offerUndo(tr('Time entry deleted ({0})', hmm(e.seconds)), r, [], () => api('POST', '/api/time/entries', back));
+  else toast(tr('Timer discarded'));
+}
+
+// ---- reports view (#time)
+S.tv = {data: null, loading: false, err: null, key: '', period: LS.get('timePeriod', 'week'), from: LS.get('timeFrom', ''), to: LS.get('timeTo', ''),
+  scope: LS.get('timeScope', 'mine'), lists: LS.get('timeLists', []), entries: LS.get('timeEntries', false)};
+const TPERIODS = [['week', N_('This week')], ['lastweek', N_('Last week')], ['month', N_('This month')], ['lastmonth', N_('Last month')], ['custom', N_('Custom')]];
+const monthEnd = s => { const d = pd(s); return ds(new Date(d.getFullYear(), d.getMonth() + 1, 0)); };
+function timeRange() {
+  const t = today(), mon = mondayOf(t), m0 = t.slice(0, 8) + '01';
+  switch (S.tv.period) {
+    case 'lastweek': return [addDays(mon, -7), addDays(mon, -1)];
+    case 'month': return [m0, monthEnd(m0)];
+    case 'lastmonth': { const d = pd(m0), p = ds(new Date(d.getFullYear(), d.getMonth() - 1, 1)); return [p, monthEnd(p)]; }
+    case 'custom': if (S.tv.from && S.tv.to) return S.tv.from <= S.tv.to ? [S.tv.from, S.tv.to] : [S.tv.to, S.tv.from]; return [mon, addDays(mon, 6)];
+    default: return [mon, addDays(mon, 6)];
+  }
+}
+const timeScope = () => hasSharing() && S.tv.scope === 'all' ? 'all' : 'mine';
+const tvLists = () => S.tv.lists.filter(id => id === 0 || listById(id));
+function timeQuery() {
+  const [f, t] = timeRange(), q = new URLSearchParams({from: f, to: t, scope: timeScope()});
+  if (tvLists().length) q.set('lists', tvLists().join(','));
+  return q.toString();
+}
+async function loadTime() {
+  if (S.tv.loading) return;
+  S.tv.loading = true;
+  const q = timeQuery(), key = q + '|' + S.v;
+  try { S.tv.data = await rawFetch('GET', '/api/time/report?' + q); S.tv.data._q = q; S.tv.err = null; }
+  catch (e) { if (e.message !== 'auth') S.tv.err = e instanceof Offline ? 'offline' : e.message; }
+  finally { S.tv.loading = false; S.tv.key = key; }
+  if (S.route.mod === 'time') renderView();
+}
+const tvListName = l => l.id === 0 ? tr('No list') : l.is_inbox && l.name === 'Eingang' ? tr('Inbox') : l.name;
+const rangeLabel = (f, t) => f === t ? fmtDate(f) : `${fmtDate(f)} – ${fmtDate(t)}`;
+function tvListsLabel() {
+  const ids = tvLists();
+  if (!ids.length) return tr('All lists');
+  return ids.length === 1 ? (ids[0] === 0 ? tr('No list') : lname(listById(ids[0]))) : trn('{0} list', '{0} lists', ids.length);
+}
+function viewTime() {
+  const tv = S.tv, [f, t] = timeRange(), q = timeQuery();
+  if (tv.key !== q + '|' + S.v && !tv.loading) setTimeout(loadTime, 0);
+  const j = tv.data && tv.data._q === q ? tv.data : null;
+  let h = `<div class="stats timev"><div class="tvbar"><div class="seg tvseg">${TPERIODS.map(([k, n]) => `<button class="${tv.period === k ? 'on' : ''}" data-act="tv-period" data-k="${k}">${tr(n)}</button>`).join('')}</div>
+      ${tv.period === 'custom' ? `<span class="tvrange"><input type="date" id="tv-from" value="${f}" aria-label="${tr('From')}"><span class="muted">–</span><input type="date" id="tv-to" value="${t}" aria-label="${tr('To')}"></span>` : `<span class="muted tvlabel">${esc(rangeLabel(f, t))}</span>`}</div>
+    <div class="tvbar">${hasSharing() ? `<div class="seg"><button class="${timeScope() === 'mine' ? 'on' : ''}" data-act="tv-scope" data-k="mine">${tr('Only mine')}</button><button class="${timeScope() === 'all' ? 'on' : ''}" data-act="tv-scope" data-k="all">${tr('All members')}</button></div>` : ''}
+      <button class="btn sm" data-act="tv-lists">${ic('filter', 's')} ${esc(tvListsLabel())}</button><span class="spacer"></span>
+      <button class="btn sm" data-act="te-add">${ic('plus', 's')} ${tr('Entry')}</button>
+      <a class="btn sm" href="/api/time/export.csv?${esc(q)}" download>${ic('download', 's')} CSV</a>
+      <button class="btn sm" data-act="tv-sheet" ${j ? '' : 'disabled'}>${ic('file', 's')} ${tr('Timesheet')}</button></div>`;
+  if (!j) return h + `<div class="empty">${tv.err ? (tv.err === 'offline' ? tr('Reports are only available online.') : esc(tv.err)) : tr('Loading…')}</div></div>`;
+  const tot = j.total, rm = j.rounding, hasAmt = j.lists.some(l => l.rate), tgt = j.today.target_h;
+  const tiles = [[hmm(tot.seconds), tr('tracked'), rm ? tr('rounded: {0}', hmm(tot.rounded)) : trn('{0} entry', '{0} entries', tot.count)],
+    [hoursDec(tot.rounded) + ' h', rm ? tr('hours (rounded)') : tr('hours'), rm ? trn('{0} entry', '{0} entries', tot.count) : tr('decimal')],
+    [hmm(j.today.seconds), tr('today'), tgt ? tr('{0}% of the daily target ({1} h)', Math.round(100 * j.today.seconds / 3600 / tgt), String(tgt).replace('.', LOCALE().startsWith('de') ? ',' : '.')) : tr('your time')]];
+  if (hasAmt) tiles.push([money(tot.amount, j.currency), tr('amount'), tr('hourly rates of the lists')]);
+  h += `<div class="sttiles">${tiles.map(([v, l, s]) => `<div><b>${esc(v)}</b><span>${esc(l)}</span><small>${esc(s)}</small></div>`).join('')}</div>`;
+  // per day (per week for long ranges)
+  const days = []; for (let d = f; d <= t && days.length < 400; d = addDays(d, 1)) days.push(d);
+  const per = Object.fromEntries(j.days.map(x => [x.date, x.seconds / 60]));
+  if (days.length > 1) {
+    const weekly = days.length > 62, keys = weekly ? [...new Set(days.map(mondayOf))] : days;
+    const vals = keys.map(k => weekly ? days.filter(d => mondayOf(d) === k).reduce((n, d) => n + (per[d] || 0), 0) : per[k] || 0);
+    h += `<section class="stcard"><div class="sthead"><h3>${weekly ? tr('Per week') : tr('Per day')}</h3></div>${barChart(vals, keys.map(k => weekly ? shortDay(k) : days.length <= 7 ? WD[pd(k).getDay()] : String(pd(k).getDate())),
+      {fmt: v => fmtH(Math.round(v)), tip: i => `${weekly ? tr('Week of {0}', fmtDate(keys[i])) : fmtDate(keys[i])}: ${fmtH(Math.round(vals[i]))}`, label: tr('Tracked time')})}</section>`;
+  }
+  if (!j.lists.length) return h + `<div class="empty">${ic('clock')}${tr('No time tracked in this period.')}</div></div>`;
+  const all = j.scope === 'all', ppl = us => all && us.length ? `<small class="muted">${esc(us.map(([n, s]) => `${n} ${hmm(s)}`).join(', '))}</small>` : '';
+  h += `<section class="stcard"><div class="sthead"><h3>${tr('By list and task')}</h3>${rm ? `<span class="muted">${tr('rounded up to {0} min per entry', rm)}</span>` : ''}</div>
+    <table class="ttable"><thead><tr><th>${tr('List / task')}</th><th class="n">${tr('Time|tracked')}</th>${rm ? `<th class="n">${tr('Rounded')}</th>` : ''}${hasAmt ? `<th class="n">${tr('Amount')}</th>` : ''}</tr></thead><tbody>
+    ${j.lists.map(l => { const closed = S.collapsed.has('tvl:' + l.id); return `<tr class="tvl ${closed ? 'closed' : ''}" data-act="tv-toggle" data-key="tvl:${l.id}"><td>${ic('chev', 's')}<span>${esc(tvListName(l))}</span>${ppl(l.users)}</td><td class="n">${hmm(l.seconds)}</td>${rm ? `<td class="n">${hmm(l.rounded)}</td>` : ''}${hasAmt ? `<td class="n">${l.rate ? money(l.amount, j.currency) : ''}</td>` : ''}</tr>` +
+      (closed ? '' : l.tasks.map(x => `<tr class="tvt" ${x.id ? `data-act="te-open" data-id="${x.id}"` : ''}><td><span>${esc(x.title || tr('No task'))}</span>${ppl(x.users)}</td><td class="n">${hmm(x.seconds)}</td>${rm ? `<td class="n">${hmm(x.rounded)}</td>` : ''}${hasAmt ? `<td class="n">${l.rate ? money(x.amount, j.currency) : ''}</td>` : ''}</tr>`).join('')); }).join('')}
+    <tr class="tvsum"><td>${tr('Total')}</td><td class="n">${hmm(tot.seconds)}</td>${rm ? `<td class="n">${hmm(tot.rounded)}</td>` : ''}${hasAmt ? `<td class="n">${money(tot.amount, j.currency)}</td>` : ''}</tr></tbody></table></section>`;
+  const byDay = {}; for (const e of j.entries) (byDay[e.day] ||= []).push(e);
+  h += `<section class="stcard"><div class="sthead tvtoggle" data-act="tv-entries"><h3>${ic('chev', 's' + (tv.entries ? '' : ' closedc'))} ${tr('Entries')}</h3><span class="muted">${tot.count}</span></div>
+    ${tv.entries ? Object.keys(byDay).sort().reverse().map(d => `<div class="teday"><span>${esc(dayLabel(d))}</span><b>${hmm(byDay[d].reduce((n, e) => n + e.seconds, 0))}</b></div>${byDay[d].slice().reverse().map(e => teRow(e, {day: false})).join('')}`).join('') : ''}</section>`;
+  return h + `<p class="muted stnote">${tr('An entry counts on the day it starts. Rounding and the hourly rate (list settings) only apply to the report, CSV and timesheet; the tracked times stay exact.')}</p></div>`;
+}
+function tvListsMenu(anchor) {
+  const cur = new Set(tvLists());
+  const ls = S.lists.filter(l => !l.archived || cur.has(l.id));
+  const p = openPop(anchor, `<div class="menu-list tvlm"><label><input type="checkbox" data-l="all" ${cur.size ? '' : 'checked'}> ${tr('All lists')}</label><hr>${ls.map(l => `<label><input type="checkbox" data-l="${l.id}" ${cur.has(l.id) ? 'checked' : ''}> ${esc(lname(l))}</label>`).join('')}<label><input type="checkbox" data-l="0" ${cur.has(0) ? 'checked' : ''}> ${tr('No list')}</label></div>`, () => { S.tv.key = ''; renderView(); });
+  p.onchange = e => {
+    const x = e.target.closest('[data-l]'); if (!x) return;
+    if (x.dataset.l === 'all') S.tv.lists = [];
+    else { const id = +x.dataset.l, s = new Set(tvLists()); x.checked ? s.add(id) : s.delete(id); S.tv.lists = [...s]; }
+    LS.set('timeLists', S.tv.lists);
+    $$('[data-l]', p).forEach(c => { c.checked = c.dataset.l === 'all' ? !S.tv.lists.length : S.tv.lists.includes(+c.dataset.l); });
+  };
+}
+async function openTaskById(id) {  // a task from the report may be completed long ago (not in the state)
+  if (!taskById(id)) {
+    try { (S.extra ||= []).push(await rawFetch('GET', `/api/tasks/${id}`)); }
+    catch (e) { toast(e instanceof Offline ? tr('Only available online.') : tr('Task not found')); return; }
+  }
+  openDetail(id);
+}
+// printable timesheet ("Stundennachweis") of the current report; the browser's print dialog saves it as PDF
+function timesheet() {
+  const j = S.tv.data; if (!j) return;
+  const rm = j.rounding, hasAmt = j.lists.some(l => l.rate), cur = j.currency, all = j.scope === 'all';
+  const who = all ? tr('All members') : j.me.display_name;
+  const filt = tvLists().length ? ' · ' + tvListsLabel() : '';
+  const ustr = us => esc(us.map(([n, s]) => `${n} ${hmm(s)}`).join(', '));
+  const cols = (x, rate, amt) => `<td class="n">${hmm(x.rounded)}</td><td class="n">${hoursDec(x.rounded)}</td>${hasAmt ? `<td class="n">${rate}</td><td class="n">${amt}</td>` : ''}`;
+  const byList = {}; for (const e of j.entries) (byList[e.list_id || 0] ||= []).push(e);
+  const lname2 = id => { const l = j.lists.find(x => x.id === id); return l ? tvListName(l) : tr('No list'); };
+  const doc = `<h1>${tr('Timesheet')}</h1><div class="tssub">${esc(rangeLabel(j.from, j.to))} · ${esc(who)}${esc(filt)}${rm ? ' · ' + esc(tr('rounded up to {0} min per entry', rm)) : ''} · ${esc(tr('created {0}', fmtDate(today())))}</div>
+    <div class="tskpi"><div><b>${hoursDec(j.total.rounded)} h</b><span>${rm ? tr('hours (rounded)') : tr('hours')}</span></div><div><b>${hmm(j.total.rounded)}</b><span>h:mm</span></div>${hasAmt ? `<div><b>${money(j.total.amount, cur)}</b><span>${tr('amount')}</span></div>` : ''}<div><b>${j.total.count}</b><span>${trn('entry', 'entries', j.total.count)}</span></div></div>
+    <table><thead><tr><th>${tr('List / task')}</th><th>${tr('People')}</th><th class="n">h:mm</th><th class="n">${tr('Hours')}</th>${hasAmt ? `<th class="n">${tr('Rate')}</th><th class="n">${tr('Amount')}</th>` : ''}</tr></thead><tbody>
+    ${j.lists.map(l => `<tr class="p"><td>${esc(tvListName(l))}</td><td class="muted">${ustr(l.users)}</td>${cols(l, l.rate ? money(l.rate, cur) : '', l.rate ? money(l.amount, cur) : '')}</tr>${l.tasks.map(x => `<tr class="t"><td>${esc(x.title || tr('No task'))}</td><td class="muted">${ustr(x.users)}</td>${cols(x, '', l.rate ? money(x.amount, cur) : '')}</tr>`).join('')}`).join('')}
+    <tr class="g"><td>${tr('Total')}</td><td class="muted">${esc(j.users.map(u => `${u.name} ${hmm(u.rounded)}`).join(', '))}</td><td class="n">${hmm(j.total.rounded)}</td><td class="n">${hoursDec(j.total.rounded)}</td>${hasAmt ? `<td></td><td class="n">${money(j.total.amount, cur)}</td>` : ''}</tr></tbody></table>
+    <h2>${tr('Per day')}</h2><table class="tsdays"><thead><tr><th>${tr('Date')}</th><th class="n">h:mm</th><th class="n">${tr('Hours')}</th></tr></thead><tbody>${j.days.map(d => `<tr><td>${esc(fmtDay('year', pd(d.date)))}</td><td class="n">${hmm(d.rounded)}</td><td class="n">${hoursDec(d.rounded)}</td></tr>`).join('')}</tbody></table>
+    <div class="tsentries">${Object.keys(byList).map(id => `<h2>${esc(lname2(+id))}</h2><table class="entries"><thead><tr><th>${tr('Date')}</th><th>${tr('Time|tracked')}</th><th>${tr('Task')}</th><th>${tr('Note')}</th>${all ? `<th>${tr('User')}</th>` : ''}<th class="n">h:mm</th>${rm ? `<th class="n">${tr('Rounded')}</th>` : ''}</tr></thead><tbody>
+      ${byList[id].map(e => { const s = new Date(e.start), en = e.end ? new Date(e.end) : null; return `<tr><td>${esc(fmtDate(ds(s)))}</td><td>${fmtClock(s)} – ${en ? fmtClock(en) : tr('running')}</td><td>${esc(e.title || tr('No task'))}</td><td class="note">${esc(e.note)}</td>${all ? `<td class="muted">${esc(e.user_name)}</td>` : ''}<td class="n">${hmm(e.seconds)}</td>${rm ? `<td class="n">${hmm(e.rounded)}</td>` : ''}</tr>`; }).join('')}</tbody></table>`).join('')}</div>`;
+  $('.tsheet')?.remove();
+  const el = document.createElement('div');
+  el.className = 'tsheet';
+  el.innerHTML = `<div class="tsbar"><button class="btn pri" data-ts="print">${ic('download', 's')} ${tr('Print / save as PDF')}</button><label class="chkl"><input type="checkbox" id="ts-entries" ${LS.get('tsEntries', true) ? 'checked' : ''}> ${tr('Individual entries')}</label><span class="spacer"></span><span class="muted tshint">${tr('In the print dialog choose “Save as PDF”.')}</span><button class="iconbtn" data-ts="close" aria-label="${tr('Close')}">${ic('x')}</button></div><div class="tspage ${LS.get('tsEntries', true) ? '' : 'noentries'}" lang="${esc(document.documentElement.lang)}">${doc}</div>`;
+  document.body.appendChild(el);
+  document.body.classList.add('tsprint');
+  const close = () => { el.remove(); document.body.classList.remove('tsprint'); document.title = APP_NAME; };
+  el.addEventListener('click', ev => { const b = ev.target.closest('[data-ts]'); if (!b) return; if (b.dataset.ts === 'close') close(); else window.print(); });
+  el.addEventListener('change', ev => { if (ev.target.id === 'ts-entries') { LS.set('tsEntries', ev.target.checked); $('.tspage', el).classList.toggle('noentries', !ev.target.checked); } });
+  el.addEventListener('keydown', ev => { if (ev.key === 'Escape') close(); });
+  document.title = `${tr('Timesheet')} ${rangeLabel(j.from, j.to)}${all ? '' : ' ' + j.me.display_name}`;
+}
 
 // ------------------------------------------------------------------ toast
 let toastTimer;
@@ -3163,6 +3515,20 @@ document.addEventListener('click', async e => {
       S.pomo = j.pomo; S.pomoToday = j.today; document.title = APP_NAME; render(); break;
     }
     case 'qsheet-send': submitQuick($('#qsheet')); break;
+    case 'timer-pill': timerMenu(a); break;
+    case 'timer-toggle': timerToggle(id); break;
+    case 'te-add': entryModal(null, id ? {task_id: id} : {}); break;
+    case 'te-edit': { const en = findEntry(+a.dataset.eid); if (en) entryModal(en); break; }
+    case 'te-del': teDelete(+a.dataset.eid); break;
+    case 'te-resume': { const en = findEntry(+a.dataset.eid); if (en) timerStart(en.task_id ? {task_id: en.task_id} : {list_id: en.list_id}, en.note); break; }
+    case 'te-more': S.te.all = true; drawTaskTime(); break;
+    case 'te-open': if (id) openTaskById(id); break;
+    case 'tv-period': S.tv.period = a.dataset.k; LS.set('timePeriod', S.tv.period); if (S.tv.period === 'custom' && !S.tv.from) { [S.tv.from, S.tv.to] = [addDays(today(), -29), today()]; LS.set('timeFrom', S.tv.from); LS.set('timeTo', S.tv.to); } renderView(); break;
+    case 'tv-scope': S.tv.scope = a.dataset.k; LS.set('timeScope', S.tv.scope); renderView(); break;
+    case 'tv-lists': tvListsMenu(a); break;
+    case 'tv-toggle': { const k = a.dataset.key; S.collapsed.has(k) ? S.collapsed.delete(k) : S.collapsed.add(k); LS.set('collapsed', [...S.collapsed]); renderView(); break; }
+    case 'tv-entries': S.tv.entries = !S.tv.entries; LS.set('timeEntries', S.tv.entries); renderView(); break;
+    case 'tv-sheet': timesheet(); break;
   }
 });
 function closeSide() { $('#side').classList.remove('open'); if (!$('.qadd.sheet') && $('#pop').classList.contains('hidden')) $('#scrim').classList.add('hidden'); }
@@ -3187,6 +3553,7 @@ document.addEventListener('change', async e => {
   if (t.id === 'd-sec') patchTask(S.sel, {section_id: t.value ? +t.value : null});
   if (t.id === 'd-assignee') patchTask(S.sel, {assignee_id: t.value ? +t.value : null});
   if (t.id === 'pomo-task') { pomoTask = t.value; LS.set('pomoTask', t.value); }
+  if ((t.id === 'tv-from' || t.id === 'tv-to') && t.value) { S.tv[t.id.slice(3)] = t.value; LS.set(t.id === 'tv-from' ? 'timeFrom' : 'timeTo', t.value); renderView(); }
 });
 document.addEventListener('keydown', async e => {
   const t = e.target;
@@ -3220,6 +3587,7 @@ document.addEventListener('keydown', async e => {
   }
   if (e.key === 'Escape') {
     const lb = $('.lightbox'); if (lb) { lb.remove(); return; }
+    const ts = $('.tsheet'); if (ts && !$('.modal')) { $('[data-ts="close"]', ts).click(); return; }
     if (!$('#pop').classList.contains('hidden') || $('.qadd.sheet')) { closePop(); return; }
     if (S.multi.size || S.multiMode) { S.multi.clear(); S.multiMode = false; render(); return; }
     const m = $$('.modal:not(.authscreen)').pop(); if (m) { m.remove(); return; }

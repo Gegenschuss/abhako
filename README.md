@@ -3,7 +3,7 @@
 <h1 align="center">Abhako</h1>
 
 <p align="center">A self-hosted task manager inspired by TickTick and Asana: personal planning meets team collaboration.<br>
-Lists, calendar, Eisenhower matrix, habits, a focus timer, comments and shared lists in one small web app you run yourself.</p>
+Lists, calendar, Eisenhower matrix, habits, a focus timer, time tracking, comments and shared lists in one small web app you run yourself.</p>
 
 <p align="center"><img src="docs/today.png" alt="Today view with overdue and today's tasks, subtasks, tags and the list sidebar"></p>
 
@@ -30,9 +30,11 @@ Lists, calendar, Eisenhower matrix, habits, a focus timer, comments and shared l
 - Kanban per list
 - **Statistics**: completions per week / day and per list, on-time rate, overdue trend, focus time, habit streaks
 
-**Habits and focus**
+**Habits, focus and time**
 - Habits per day or *n* times per week, counters (e.g. 8 glasses of water), notes per day, streaks
 - Pomodoro timer and stopwatch, focus minutes per task
+- **Time tracking**: a timer on any task that follows you across devices, manual entries, hours per list and task
+  for any period, rounding, hourly rates, CSV export and a printable timesheet
 
 **Together**
 - Several users, each with their own inbox, habits, filters, tags, settings and notifications
@@ -51,7 +53,7 @@ Lists, calendar, Eisenhower matrix, habits, a focus timer, comments and shared l
 - Share from Android into the inbox (see below), app shortcuts (long-press the icon: new task, today, news, search)
 - **Calendar subscription**: your open tasks with a date as an ICS feed for Google Calendar, Apple Calendar, Outlook or Thunderbird
 - Optional [Paperless-ngx](https://docs.paperless-ngx.com) integration: link documents to tasks, send attachments to Paperless
-- Import TickTick CSV backups, export everything as JSON
+- Import TickTick CSV backups, export everything as JSON (incl. your time entries)
 - Dark and light theme, English and German interface (translations are plain JSON files, [add yours](TRANSLATING.md))
 
 | | | |
@@ -207,6 +209,37 @@ address. With a login proxy, let `/ical/*` bypass it (see *Reverse proxy*); Abha
   A completion counts for the person who ticked the task off, also in shared lists.
 
 <p align="center"><img src="docs/stats.png" alt="Statistics view with completed tasks per week, by list, overdue trend, focus time and habits"></p>
+
+## Time tracking
+
+A module (on by default, *Settings > Layout*) for tracking the time you spend on tasks, for yourself or to bill a client.
+
+- **Timer:** *Start timer* in a task's detail panel or menu. The running timer shows in the top bar (with the task
+  and the elapsed time) on every device you are logged in on; click it to stop, open the task or change the start
+  time. One timer per person: starting another one stops the first. Start and stop also work offline: they carry
+  the device's time and are sent later with the right times.
+- **Manual entries:** *Add time* with a date and a from-to time (an end before the start means the next day) or
+  just a duration (`1:30`, `45m`, `1.5`). The *Time* section of a task lists its entries with totals; your own
+  entries can be edited, continued (a new timer with the same note) or deleted (with undo). A task row shows a small
+  total-time chip.
+- **Focus sessions** (Pomodoro or stopwatch) on a task count as time entries when they end, unless a timer ran at
+  the same time: the timer wins, nothing is counted twice. Can be turned off in *Settings > Time tracking*.
+- **Reports** (sidebar *Time tracking*, the rail or a pinned tab): this week, last week, this month, last month or a
+  custom range; totals per list and task, per day and per person, filtered by lists and, with shared lists, *only
+  mine* or *all members*. **CSV export** (one row per entry: list, task, user, start, end, duration in hours and
+  h:mm, rounded hours, amount, note; UTF-8 with BOM, in German with `;` and decimal commas for Excel) and a
+  printable **timesheet** (summary per list and task, hours per day, individual entries; *Print / save as PDF*).
+- **Rounding and rates:** every entry can be rounded up to 5, 6, 10, 15 or 30 minutes in reports, CSV and the
+  timesheet; the tracked times stay exact. The list owner can set an hourly rate in the list dialog, the report
+  then shows amounts. A daily target shows today's progress.
+- **Forgotten timers:** a push notification after a few hours (default 4) and an automatic stop after 12 hours
+  (end = start + 12 h), both adjustable per user.
+- **Rules:** an entry counts on the local day it starts (entries across midnight are not split); durations are
+  real elapsed time, so daylight-saving changes are exact; weeks start on Monday. In a shared list every member
+  sees everyone's time on its tasks, but only the person who tracked an entry can change it; time on private
+  tasks stays private. View-only members can track their own time.
+
+<p align="center"><img src="docs/time.png" alt="Time tracking report with hours per day and per list and task"></p>
 
 ## Login
 

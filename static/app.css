@@ -840,3 +840,106 @@ svg.chart{display:block;max-width:100%;overflow:visible}
   .sthabits .shh,.sthabits .shr{grid-template-columns:minmax(0,1fr) 96px 64px 30px;gap:6px}
   .sthabits .rate svg{width:40px}
 }
+/* ---------- time tracking (module "time") ---------- */
+@keyframes recpulse{0%,100%{opacity:1}50%{opacity:.35}}
+.tmini{display:flex;align-items:center;gap:7px;padding:5px 11px 5px 9px;border-radius:999px;background:color-mix(in srgb,var(--p5) 15%,transparent);color:var(--text);font-size:13px;max-width:min(46vw,280px);min-width:0}
+.tmini [data-timer-mini]{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--p5);flex:none}
+.tmini .tmt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);min-width:0}
+.tmini .rec,.recdot{width:8px;height:8px;border-radius:50%;background:var(--p5);flex:none;animation:recpulse 1.6s ease-in-out infinite;display:inline-block}
+.rbtn .dot.rec,#tabs .dot.rec{background:var(--p5)}
+.meta .tchip{font-variant-numeric:tabular-nums}
+.meta .tchip b{font-weight:500}
+.meta .tchip.live{color:var(--p5)}
+.btn.recon,.iconbtn.recon{color:var(--p5)}
+.btn.recon{border-color:color-mix(in srgb,var(--p5) 45%,var(--line))}
+.btn.recon [data-timer-live]{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.tebtns{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.telist{display:flex;flex-direction:column}
+.terow{display:flex;align-items:center;gap:8px;padding:6px 2px;border-top:1px solid var(--line);font-size:13px;min-width:0}
+.terow:first-child{border-top:0}
+.terow .ted{color:var(--muted);flex:none;min-width:74px}
+.terow .tet{font-family:var(--mono);font-size:12px;color:var(--muted);flex:none}
+.terow .tett{font-weight:500;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.terow .tett[data-act]{cursor:pointer}
+.terow .tett[data-act]:hover{color:var(--accent)}
+.terow .ten{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
+.terow .tesrc{color:var(--muted);display:inline-flex}
+.terow .tesrc.warn{color:var(--p3)}
+.terow .who{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;background:var(--bg4);font-size:10px;font-weight:600;flex:none}
+.terow .tedur{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:500;flex:none;margin-left:auto}
+.terow.live .tedur{color:var(--p5)}
+.terow .teacts{display:flex;flex:none;opacity:.35;transition:opacity .1s}
+.terow:hover .teacts,.terow .teacts:focus-within{opacity:1}
+.terow .teacts .iconbtn{width:28px;height:28px}
+.telink{margin-top:6px}
+.timev .tvbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+.timev .tvseg{flex-wrap:wrap}
+.timev .tvlabel{font-size:13px}
+.tvrange{display:inline-flex;align-items:center;gap:6px}
+.tvrange input{max-width:150px}
+.ttable{width:100%;border-collapse:collapse;font-size:14px}
+.ttable th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600;padding:4px 6px 6px;border-bottom:1px solid var(--line)}
+.ttable td{padding:7px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+.ttable .n{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;width:1%}
+.ttable td small{display:block;font-size:11px;margin-top:1px}
+.ttable .tvl td{font-weight:600;cursor:pointer;background:color-mix(in srgb,var(--bg3) 60%,transparent)}
+.ttable .tvl td:first-child{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.ttable .tvl td:first-child small{flex-basis:100%;margin-left:20px;font-weight:400}
+.ttable .tvl svg{transition:transform .15s;flex:none}
+.ttable .tvl.closed svg{transform:rotate(-90deg)}
+.ttable .tvt td:first-child{padding-left:28px}
+.ttable .tvt[data-act]{cursor:pointer}
+.ttable .tvt[data-act]:hover td{background:var(--bg3)}
+.ttable .tvsum td{font-weight:700;border-bottom:0;border-top:2px solid var(--line)}
+.tvtoggle{cursor:pointer;user-select:none;margin-bottom:0}
+.tvtoggle h3{display:flex;align-items:center;gap:6px}
+.tvtoggle svg{transition:transform .15s}
+.tvtoggle svg.closedc{transform:rotate(-90deg)}
+.teday{display:flex;justify-content:space-between;font-size:12px;font-weight:600;color:var(--muted);padding:12px 2px 4px;text-transform:uppercase;letter-spacing:.05em}
+.teday b{font-family:var(--mono);font-weight:500}
+.tvlm{min-width:220px;max-height:60vh;overflow:auto}
+.tvlm label{display:flex;align-items:center;gap:8px;padding:7px 10px;font-size:14px;cursor:pointer;border-radius:6px}
+.tvlm label:hover{background:var(--bg3)}
+.tvlm input{flex:none}
+@media (max-width:899px){
+  .terow{flex-wrap:wrap;row-gap:2px}
+  .terow .ted{min-width:0}
+  .terow .ten{flex-basis:100%;order:9;white-space:normal}
+  .terow .teacts{opacity:1}
+  .timev .tvbar .spacer{display:none}
+  .tmini .tmt{display:none}
+}
+/* printable timesheet: overlay in the app, only the page itself is printed */
+.tsheet{position:fixed;inset:0;z-index:95;background:#e9ebee;overflow:auto;color:#111;color-scheme:light}
+.tsbar{position:sticky;top:0;display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 16px;background:var(--bg2);color:var(--text);border-bottom:1px solid var(--line)}
+.tsbar .tshint{font-size:12px}
+.tspage{max-width:860px;margin:18px auto 40px;background:#fff;padding:36px 40px;font:13px/1.45 var(--sans);box-shadow:0 2px 14px rgba(0,0,0,.12);border-radius:4px}
+.tspage h1{font-size:22px;margin:0 0 2px;font-weight:700}
+.tspage h2{font-size:14px;margin:26px 0 8px;font-weight:700;break-after:avoid}
+.tspage .tssub,.tspage .muted{color:#666}
+.tspage .tssub{margin-bottom:22px}
+.tskpi{display:flex;gap:28px;flex-wrap:wrap;margin-bottom:24px}
+.tskpi div{display:flex;flex-direction:column}
+.tskpi b{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+.tskpi span{color:#666;font-size:12px}
+.tspage table{width:100%;border-collapse:collapse;margin-bottom:18px}
+.tspage th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#666;border-bottom:2px solid #111;padding:6px}
+.tspage td{padding:6px;border-bottom:1px solid #ddd;vertical-align:top}
+.tspage .n{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.tspage tr.p td{font-weight:700;background:#f4f4f4}
+.tspage tr.t td:first-child{padding-left:22px}
+.tspage tr.g td{font-weight:700;border-top:2px solid #111;border-bottom:0}
+.tspage .tsdays{width:auto;min-width:300px}
+.tspage .entries td{font-size:12px}
+.tspage .entries td.note{color:#333}
+.tspage.noentries .tsentries{display:none}
+@media (max-width:899px){ .tspage{margin:0;padding:20px 16px;border-radius:0;box-shadow:none} .tspage table{font-size:12px} .tsbar .tshint{display:none} }
+@media print{
+  body.tsprint>*:not(.tsheet){display:none!important}
+  body.tsprint,html:has(body.tsprint){background:#fff!important;height:auto;overflow:visible}
+  .tsheet{position:static;inset:auto;overflow:visible;background:#fff}
+  .tsbar{display:none!important}
+  .tspage{margin:0;padding:0;max-width:none;box-shadow:none;border-radius:0;font-size:11.5px}
+  .tspage tr{break-inside:avoid}
+  @page{margin:16mm 14mm}
+}
