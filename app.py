@@ -1823,7 +1823,7 @@ def ntfy(title, msg, prio="default", click=None, topic=None, actions=None):
     topic = topic or NTFY_TOPIC
     if not topic:
         return False
-    hdr = {"Title": title.encode("utf-8"), "Priority": prio, "Tags": "white_check_mark"}
+    hdr = {"Title": title.encode("utf-8"), "Priority": prio}  # no Tags header: no emoji icon in the push
     if click:
         hdr["Click"] = click
     if NTFY_TOKEN:
