@@ -238,6 +238,24 @@ Chrome currently passes no files to installed web apps via the share sheet (link
 
 Python (Flask, waitress, python-dateutil) and SQLite on the server, plain JavaScript in the browser (`app.js`, translation helpers in `i18n.js`, translations in `static/i18n/*.json`): no build step, no framework, no external requests. Icons from [Lucide](https://lucide.dev).
 
+## Limits
+
+Abhako is built for one person, a household or a small team, not as a hosted service for many accounts.
+
+- **Tasks:** every device loads all open tasks plus the last 14 days of completed ones (and a year of habit
+  history) in one request and re-renders from it. A few thousand open tasks per user feel instant; around
+  10,000 open tasks the payload reaches several megabytes and rendering slows down, especially on phones.
+  Completed tasks older than 14 days are not loaded, so a long history costs nothing.
+- **Users:** devices poll for changes every few seconds, and any change makes every active device reload its
+  state. That is fine for a handful of people; with more than roughly 20 to 30 users active at the same time
+  it becomes wasteful.
+- **Database:** SQLite in WAL mode handles hundreds of thousands of tasks without trouble. Writes are
+  serialised, which only matters under many writes per second. Attachments are stored as files, not in the
+  database.
+
+If you run into these limits, the next steps would be per-user change tracking, sending only changes
+instead of the full state, and rendering long lists incrementally. Issues and pull requests are welcome.
+
 ## License
 
 [MIT](LICENSE). Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
