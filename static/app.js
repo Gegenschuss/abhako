@@ -238,7 +238,7 @@ function applyLocal(e) {
       title: body.title, content: body.content || '', priority: body.priority || 0, status: 0, due: body.due || null, due_time: body.due_time || null,
       reminders: body.reminders || '', repeat: body.repeat || '', repeat_from: body.repeat_from || 'due', url: body.url || null,
       sort: par ? 1e9 : Math.min(0, ...[...S.tasks.values()].map(x => x.sort)) - 1,
-      created_at: nowIso, updated_at: nowIso, completed_at: null, deleted_at: null, tags: body.tags || []};
+      created_at: nowIso, updated_at: nowIso, completed_at: null, deleted_at: null, tags: body.tags || [], fields: body.fields || {}, blocked: 0, blockers: [], blocking: 0};
     S.tasks.set(t.id, t); return t;
   }
   if (url === '/api/tasks/batch') {
@@ -255,7 +255,10 @@ function applyLocal(e) {
     const t = S.tasks.get(+m[1]);
     if (method === 'DELETE') { S.tasks.delete(+m[1]); return {ok: true}; }
     if (!t) return {ok: true};
-    if (method === 'PATCH') { const {_prev, ...b} = body; Object.assign(t, b); if ('due' in b && !b.due) t.due_time = null; }
+    if (method === 'PATCH') {
+      const {_prev, fields, ...b} = body; Object.assign(t, b); if ('due' in b && !b.due) t.due_time = null;
+      if (fields) { t.fields = {...(t.fields || {})}; for (const [k, v] of Object.entries(fields)) { if (v == null || v === '' || v === false) delete t.fields[k]; else t.fields[k] = v === true ? '1' : String(v); } }
+    }
     if (m[2] === 'complete') { t.status = body.status ?? 2; t.completed_at = nowIso; }
     if (m[2] === 'reopen') { t.status = 0; t.completed_at = null; }
     return {...t, next_due: null};
@@ -394,6 +397,7 @@ async function load() {
   if (S.extra) await loadExtra().catch(() => {});
   if (S.sel && collab() && S.tl.id === S.sel && S.tl.v !== S.v) loadTimeline(S.sel);
   if (S.sel && timeOn() && S.te.tid === S.sel && S.te.v !== S.v) loadTaskTime(S.sel);
+  if (S.sel && S.dp.id === S.sel && S.dp.v !== S.v) loadDeps(S.sel);
 }
 async function loadExtra() {
   const k = S.route.key;
@@ -666,6 +670,7 @@ function filterMatch(t, r = {}) {
   if (r.dates?.length) c.push(r.dates.some(d => dateMatch(t, d)));
   if (r.prios?.length) c.push(r.prios.includes(t.priority));
   if (r.tags?.length) c.push(r.tags.some(g => t.tags.includes(g)));
+  for (const [fid, cr] of Object.entries(r.cf || {})) if (cfRuleOn(cr) && fieldById(+fid)) c.push(cfMatch(t, fid, cr));
   if (!c.length) return true;
   return r.op === 'or' ? c.some(Boolean) : c.every(Boolean);
 }
@@ -685,7 +690,7 @@ function sortTasks(arr) {
     date: (a, b) => dueKey(a).localeCompare(dueKey(b)) || b.priority - a.priority || bySort(a, b),
     prio: (a, b) => b.priority - a.priority || bySort(a, b),
     title: (a, b) => a.title.localeCompare(b.title, 'de'),
-  }[m] || bySort;
+  }[m] || (m.startsWith('cf:') ? cfSortCmp(+m.slice(3)) : bySort);
   return arr.sort(f);
 }
 function groupTasks(v) {
@@ -894,7 +899,7 @@ function renderSide() {
       ${row('done', ic('done'), tr('Completed'), '')}
       ${row('trash', ic('trash'), tr('Trash'), S.counts.trash || '')}
       ${archived.length ? `<div class="folder">${ic('eye', 's')}${tr('Archived')}</div>` + archived.map(l => row('l:' + l.id, `<span class="sw"></span>`, listName(l.name), '', `data-list="${l.id}"`)).join('') : ''}
-      ${overviewOn() ? `<button class="srow ${S.route.mod === 'overview' ? 'on' : ''}" data-go="overview">${ic('pulse')}<span class="n">${tr('Where is it stuck?')}</span><span class="c ${ovProblems() ? 'over' : ''}">${ovProblems() || ''}</span></button>` : ''}
+      ${overviewOn() ? `<button class="srow ${S.route.mod === 'overview' ? 'on' : ''}" data-go="overview" title="${tr('Where is it stuck?')}">${ic('pulse')}<span class="n">${tr('Overview')}</span><span class="c ${ovProblems() ? 'over' : ''}">${ovProblems() || ''}</span></button>` : ''}
       ${feat('stats') ? `<button class="srow ${S.route.mod === 'stats' ? 'on' : ''}" data-go="stats">${ic('chart')}<span class="n">${tr('Statistics')}</span></button>` : ''}
       ${timeOn() ? `<button class="srow ${S.route.mod === 'time' ? 'on' : ''}" data-go="time">${ic('clock')}<span class="n">${tr('Time tracking')}</span>${S.timer ? '<span class="c"><span class="recdot"></span></span>' : ''}</button>` : ''}
       <button class="srow" data-go="search">${ic('search')}<span class="n">${tr('Search')}</span></button>
@@ -1031,7 +1036,7 @@ const fieldCols = lid => !isMobile() && !!LS.get('fcols.' + lid, false) && field
 // ---- dependencies: "waiting on" (blocked by open tasks)
 function blockedTitle(t) {
   const names = (t.blockers || []).map(id => S.tasks.get(id)?.title).filter(Boolean), hidden = Math.max(0, (t.blocked || 0) - names.length);
-  return tr('Waiting on: {0}', [...names.map(n => '“' + n + '”'), ...(hidden ? [trn('{0} task you cannot see', '{0} tasks you cannot see', hidden)] : [])].join(', '));
+  return tr('Waiting on: {0}', [...names.map(n => tr('“{0}”|quoted', n)), ...(hidden ? [trn('{0} task you cannot see', '{0} tasks you cannot see', hidden)] : [])].join(', '));
 }
 const hideBlockedToday = () => S.settings.hide_blocked_today === '1';
 function qaddBox(extraCls = '') {
@@ -1047,7 +1052,7 @@ function viewList() {
   const rl = v.list && listById(v.list), ro = rl && rl.role === 'view';
   const cols = rl && fieldCols(rl.id) ? fieldsOf(rl.id).slice(0, 6) : null;
   let h = (rl ? listHead(rl) : '') + (ro ? `<div class="rohint">${ic('eye', 's')}${esc(tr('View only, shared by {0}', rl.owner_name))}</div>` : qaddBox());
-  if (cols) h += `<div class="fcolhead"><span class="spacer"></span>${cols.map(f => `<span class="fcell" title="${esc(f.name)}">${esc(f.name)}</span>`).join('')}</div>`;
+  if (cols) h += `<div class="fcolhead"><span class="spacer"></span>${cols.map(f => `<span class="fcell t-${f.type}" title="${esc(f.name)}">${esc(f.name)}</span>`).join('')}</div>`;
   const total = groups.reduce((n, g) => n + g.tasks.length, 0);
   if (!total) {
     h += `<div class="empty">${ic(S.route.key === 'today' ? 'sun' : 'done')}${S.route.key === 'today' ? tr('Nothing left for today.') : tr('No tasks.')}</div>`;
@@ -1105,7 +1110,7 @@ function viewKanban() {
   const loose = tasks.filter(t => !t.section_id || !secs.some(s => s.id === t.section_id));
   if (loose.length || !secs.length) cols.push({id: null, name: secs.length ? tr('Unassigned') : tr('Tasks'), tasks: loose});
   for (const s of secs) cols.push({id: s.id, name: s.name, tasks: tasks.filter(t => t.section_id === s.id)});
-  return `<div class="kanban">${cols.map(c => `
+  return `${listHead(listById(lid))}<div class="kanban">${cols.map(c => `
     <div class="kcol" data-kcol="${c.id ?? ''}">
       <div class="khead">${esc(c.name)} <span class="c">${c.tasks.length}</span>${c.id && !ro ? `<button class="iconbtn" data-act="section-menu" data-id="${c.id}">${ic('dots', 's')}</button>` : ''}</div>
       <div class="kcards">${c.tasks.map(t => taskRow(t, {compact: true})).join('')}</div>
@@ -1576,6 +1581,8 @@ function openDetail(id) {
   if (collab() && id > 0 && S.tl.id !== id) S.tl = {id};
   loadTimeline(id);
   loadTaskTime(id);
+  if (S.dp.id !== id) S.dp = {id: null};
+  loadDeps(id);
 }
 function closeDetail(fromPop) {
   flushSaves();
@@ -1628,6 +1635,8 @@ function renderDetail() {
         <label>${tr('Link')}</label>${linkField(t, ro)}
         ${collab() && (shared || t.assignee_id) ? `<label>${tr('Assignee')}</label><select id="d-assignee" ${ro ? 'disabled' : ''}><option value="">${tr('Nobody')}</option>${listPeople(l).map(p => `<option value="${p.user_id}" ${p.user_id === t.assignee_id ? 'selected' : ''}>${esc(p.name)}${S.me && p.user_id === S.me.id ? ' ' + tr('(me)') : ''}</option>`).join('')}</select>` : ''}
       </div>
+      ${fieldsOf(t.list_id).length ? `<div class="dsec cfsec"><h5>${tr('Fields')}</h5><div class="fields cf">${fieldsOf(t.list_id).map(f => fieldEditor(f, t, ro)).join('')}</div></div>` : ''}
+      ${t.id > 0 ? `<div class="dsec depsec" id="d-deps">${depsHtml(t)}</div>` : ''}
       ${timeOn() && t.id > 0 ? `<div class="dsec tesec" id="d-time">${taskTimeHtml(t)}</div>` : ''}
       ${collab() && t.id > 0 ? `<div class="dsec cmsec" id="d-tl">${timelineHtml(t)}</div>` : ''}
     </div>
@@ -1688,10 +1697,12 @@ function newsText(it, U) {
     case 'share': return d.role === 'view' ? tr('{0} shared the list {1} with you (view only)', who, q(newsListName(it))) : tr('{0} shared the list {1} with you', who, q(newsListName(it)));
     case 'role': return tr('{0} changed your role in {1} to {2}', who, q(newsListName(it)), q(roleLabel(d.role)));
     case 'unshare': return tr('{0} removed you from the list {1}', who, q(newsListName(it)));
+    case 'unblock': return d.hidden ? tr('{0} completed a task you cannot see: your task is unblocked', who) : tr('{0} completed {1}: your task is unblocked', who, q(d.title || ''));
+    case 'status': return d.status ? tr('{0} set {1} to {2}', who, q(newsListName(it)), `<span class="stpill st-${esc(d.status)} inl"><i></i>${esc(statusLabel(d.status))}</span>`) : tr('{0} cleared the status of {1}', who, q(newsListName(it)));
   }
   return tr('{0} changed something', who);
 }
-const NEWS_ICON = {mention: 'at', comment: 'comment', assign: 'user', unassign: 'user', complete: 'check', share: 'users', role: 'users', unshare: 'users'};
+const NEWS_ICON = {mention: 'at', comment: 'comment', assign: 'user', unassign: 'user', complete: 'check', share: 'users', role: 'users', unshare: 'users', unblock: 'deps', status: 'pulse'};
 function newsItemHtml(it, i) {
   const U = S.nf.users;
   const task = it.task_id ? `<div class="ntask"><span class="nt">${esc(it.task_title || '')}</span><span class="muted">${esc(newsListName(it))}</span></div>` : '';
@@ -1782,6 +1793,12 @@ function actText(a, U) {
     case 'paperless_rm': return tr('{0} removed the Paperless document {1}', who, q(d.title || ''));
     case 'paperless_send': return tr('{0} sent {1} to Paperless', who, q(d.name || ''));
     case 'subtask': return tr('{0} added the subtask {1}', who, q(d.title || ''));
+    case 'dep_add': return d.hidden ? tr('{0} made the task wait on a task you cannot see', who) : tr('{0} made the task wait on {1}', who, q(d.title || ''));
+    case 'dep_rm': return d.hidden ? tr('{0} removed a dependency on a task you cannot see', who) : tr('{0} removed the dependency on {1}', who, q(d.title || ''));
+    case 'blocks_add': return d.hidden ? tr('{0} marked the task as blocking a task you cannot see', who) : tr('{0} marked the task as blocking {1}', who, q(d.title || ''));
+    case 'blocks_rm': return d.hidden ? tr('{0} removed the task as a blocker of a task you cannot see', who) : tr('{0} removed the task as a blocker of {1}', who, q(d.title || ''));
+    case 'unblocked': return d.hidden ? tr('{0} completed the last task this one was waiting on', who) : tr('{0} completed {1}, the task is no longer waiting', who, q(d.title || ''));
+    case 'field': return d.v == null ? tr('{0} cleared the field {1}', who, q(d.name || '')) : tr('{0} set {1} to {2}', who, q(d.name || ''), q(actField(d)));
     case 'delete': return tr('{0} moved the task to the trash', who);
     case 'restore': return tr('{0} restored the task', who);
   }
@@ -2150,6 +2167,7 @@ async function toggleTask(id) {
     offerUndo(tr('Reopened'), r, snaps, res => res?.undo ? api('POST', `/api/tasks/${id}/undo`, res.undo) : false);
     return;
   }
+  if (t.blocked && !confirm(tr('“{0}” is still waiting on {1}. Complete it anyway?', t.title, blockedNames(t)))) return;
   // optimistic: fade the row, then sync
   $$(`.trow[data-id="${id}"] .chk`).forEach(c => { c.classList.add('on'); c.innerHTML = ic('check'); });
   const j = await api('POST', `/api/tasks/${id}/complete`, t.repeat && t.due ? {expect_due: t.due} : undefined);
@@ -2295,7 +2313,7 @@ function taskMenu(anchor, id) {
       {label: tr('Add time…'), icon: 'plus', fn: () => entryModal(null, {task_id: id})}] : []),
     {label: t.status === -1 ? tr('Reopen') : tr("Won't do (discard)"), icon: 'ban', fn: () => t.status === -1 ? toggleTask(id) : wontDo(id)},
     {label: tr('Save as template'), icon: 'copy', fn: () => saveTemplate({task_id: id}, t.title)},
-    {label: tr('Duplicate'), icon: 'sub', fn: () => createTask({title: t.title, content: t.content, list_id: t.list_id, section_id: t.section_id, priority: t.priority, due: t.due, due_time: t.due_time, reminders: t.reminders, repeat: t.repeat, repeat_from: t.repeat_from, tags: t.tags, parent_id: t.parent_id, url: t.url || null})},
+    {label: tr('Duplicate'), icon: 'sub', fn: () => createTask({title: t.title, content: t.content, list_id: t.list_id, section_id: t.section_id, priority: t.priority, due: t.due, due_time: t.due_time, reminders: t.reminders, repeat: t.repeat, repeat_from: t.repeat_from, tags: t.tags, parent_id: t.parent_id, url: t.url || null, ...(t.fields && Object.keys(t.fields).length ? {fields: t.fields} : {})})},
     ...(t.parent_id && S.tasks.get(t.parent_id)?.parent_id ? [{label: tr('Make it a main task'), icon: 'arrow', fn: () => patchTask(id, {parent_id: null})}] : []),
     '-',
     {label: tr('Delete'), icon: 'trash', cls: 'flag-5', fn: () => deleteTask(id)},
@@ -2324,7 +2342,9 @@ function snoozeSheet(id, anchor, extra = []) {
 function sortMenu(anchor) {
   const cur = sortMode();
   const set = m => { LS.set('sort2.' + S.route.key, m); render(); };
+  const l = routeList(), cfs = l ? fieldsOf(l.id).filter(f => f.type !== 'url') : [];
   menu(anchor, [...[['prio', N_('Priority, then manual')], ['custom', N_('Manual only')], ['date', N_('Date')], ['title', N_('Title')]].map(([m, n]) => ({label: tr(n), on: cur === m, fn: () => set(m)})),
+    ...(cfs.length ? ['-', ...cfs.map(f => ({label: tr('Field: {0}', f.name), icon: FT_ICON[f.type], on: cur === 'cf:' + f.id, fn: () => set('cf:' + f.id)}))] : []),
     '-', {label: showDone() ? tr('Hide completed') : tr('Show completed'), icon: 'eye', fn: () => setShowDone(!showDone())}]);
 }
 
@@ -2353,6 +2373,8 @@ function listModal(id, folder = '') {
     <div class="row"><label>${tr('View')}</label><select id="l-view"><option value="list">${tr('List')}</option>${feat('kanban') ? `<option value="kanban" ${l.view === 'kanban' ? 'selected' : ''}>${tr('Kanban')}</option>` : ''}${feat('timeline') ? `<option value="timeline" ${l.view === 'timeline' ? 'selected' : ''}>${tr('Timeline')}</option>` : ''}</select></div>
     ${timeOn() && (own || l.rate) ? `<div class="row"><label>${tr('Hourly rate')}</label><input id="l-rate" inputmode="decimal" value="${l.rate != null ? esc(String(l.rate).replace('.', LOCALE().startsWith('de') ? ',' : '.')) : ''}" placeholder="${tr('optional')}" style="max-width:110px" ${dis}><span class="muted">${esc(S.settings.time_currency || '')} · ${tr('time reports')}</span></div>` : ''}
     <div class="row"><label>${tr('Color')}</label><div class="colors" id="l-col">${LCOLORS.map(c => `<button style="background:${c || 'var(--bg4)'}" class="${(l.color || '') === c ? 'on' : ''}" data-c="${c}" ${dis}></button>`).join('')}</div></div>
+    ${id && !l.is_inbox && statusOn() ? `<div class="row"><label>${tr('Project status')}</label>${statusPill(l, true, true)}</div>` : ''}
+    ${id && own ? `<h4>${tr('Custom fields')}</h4><div class="members" id="l-fields">${fieldsBox(id)}</div>` : id && fieldsOf(id).length ? `<h4>${tr('Custom fields')}</h4><div class="muted mhint">${esc(fieldsOf(id).map(f => f.name).join(', '))} · ${tr('only the owner can change them')}</div>` : ''}
     ${id && !l.is_inbox && collab() ? `<h4>${tr('Sharing')}</h4><div class="members" id="l-members"></div>` : ''}
     <div class="foot">${id && !l.is_inbox && own ? `<button class="btn danger" data-m="del">${tr('Delete')}</button><button class="btn" data-m="arch">${l.archived ? tr('Reactivate') : tr('Archive')}</button>` : ''}${id && !own ? `<button class="btn danger" data-m="leave">${ic('logout', 's')} ${tr('Leave list')}</button>` : ''}${id ? `<button class="btn" data-m="tpl" title="${tr('Save the sections and open tasks as a template')}">${ic('copy', 's')} ${tr('Save as template')}</button>` : ''}<span class="spacer"></span><button class="btn" data-m="close">${tr('Cancel')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
   let users = null;
@@ -2378,8 +2400,21 @@ function listModal(id, folder = '') {
     const r = e.target.closest('[data-mrole]');
     if (r) memberAct(() => api('PUT', `/api/lists/${id}/members`, {user_id: +r.dataset.mrole, role: r.value}));
   });
+  const drawFields = () => { const box = $('#l-fields', md); if (box) box.innerHTML = fieldsBox(id); };
   md.addEventListener('click', async e => {
     const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.m === 'field-add') { fieldModal(id, null, drawFields); return; }
+    if (b.dataset.fedit) { fieldModal(id, fieldById(+b.dataset.fedit), drawFields); return; }
+    if (b.dataset.fpin) {
+      const f = fieldById(+b.dataset.fpin);
+      try { await api('PATCH', '/api/fields/' + f.id, {pinned: !f.pinned}); } catch { return; }
+      await load(); render(); drawFields(); return;
+    }
+    if (b.dataset.fup) {
+      const fs = fieldsOf(id), i = fs.findIndex(f => f.id === +b.dataset.fup); if (i < 1) return;
+      try { await api('PATCH', '/api/fields/' + fs[i].id, {sort: fs[i - 1].sort}); await api('PATCH', '/api/fields/' + fs[i - 1].id, {sort: fs[i].sort === fs[i - 1].sort ? fs[i].sort + 1 : fs[i].sort}); } catch { return; }
+      await load(); render(); drawFields(); return;
+    }
     if (b.dataset.m === 'share') {
       const u = +$('#l-adduser', md).value; if (!u) return;
       memberAct(() => api('PUT', `/api/lists/${id}/members`, {user_id: u, role: $('#l-addrole', md).value}), tr('Shared')); return;
@@ -2439,7 +2474,7 @@ function listModal(id, folder = '') {
 const SET_SECS = [['account', 'user', N_('Account')], ['general', 'sliders', N_('General')], ['notify', 'bell', N_('Notifications')],
   ['layout', 'grid', N_('Layout')], ['focus', 'timer', N_('Focus')], ['time', 'clock', N_('Time tracking')], ['integr', 'link', N_('Integrations')], ['data', 'download', N_('Data')],
   ['users', 'users', N_('Users')], ['help', 'help', N_('Help')]];
-const SET_SAVE = '#s-allday,#s-defrem,#s-digest,#s-pf,#s-ps,#s-pl,#s-pe,#s-showdone,#s-plkeep,#s-icalscope,#s-icalalarm,#s-trnd,#s-ttarget,#s-tcur,#s-tfocus,#s-trem,#s-tstop,[data-feat]';
+const SET_SAVE = '#s-hideblk,#s-progsub,#s-allday,#s-defrem,#s-digest,#s-pf,#s-ps,#s-pl,#s-pe,#s-showdone,#s-plkeep,#s-icalscope,#s-icalalarm,#s-trnd,#s-ttarget,#s-tcur,#s-tfocus,#s-trem,#s-tstop,[data-feat]';
 function settingsModal(focus) {
   const s = S.settings;
   const topicUrl = `${S.ntfyUrl}/${s.ntfy_topic}`;
@@ -2453,7 +2488,10 @@ function settingsModal(focus) {
       <h4>${tr('Appearance')}${dev}</h4>
       <div class="row"><label>${tr('Color scheme')}</label><div class="seg" id="s-theme">${[['auto', N_('Automatic')], ['dark', N_('Dark')], ['light', N_('Light')]].map(([k, n]) => `<button data-theme-set="${k}" class="${LS.get('theme', 'auto') === k ? 'on' : ''}">${tr(n)}</button>`).join('')}</div></div>
       <h4>${tr('Completed tasks')}</h4>
-      <div class="row"><label>${tr('Show in lists')}</label>${chk('s-showdone', s.show_completed !== '0', tr('Show completed|setting'))}</div>`,
+      <div class="row"><label>${tr('Show in lists')}</label>${chk('s-showdone', s.show_completed !== '0', tr('Show completed|setting'))}</div>
+      <h4>${tr('Projects')}</h4>
+      <div class="row"><label>${tr('Today')}</label>${chk('s-hideblk', s.hide_blocked_today === '1', tr('Hide tasks that are still waiting on another task'))}</div>
+      <div class="row"><label>${tr('List progress')}</label>${chk('s-progsub', s.progress_subtasks === '1', tr('Count subtasks too'))}</div>`,
     notify: `<h4>${tr('Notifications (ntfy)')}</h4>
       <div class="row"><label>${tr('Topic')}</label><code class="topic">${esc(s.ntfy_topic)}</code><button class="btn sm" data-m="test">${ic('bell', 's')} ${tr('Send test')}</button></div>
       ${hint(`${tr('Subscribe in the ntfy app: server {0}, topic as above', esc(S.ntfyUrl))}${/ntfy\.sh/.test(S.ntfyUrl) || !S.me?.ntfy_inbox ? '' : tr(', with a user that has read access')}. <a href="${esc(topicUrl)}" target="_blank" rel="noopener">${tr('Web view')}</a>`)}
@@ -2516,6 +2554,7 @@ function settingsModal(focus) {
       <h4>${tr('Templates')}</h4>
       <div class="shelp">${tr('Task menu (…) or list dialog > Save as template. The template button in the add bar creates the task in the current list, Lists > + > New list from template a whole list. Manage them under Settings > Data.')}</div>
       ${timeOn() ? `<h4>${tr('Time tracking')}</h4><div class="shelp">${tr('Start a timer from a task (detail panel, task menu …) or add time by hand; the running timer shows in the top bar on every device. Sidebar > Time tracking: hours per list and task for a week, month or any range, CSV export and a printable timesheet. In shared lists everyone sees the time of all members, but only changes their own entries. Finished focus sessions on a task count as time unless a timer ran at the same time.')}</div>` : ''}
+      <h4>${tr('Projects')}</h4><div class="shelp">${tr('<b>Dependencies:</b> in a task, “Waiting on…” picks the tasks that have to be done first; the task shows “waiting” until they are, and whoever it is assigned to gets a message once the last one is done. <b>Custom fields</b> (list dialog, owner): text, number, selection, date, checkbox, person or link per task; pin up to two as chips on the rows, sort and filter by them. <b>Status and progress</b> (Project progress module): the list header shows the progress; with collaboration, owner and editors set a status with a short note, and “Where is it stuck?” lists overdue, waiting and unassigned tasks of all lists.')}</div>
       ${feat('stats') ? `<h4>${tr('Statistics')}</h4><div class="shelp">${tr('Sidebar > Statistics (or pin it as a tab): completions per week / day and per list, on-time rate, overdue trend, focus time and habit streaks of the last 12 weeks.')}</div>` : ''}
       <h4>${tr('Gestures (phone)')}</h4>
       <div class="shelp">${tr('Swipe right: complete · swipe left: snooze / delete · long-press and drag: reorder, move to another column, quadrant or onto a day; drag to the left edge and hold briefly to open the lists (dropping a subtask there = standalone task in that list).')}</div>`,
@@ -2604,7 +2643,7 @@ function settingsModal(focus) {
     }
     if (a === 'test') { const j = await api('POST', '/api/ntfy/test'); toast(j.ok ? tr('Test sent') : tr('ntfy not reachable')); }
     if (a === 'save') {
-      await api('PATCH', '/api/settings', {...($('#s-plkeep', md) ? {paperless_keep: $('#s-plkeep', md).checked ? '1' : '0'} : {}), nav_order: $$('#s-nav .navrow', md).map(r => r.dataset.mod).join(','), features: $$('[data-feat]', md).filter(x => x.checked).map(x => x.dataset.feat).join(','), show_completed: $('#s-showdone', md).checked ? '1' : '0', ical_scope: $('#s-icalscope', md).value, ical_alarms: $('#s-icalalarm', md).checked ? '1' : '0', allday_time: $('#s-allday', md).value || '09:00', default_reminder: $('#s-defrem', md).value, digest_time: $('#s-digest', md).value,
+      await api('PATCH', '/api/settings', {...($('#s-plkeep', md) ? {paperless_keep: $('#s-plkeep', md).checked ? '1' : '0'} : {}), nav_order: $$('#s-nav .navrow', md).map(r => r.dataset.mod).join(','), features: $$('[data-feat]', md).filter(x => x.checked).map(x => x.dataset.feat).join(','), show_completed: $('#s-showdone', md).checked ? '1' : '0', hide_blocked_today: $('#s-hideblk', md).checked ? '1' : '0', progress_subtasks: $('#s-progsub', md).checked ? '1' : '0', ical_scope: $('#s-icalscope', md).value, ical_alarms: $('#s-icalalarm', md).checked ? '1' : '0', allday_time: $('#s-allday', md).value || '09:00', default_reminder: $('#s-defrem', md).value, digest_time: $('#s-digest', md).value,
         pomo_focus: $('#s-pf', md).value, pomo_short: $('#s-ps', md).value, pomo_long: $('#s-pl', md).value, pomo_long_every: $('#s-pe', md).value,
         ...($('#s-trnd', md) ? {time_rounding: $('#s-trnd', md).value, time_currency: $('#s-tcur', md).value.trim(), time_target: String(Math.max(0, +$('#s-ttarget', md).value || 0)),
           time_remind_h: String(Math.max(0, +$('#s-trem', md).value || 0)), time_autostop_h: String(Math.max(0, +$('#s-tstop', md).value || 0)), time_focus: $('#s-tfocus', md).checked ? '1' : '0'} : {})});
@@ -2846,7 +2885,7 @@ function templateModal(tp, done) {
       <div class="row"><label>${tr('Time')}</label><input type="time" id="tp-time" value="${esc(root.due_time || '')}">${root.repeat ? `<span class="muted" style="font-size:12px">${ic('repeat', 's')} ${esc(repeatLabel(root.repeat))}</span>` : ''}</div>
       <div class="row"><label>${tr('Tags')}</label><input id="tp-tags" value="${esc((root.tags || []).join(', '))}" placeholder="${tr('tag1, tag2')}"></div>
       <h4>${tr('Subtasks')}</h4>`
-    : `<div class="row"><label>${tr('List name')}</label><input id="tp-lname" value="${esc(d.name || '')}"></div><h4>${tr('Sections and tasks')}</h4>`}
+    : `<div class="row"><label>${tr('List name')}</label><input id="tp-lname" value="${esc(d.name || '')}"></div>${d.fields?.length ? `<div class="row"><label>${tr('Custom fields')}</label><span class="muted">${esc(d.fields.map(f => f.name).join(', '))}</span></div>` : ''}<h4>${tr('Sections and tasks')}</h4>`}
     <textarea id="tp-outline" class="tpoutline" rows="9" spellcheck="false">${esc(task ? tplOutline(root.children || []) : tplListOutline(d))}</textarea>
     <div class="shint">${task ? tr('One subtask per line, indent with two spaces for a further level (at most 3 levels in total).') : tr('One task per line, indent with two spaces for subtasks. A line “# Name” starts a section.')} ${tr('Lines that keep their title keep their dates, priority and notes.')}</div>
     <div class="foot"><button class="btn danger" data-m="del">${tr('Delete')}</button><span class="spacer"></span><button class="btn" data-m="close">${tr('Cancel')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
@@ -3334,9 +3373,9 @@ function progMeta(p) {
   return (p.overdue ? `<span class="lmeta over">${trn('{0} overdue', '{0} overdue', p.overdue)}</span>` : '') +
     (p.next_due ? `<span class="lmeta">${tr('next: {0}', esc(dayLabel(p.next_due)))}</span>` : '');
 }
-function statusPill(l, act = true) {
+function statusPill(l, act = true, empty = l.shared) {
   if (!statusOn() || l.is_inbox) return '';
-  if (!l.status) return act && canEditList(l.id) ? `<button class="stpill none" data-act="status" data-id="${l.id}">${ic('pulse', 's')}${tr('Set status')}</button>` : '';
+  if (!l.status) return act && empty && canEditList(l.id) ? `<button class="stpill none" data-act="status" data-id="${l.id}">${ic('pulse', 's')}${tr('Set status')}</button>` : '';
   return `<button class="stpill st-${esc(l.status)}" ${act ? `data-act="status" data-id="${l.id}"` : 'disabled'} title="${esc(l.status_note || statusLabel(l.status))}"><i></i>${esc(statusLabel(l.status))}</button>`;
 }
 function statusNote(l) {
@@ -3420,7 +3459,7 @@ function viewOverview() {
     }
     if (r.blocked.length) body += `<h4>${ic('lock', 's')}${tr('Waiting')} <span class="c">${r.blocked.length}</span></h4>` + ovMore(r.blocked, t => ovTask(t, `<span class="muted ovw-on">${esc(blockedTitle(t))}</span>`));
     if (r.unassigned.length) body += `<h4>${ic('user', 's')}${tr('Without assignee')} <span class="c">${r.unassigned.length}</span></h4>` + ovMore(r.unassigned, t => ovTask(t, t.due ? `<span class="muted">${esc(dayLabel(t.due))}</span>` : ''));
-    h += `<section class="stcard ovcard ${r.risk < 2 ? 'risk' : ''}"><div class="ovhead"><button class="ovname" data-go="l/${l.id}"><span class="sw" style="${l.color ? 'background:' + l.color : ''}"></span>${esc(lname(l))}${l.shared && collab() ? ic('users', 's') : ''}</button><span class="spacer"></span>${statusPill(l)}</div>
+    h += `<section class="stcard ovcard ${r.risk < 2 ? 'risk st-' + esc(l.status) : ''}"><div class="ovhead"><button class="ovname" data-go="l/${l.id}"><span class="sw" style="${l.color ? 'background:' + l.color : ''}"></span>${esc(lname(l))}${l.shared && collab() ? ic('users', 's') : ''}</button><span class="spacer"></span>${statusPill(l)}</div>
       ${p.total ? `<div class="ovprog">${progBar(p)}${progMeta(p)}</div>` : ''}${statusNote(l)}
       ${body || `<div class="muted ovok">${ic('check', 's')}${tr('Nothing stuck')}</div>`}</section>`;
   }
@@ -3480,7 +3519,7 @@ function depPicker(tid, dir) {
   });
   setTimeout(() => { if (!isMobile()) $('#dp-q', md).focus(); }, 50);
 }
-const blockedNames = t => { const n = (t.blockers || []).map(id => S.tasks.get(id)?.title).filter(Boolean); const h = Math.max(0, (t.blocked || 0) - n.length); return [...n.map(x => '“' + x + '”'), ...(h ? [trn('{0} task you cannot see', '{0} tasks you cannot see', h)] : [])].join(', '); };
+const blockedNames = t => { const n = (t.blockers || []).map(id => S.tasks.get(id)?.title).filter(Boolean); const h = Math.max(0, (t.blocked || 0) - n.length); return [...n.map(x => tr('“{0}”|quoted', x)), ...(h ? [trn('{0} task you cannot see', '{0} tasks you cannot see', h)] : [])].join(', '); };
 
 // ------------------------------------------------------------------ custom fields (package 3)
 const FTYPES = [['text', N_('Text')], ['number', N_('Number')], ['select', N_('Selection')], ['date', N_('Date')], ['checkbox', N_('Checkbox')], ['person', N_('Person')], ['url', N_('Link')]];
@@ -3739,6 +3778,16 @@ document.addEventListener('click', async e => {
     case 'list-new': menu(a, [{label: tr('New list'), icon: 'list', fn: () => { closeSide(); listModal(); }}, ...(tplOf('list').length ? [{label: tr('New list from template'), icon: 'copy', fn: () => { closeSide(); templateMenu($('#top h1'), 'list'); }}] : []), {label: tr('New folder'), icon: 'folder', fn: () => newFolder()}]); break;
     case 'tpl-use': if (a.closest('.qadd.sheet')) { closePop(); templateMenu($('#fab'), 'task'); } else templateMenu(a, 'task'); break;
     case 'stats-mode': S.st.mode = a.dataset.k; LS.set('statsMode', S.st.mode); renderView(); break;
+    case 'status': statusModal(id); break;
+    case 'ov-only': S.ov.only = !!a.dataset.k; LS.set('ovOnly', S.ov.only); renderView(); break;
+    case 'field-cols': LS.set('fcols.' + id, !LS.get('fcols.' + id, false)); render(); break;
+    case 'dep-add': depPicker(id, a.dataset.dir); break;
+    case 'dep-rm': {
+      const b = +a.dataset.b;
+      try { await api('DELETE', `/api/deps/${id}/${b}`); } catch { break; }
+      await load(); render(); loadDeps(S.sel); break;
+    }
+    case 'open-dep': openTaskById(id); break;
     case 'folder-toggle': { const k = 'fold:' + a.dataset.folder; S.collapsed.has(k) ? S.collapsed.delete(k) : S.collapsed.add(k); LS.set('collapsed', [...S.collapsed]); renderSide(); break; }
     case 'folder-menu': e.stopPropagation(); folderMenu(a, a.dataset.folder); break;
     case 'lists-reorder': S.listReorder = !S.listReorder; renderSide(); break;
@@ -3849,7 +3898,11 @@ document.addEventListener('click', async e => {
     case 'mb-list': menu(a, S.lists.filter(l => !l.archived && l.role !== 'view').map(l => ({label: lname(l), fn: () => batch('patch', {list_id: l.id, section_id: null})}))); break;
     case 'mb-tag': { const g = prompt(tr('Add tag')); if (g && g.trim()) batch('patch', {add_tags: [g.trim().replace(/^#/, '')]}); break; }
     case 'mb-pin': batch('patch', {pinned: [...S.multi].every(i => S.tasks.get(i)?.pinned) ? 0 : 1}); break;
-    case 'mb-done': batch('complete', {}, true); break;
+    case 'mb-done': {
+      const nb = [...S.multi].filter(i => S.tasks.get(i)?.blocked && S.tasks.get(i).status === 0).length;
+      if (nb && !confirm(trn('{0} of the selected tasks is still waiting on another task. Complete anyway?', '{0} of the selected tasks are still waiting on other tasks. Complete anyway?', nb))) break;
+      batch('complete', {}, true); break;
+    }
     case 'mb-del': if (confirm(trn('Delete {0} task?', 'Delete {0} tasks?', S.multi.size))) batch('delete', {}, true); break;
     case 'mb-all': $$('#view .trow').forEach(r => S.multi.add(+r.dataset.id)); render(); break;
     case 'mb-close': S.multi.clear(); S.multiMode = false; render(); break;
@@ -3897,6 +3950,7 @@ document.addEventListener('change', async e => {
   if (t.id === 'd-list') patchUndoable(S.sel, {list_id: +t.value}, tr('Moved to {0}', lname(listById(+t.value))));
   if (t.id === 'd-sec') patchTask(S.sel, {section_id: t.value ? +t.value : null});
   if (t.id === 'd-assignee') patchTask(S.sel, {assignee_id: t.value ? +t.value : null});
+  if (t.dataset?.cf !== undefined && t.closest('#detail')) saveField(t);
   if (t.id === 'pomo-task') { pomoTask = t.value; LS.set('pomoTask', t.value); }
   if ((t.id === 'tv-from' || t.id === 'tv-to') && t.value) { S.tv[t.id.slice(3)] = t.value; LS.set(t.id === 'tv-from' ? 'timeFrom' : 'timeTo', t.value); renderView(); }
 });
@@ -3906,6 +3960,7 @@ document.addEventListener('keydown', async e => {
     if (t.id === 'qinput' || t.id === 'qsheet') { e.preventDefault(); submitQuick(t); return; }
     if (t.id === 'd-title') { e.preventDefault(); t.blur(); return; }
     if (t.id === 'd-url') { e.preventDefault(); t.blur(); return; }
+    if (t.dataset?.cf !== undefined && t.tagName === 'INPUT') { e.preventDefault(); t.blur(); return; }
     if (t.classList?.contains('nitem')) { e.preventDefault(); newsOpen(+t.dataset.i); return; }
     if (t.id === 'd-sub' && t.value.trim()) {
       const p = taskById(S.sel);
@@ -4016,6 +4071,18 @@ function filterModal(id) {
   const f = id ? S.filters.find(x => x.id === id) : {name: '', rules: {}};
   if (!f) return;
   const r = {op: 'and', lists: [], dates: [], prios: [], tags: [], ...JSON.parse(JSON.stringify(f.rules || {}))};
+  r.cf = r.cf && typeof r.cf === 'object' ? r.cf : {};
+  // custom fields of the visible lists that the filter engine understands
+  const cfs = (S.fields || []).filter(x => ['select', 'checkbox', 'date', 'number'].includes(x.type) && listById(x.list_id) && !listById(x.list_id).archived);
+  const cfChips = (fd, kind, opts) => `<div class="fchips" data-cf="${fd.id}" data-cfk="${kind}">${opts.map(([v, n]) => `<button class="${(r.cf[fd.id]?.[kind] || []).includes(v) ? 'on' : ''}" data-v="${esc(v)}">${esc(n)}</button>`).join('')}</div>`;
+  const cfRow = fd => {
+    const cur = r.cf[fd.id] || {};
+    const ctl = fd.type === 'select' ? cfChips(fd, 'sel', [...(fd.options?.options || []).map(o => [o.id, o.name]), ['', tr('empty')]])
+      : fd.type === 'checkbox' ? cfChips(fd, 'chk', [['1', tr('checked')], ['0', tr('not checked')]])
+      : fd.type === 'date' ? cfChips(fd, 'date', DATE_OPTS.map(([v, n]) => [v, tr(n)]))
+      : `<div class="cfnumf"><select data-cfnum="${fd.id}"><option value="">–</option>${[['gt', '>'], ['lt', '<'], ['eq', '='], ['set', tr('has a value')], ['empty', tr('empty')]].map(([k, n]) => `<option value="${k}" ${cur.num?.op === k ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select><input data-cfnumv="${fd.id}" inputmode="decimal" value="${esc(cur.num?.v ?? '')}" style="max-width:110px">${fd.options?.unit ? `<span class="muted">${esc(fd.options.unit)}</span>` : ''}</div>`;
+    return `<div class="cfrow"><div class="cfn">${esc(lname(listById(fd.list_id)))} › <b>${esc(fd.name)}</b></div>${ctl}</div>`;
+  };
   const tags = [...new Set([...S.tasks.values()].flatMap(t => t.tags))].sort((a, b) => a.localeCompare(b, 'de'));
   const chips = (key, opts, translate) => `<div class="fchips" data-key="${key}">${opts.map(([v, n]) => (translate ? [v, tr(n)] : [v, n])).map(([v, n]) => `<button class="${r[key].includes(v) ? 'on' : ''}" data-v="${esc(String(v))}">${esc(n)}</button>`).join('')}</div>`;
   const md = modal(`<h3>${id ? tr('Edit filter') : tr('New filter')}</h3>
@@ -4025,12 +4092,27 @@ function filterModal(id) {
     <h4>${tr('Date')}</h4>${chips('dates', DATE_OPTS, true)}
     <h4>${tr('Priority')}</h4>${chips('prios', [[5, N_('High')], [3, N_('Medium')], [1, N_('Low')], [0, N_('None')]], true)}
     ${tags.length ? `<h4>${tr('Tags')}</h4>${chips('tags', tags.map(g => [g, '#' + g]))}` : ''}
+    ${cfs.length ? `<h4>${tr('Custom fields')}</h4><div class="cffilters">${cfs.map(cfRow).join('')}</div>` : ''}
     <div class="muted" id="f-count" style="font-size:13px;margin-top:14px"></div>
     <div class="foot">${id ? `<button class="btn danger" data-m="del">${tr('Delete')}</button>` : ''}<span class="spacer"></span><button class="btn" data-m="close">${tr('Cancel')}</button><button class="btn pri" data-m="save">${tr('Save')}</button></div>`);
   const count = () => { const n = openTasks().filter(t => !t.parent_id && filterMatch(t, r)).length; $('#f-count', md).textContent = trn('Currently matches {0} open task. Within a category, “or” applies.', 'Currently matches {0} open tasks. Within a category, “or” applies.', n); };
   count();
+  const numRule = fid => {
+    const op = $(`[data-cfnum="${fid}"]`, md).value, v = numIn($(`[data-cfnumv="${fid}"]`, md).value.trim());
+    if (op) r.cf[fid] = {num: {op, v}}; else delete r.cf[fid];
+    count();
+  };
+  md.addEventListener('change', e => { if (e.target.dataset.cfnum) numRule(e.target.dataset.cfnum); });
+  md.addEventListener('input', e => { if (e.target.dataset.cfnumv) numRule(e.target.dataset.cfnumv); });
   md.addEventListener('click', async e => {
     const b = e.target.closest('button'); if (!b) return;
+    const cbox = b.closest('.fchips[data-cf]');
+    if (cbox) {
+      const fid = cbox.dataset.cf, k = cbox.dataset.cfk, v = b.dataset.v, cur = r.cf[fid] = r.cf[fid] || {};
+      cur[k] = cur[k] || []; const i = cur[k].indexOf(v); i >= 0 ? cur[k].splice(i, 1) : cur[k].push(v);
+      if (!cfRuleOn(cur)) delete r.cf[fid];
+      b.classList.toggle('on', i < 0); count(); return;
+    }
     const box = b.closest('.fchips');
     if (box) {
       const key = box.dataset.key, v = key === 'lists' || key === 'prios' ? +b.dataset.v : b.dataset.v;

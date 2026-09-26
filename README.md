@@ -2,7 +2,7 @@
 
 <h1 align="center">Abhako</h1>
 
-<p align="center">A self-hosted task manager inspired by TickTick and Asana: personal planning meets team collaboration.<br>
+<p align="center">The task app for households and small teams that you own: TickTick-style planning, the Asana essentials and time tracking in one app.<br>Free for any number of people, on your own server.<br>
 Lists, calendar, Eisenhower matrix, habits, a focus timer, time tracking, comments and shared lists in one small web app you run yourself.</p>
 
 <p align="center"><a href="https://abhako.com"><b>abhako.com</b></a> · <a href="#quick-start">Quick start</a> · <a href="TRANSLATING.md">Translate</a></p>
@@ -10,7 +10,15 @@ Lists, calendar, Eisenhower matrix, habits, a focus timer, time tracking, commen
 <p align="center"><img src="docs/today.png" alt="Today view with overdue and today's tasks, subtasks, tags and the list sidebar"></p>
 
 > **Language:** the interface is **English** by default, with **German** included (switch under *Settings > General > Language*); more languages are welcome, see [TRANSLATING.md](TRANSLATING.md). The name comes from the German *abhaken*, to tick off.
-> Abhako is an independent hobby project and not affiliated with TickTick or Asana.
+> Abhako is an independent hobby project, inspired by TickTick and Asana and not affiliated with either.
+
+## Why Abhako
+
+- **Free for everyone in the house or team.** No per-seat subscription, unlimited users, lists and tasks. (TickTick shares lists too, but the free plan allows one other person per list and beyond that everyone needs their own subscription.)
+- **One app instead of three.** Tasks, habits, focus timer and real time tracking with rates and timesheets, plus the Asana essentials: sharing, assignment, comments, activity and a News inbox.
+- **Simple when you want it.** Switch *Collaboration* off and it is a quiet personal list again.
+- **Yours.** Runs on your own server, no vendor account, no telemetry, MIT licensed. Fits a self-hosted setup: single sign-on through your proxy, ntfy push, Paperless-ngx, a calendar feed.
+- **Honest trade-offs.** No native apps or widgets (it is an installable web app), no location-based reminders, and it is a hobby project, not a company with a support desk.
 
 ## Features
 
