@@ -15,7 +15,7 @@ Lists, calendar, Eisenhower matrix, habits, a focus timer, time tracking, commen
 ## Why Abhako
 
 - **Free for everyone in the house or team.** No per-seat subscription, unlimited users, lists and tasks. (TickTick shares lists too, but the free plan allows one other person per list and beyond that everyone needs their own subscription.)
-- **One app instead of three.** Tasks, habits, focus timer and real time tracking with rates and timesheets, plus the Asana essentials: sharing, assignment, comments, activity and a News inbox.
+- **One app instead of three.** Tasks, habits, focus timer and real time tracking with rates and timesheets, plus the Asana essentials: sharing, assignment, comments, activity, a News inbox, dependencies, project status and custom fields.
 - **Simple when you want it.** Switch *Collaboration* off and it is a quiet personal list again.
 - **Yours.** Runs on your own server, no vendor account, no telemetry, MIT licensed. Fits a self-hosted setup: single sign-on through your proxy, ntfy push, Paperless-ngx, a calendar feed.
 - **Honest trade-offs.** No native apps or widgets (it is an installable web app), no location-based reminders, and it is a hobby project, not a company with a support desk.
@@ -51,7 +51,10 @@ Lists, calendar, Eisenhower matrix, habits, a focus timer, time tracking, commen
 - Share a list with others (can edit or view only); shared lists show up in their smart lists, calendar and search
 - Assign tasks in shared lists: reminders go to the assignee, plus an *Assigned to me* list
 - Comments on every task with @mentions and files, an activity history (who changed what, when) and unread markers
-- A *News* inbox (bell icon with an unread badge): mentions, comments on your tasks, assignments, completions and lists shared with you, newest first
+- A *News* inbox (bell icon with an unread badge): mentions, comments on your tasks, assignments, completions, unblocked tasks, status updates and lists shared with you, newest first
+- **Dependencies:** a task can wait on other tasks (also in other lists); it shows *waiting* until they are done, and its assignee gets a message when the last one is finished
+- **Project status and progress:** a progress bar per list, a status (*On track*, *At risk*, *Off track*, *On hold*, *Complete*) with a short note, and a *Where is it stuck?* overview of overdue, waiting and unassigned tasks across all lists
+- **Custom fields** per list: text, number (with unit), selection with colours, date, checkbox, person or link; shown as chips or columns, usable in filters, sorting and search
 - Push notifications for new comments, mentions, assignments and completions, bundled so a busy task does not spam you
 - One switch (*Collaboration*) turns all of this off for a simple personal task list
 - Built-in login or single sign-on through your reverse proxy (Authelia, Authentik, oauth2-proxy)
@@ -250,6 +253,42 @@ A module (on by default, *Settings > Layout*) for tracking the time you spend on
   tasks stays private. View-only members can track their own time.
 
 <p align="center"><img src="docs/time.png" alt="Time tracking report with hours per day and per list and task"></p>
+
+## Projects: dependencies, status, custom fields
+
+For lists that are projects rather than to-do piles.
+
+- **Dependencies ("waiting on"):** in a task's panel, *Waiting on…* picks the tasks that have to be done first
+  (search over all your open tasks, also in other lists and shared lists), *Blocking…* the other way round.
+  Cycles and self-dependencies are refused. The task row shows *waiting* with the names of the open blockers;
+  completing a waiting task asks first. When the last blocker is done (or marked *won't do*), the waiting task
+  gets an activity line and its assignee (or creator) a News item and a push: *Unblocked: Send invoice*. A blocker
+  in the trash is ignored until it is restored; a recurring blocker stays open until its repetition ends.
+  *Settings > General > Projects* can hide waiting tasks from *Today*. If you lose access to a blocker, you see
+  *a task you cannot see* (never its title) and can remove it.
+- **Progress:** the list header shows done vs. all main tasks (optionally subtasks too), overdue tasks and the next
+  due date. It counts all time, leaves out *won't do* and the trash, and counts a recurring task once.
+- **Status** (with *Collaboration* on): the owner and editors set *On track*, *At risk*, *Off track*, *On hold* or
+  *Complete* with a short note. It shows as a coloured pill in the list header, a dot in the sidebar and in the
+  overview; everyone else in the list gets it in their News. Each list keeps a status history.
+- **Where is it stuck?** (sidebar, rail or a pinned tab; shown once you have two lists or a shared one): per list
+  the status, the progress, overdue tasks grouped by assignee, waiting tasks and, in shared lists, tasks without an
+  assignee, with *Needs attention* to hide the calm ones. Everything is clickable.
+- **Custom fields:** the list owner adds fields in the list dialog: text, number (optional unit such as € or h),
+  selection (options with colours), date, checkbox, person (owner or member of the list) or link. Values are the
+  same for everyone in the list; view-only members see them but cannot change them. Up to two fields show as chips
+  on the task rows; on a computer the columns button shows up to six fields as a table. Filters (selection,
+  checkbox, date, number greater / less / equal / empty) and sorting work on fields, search finds text and option
+  names. A task moved to another list keeps its values, hidden until it comes back. Deleting a field deletes its
+  values. List templates keep the fields and their values; the JSON export includes fields, values, dependencies
+  and status updates.
+- The switch *Project progress* (*Settings > Layout*) turns progress, status and the overview off; dependencies and
+  custom fields are always there.
+
+| | |
+|---|---|
+| <img src="docs/fields.png" alt="Work list with progress bar and At risk status, field chips and waiting tasks; task panel with custom fields and dependencies"> | <img src="docs/overview.png" alt="Where is it stuck overview: overdue by assignee, waiting and unassigned tasks per list"> |
+| Custom fields, dependencies, progress and status | *Where is it stuck?* |
 
 ## Login
 
